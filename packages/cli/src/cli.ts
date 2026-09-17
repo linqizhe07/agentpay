@@ -45,7 +45,7 @@ setup
   init [--from-deployment localhost|base-sepolia|path.json] [--key 0x.. --rpc url --wallet 0x.. --token 0x.. --network eip155:n --sp 0x..,0x..]
 
 global options: --key --rpc --wallet --token --network --sp --home --deployment
-config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > contracts/deployments/<name>.json`;
+config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > packages/contracts/deployments/<name>.json`;
 
 const OPTIONS = {
   key: { type: 'string' },

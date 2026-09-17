@@ -1,6 +1,6 @@
 /**
  * Deploys AEP2DebitWallet to Base Sepolia (chain id 84532) against Circle's
- * testnet USDC. Writes contracts/deployments/base-sepolia.json.
+ * testnet USDC. Writes packages/contracts/deployments/base-sepolia.json.
  *
  *   DEPLOYER_PK=0x... npm run deploy:base-sepolia
  *

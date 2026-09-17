@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Address, Hex } from 'viem';
 
-/** What a deploy script writes to contracts/deployments/<name>.json. */
+/** What a deploy script writes to packages/contracts/deployments/<name>.json. */
 export interface DeploymentRecord {
   chainId: number;
   /** CAIP-2 id, e.g. 'eip155:84532'. */

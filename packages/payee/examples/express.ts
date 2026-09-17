@@ -11,7 +11,7 @@
  *   SP_ADDRESS       default: read from `${SP_URL}/supported`
  *   SETTLE_WINDOW    default: the SP's advertised settleWindowSeconds, else 10800
  *   NETWORK, WALLET_ADDRESS, USDC_ADDRESS
- *                    default: contracts/deployments/${DEPLOYMENT ?? 'localhost'}.json
+ *                    default: packages/contracts/deployments/${DEPLOYMENT ?? 'localhost'}.json
  */
 import express from 'express';
 import { privateKeyToAccount } from 'viem/accounts';

@@ -1,8 +1,8 @@
 /**
  * Deploys MockUSDC + AEP2DebitWallet to a local Hardhat node and mints test
- * USDC to the demo accounts. Writes contracts/deployments/localhost.json.
+ * USDC to the demo accounts. Writes packages/contracts/deployments/localhost.json.
  *
- *   (cd contracts && npx hardhat node --port 8545)   # in another shell
+ *   (cd packages/contracts && npx hardhat node --port 8545)   # in another shell
  *   npm run deploy:local
  *
  * Env: RPC_URL (default http://127.0.0.1:8545), DEPLOYER_PK (default Hardhat #0),
