@@ -1,0 +1,2408 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kairos — 研究工作台</title>
+<style>
+:root{
+  --rail-width:56px; --bg:#ffffff; --side-bg:#f2f4f6; --inset:#f4f6f8; --panel:#ffffff;
+  --line:#e3e7ea; --text:#202834; --dim:#64748b; --accent:#1c5cab; --active-bg:#e8edf2;
+  --op-bubble:#24303f; --op-text:#f2f6fa; --k-bubble:#ffffff; --card-bg:#f7f9fa;
+  --green:#1e6b3c; --red:#b3372b; --danger:#b0742c; --viz-grid:#e9edf0;
+  --r-bubble:16px; --r-card:8px; --r-chip:999px;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+/* The banner belongs to the page and the frame is the replica, so the page is a
+   column of exactly those two and the frame is what scrolls. This is the whole
+   answer to the rail's height: the engine subtracts the banner's rendered box
+   from the viewport itself and hands the frame the remainder, so nothing on this
+   page has to know, or state, how tall the banner came out. */
+html,body{height:100%}
+body{margin:0;display:flex;flex-direction:column;overflow:hidden;
+  background:var(--bg);color:var(--text);font:15px/1.5 var(--sans)}
+
+.site-banner{
+  flex:none;
+  padding:9px 18px;background:#fffaf1;border-bottom:1px solid #ecdcc0;
+  color:#866536;font:11px/1.6 var(--mono);letter-spacing:.04em;
+}
+
+.site-frame{position:relative;display:flex;flex:1;min-height:0;overflow-y:auto}
+
+/* Sticky, not absolute: an absolutely positioned rail stretches to the height
+   of the tallest surface (top:0;bottom:0 inside a position:relative frame),
+   which parks the rail-account entry far below the fold on any page taller
+   than one screen. Sticky keeps all seven entries on screen at every scroll
+   position while still sitting in normal flex flow (so it reserves its own
+   56px column instead of needing the frame's padding-left to compensate).
+
+   The offset is 0 and the height is the whole of the scrollport this rail lives
+   in — never a measurement of the banner above it, which is a constant that goes
+   wrong the moment that banner's text wraps to a second line, and it does as the
+   window narrows. Because the frame is the scrollport, 100% here IS the viewport
+   minus however tall the banner rendered, computed by the engine: the rail is
+   whole at the first paint and whole at every scroll position after it, with the
+   bottom pin intact. */
+.rail{
+  position:sticky;top:0;align-self:flex-start;flex:none;
+  width:var(--rail-width);height:100%;
+  display:flex;flex-direction:column;gap:2px;padding:10px 6px;
+  background:var(--side-bg);border-right:1px solid var(--line);
+}
+.rail-btn{
+  display:flex;flex-direction:column;align-items:center;gap:4px;
+  padding:8px 0 6px;border-radius:8px;color:var(--dim);text-decoration:none;
+  transition:background .12s;
+}
+.rail-btn:hover{background:var(--active-bg)}
+/* memory and plugin are real surfaces this tour does not open. They stay in the
+   rail in their real places, and they carry no hover highlight and no pointer,
+   so nothing about them offers a click the page will not honour. */
+.rail-off{color:#a2adb9;cursor:default}
+.rail-off:hover{background:transparent}
+.rail-btn.active{background:#fff;color:var(--accent);box-shadow:inset 0 0 0 1px var(--line)}
+.rail-glyph{font-size:16px;line-height:1}
+.rail-label{font:500 8.5px/1 var(--mono);letter-spacing:.04em}
+.rail-account{margin-top:auto}
+
+/* Sticky for the same reason the rail is, and it became necessary for the same
+   reason: once the frame is the scrollport it has a definite height, so a
+   stretched sidebar is one scrollport tall instead of one document tall and
+   scrolls away, taking the grey fill and the divider with it and leaving a plain
+   white column beside the lane. Held at the top it keeps its place at every
+   scroll position, and .conv-list's own overflow finally does what it was
+   written to do — the channel list scrolls inside a sidebar that does not. */
+/* The product serves its two instrument surfaces with the rail alone: the
+   channel sidebar belongs to the chat page, which is what the strategy and
+   agent stops are. Carrying it onto market and account narrowed the lane by
+   300px against a table whose own fold points are keyed to the window, so
+   columns the annotations describe were pushed out of view at a width where
+   the product shows all of them. */
+.sidebar[hidden]{display:none}
+.sidebar{position:sticky;top:0;align-self:flex-start;height:100%;
+  width:300px;min-width:240px;flex:none;background:var(--side-bg);
+  border-right:1px solid var(--line);display:flex;flex-direction:column}
+.side-brand{font:600 11px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--dim);padding:14px 16px 4px}
+.conv-list{flex:1;overflow-y:auto}
+.side-foot{padding:10px 16px;border-top:1px solid var(--line);
+  font:10.5px var(--mono);letter-spacing:.06em;color:var(--dim)}
+
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.surface[hidden]{display:none}
+
+/* annotation layer — deliberately foreign to product chrome */
+.note{
+  border-left:3px solid var(--accent);
+  margin:14px 0;padding:2px 0 2px 14px;
+  font:13.5px/1.75 var(--sans);color:var(--text);max-width:62ch;
+}
+.note-i{display:block;font:600 10px/1 var(--mono);letter-spacing:.14em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:5px}
+/* the one annotation that is about the page rather than about a surface: it
+   sits above all five of them, in the lane's own gutter. */
+.main>.note{margin:16px 42px}
+
+/* market surface */
+.market-page{background:#f6f7f9;font-size:14px}
+
+.market-topbar{
+  display:flex;align-items:center;gap:18px;height:76px;padding:0 42px;
+  background:var(--panel);border-bottom:1px solid var(--line);
+}
+.market-brand{font:750 12px/1 var(--sans);letter-spacing:.14em;color:var(--text)}
+.market-divider{color:#c5ccd5}
+.market-section{font-size:12px;color:var(--dim)}
+.market-search-trigger{
+  margin-left:auto;width:330px;min-height:38px;display:flex;align-items:center;gap:11px;
+  padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:#f8f9fb;
+  color:var(--dim);font-size:12px;text-align:left;
+}
+.market-search-trigger svg{flex:none;stroke:currentColor;fill:none;stroke-width:1.5;
+  stroke-linecap:round;stroke-linejoin:round}
+.market-search-trigger kbd{
+  margin-left:auto;font:10px var(--sans);border:1px solid #e0e5eb;border-radius:4px;
+  padding:2px 5px;color:#7b8796;background:var(--panel);
+}
+
+.market-main{width:100%;max-width:1380px;margin:0 auto;padding:46px 42px 38px}
+
+.market-heading{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:31px}
+.market-eyebrow{margin:0 0 9px;font-size:9px;font-weight:650;letter-spacing:.17em;color:#7a889a}
+.market-heading h1{margin:0;font-size:32px;line-height:1.25;font-weight:650;letter-spacing:-.04em;color:var(--text)}
+.market-heading-dot{color:var(--accent);margin-left:2px}
+.market-description{margin:11px 0 0;font-size:12px;color:var(--dim)}
+
+.market-button{
+  min-height:37px;border:1px solid var(--line);border-radius:7px;padding:8px 13px;
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  font-size:12px;font-weight:500;background:var(--panel);color:var(--text);
+}
+.market-button.primary{background:var(--accent);border-color:var(--accent);color:#fff;
+  box-shadow:0 2px 3px #13375e0d}
+.market-button.primary span{font-size:17px;line-height:16px;font-weight:400}
+.market-icon-button{
+  width:32px;height:32px;border-radius:6px;border:1px solid var(--line);background:var(--panel);
+  color:var(--dim);display:inline-flex;align-items:center;justify-content:center;
+}
+.market-icon-button svg{stroke:currentColor;fill:none;stroke-width:1.5;
+  stroke-linecap:round;stroke-linejoin:round}
+
+.market-notice{
+  margin:0 0 18px;padding:10px 14px;border:1px solid #ecdcc0;border-radius:7px;
+  color:#866536;background:#fffaf1;font-size:11px;
+}
+
+.watchlist{border-radius:12px;border:1px solid var(--line);background:var(--panel);
+  overflow:hidden;box-shadow:0 3px 10px #263b5203}
+.watchlist-toolbar{min-height:70px;padding:0 25px;display:flex;align-items:center;
+  justify-content:space-between;gap:15px;border-bottom:1px solid var(--line)}
+.market-tabs{display:flex;align-self:stretch;align-items:center;gap:25px}
+.market-tab{position:relative;display:flex;align-items:center;gap:7px;padding:0 1px;
+  border:none;background:transparent;font-size:12px;color:var(--dim)}
+.market-tab.active{color:var(--text);font-weight:600}
+.market-tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;
+  height:2px;background:var(--accent)}
+.market-count{min-width:19px;padding:1px 5px;border-radius:4px;color:#7a8797;
+  background:#f0f3f6;font-size:10px;font-weight:500;text-align:center}
+.market-tab.active .market-count{color:var(--accent);background:#edf3fb}
+.watchlist-actions{display:flex;align-items:center;gap:14px}
+.watchlist-actions select{max-width:115px;border:0;background:transparent;
+  color:var(--dim);font-size:11px}
+
+/* position:relative is load-bearing, not decoration: the visually-hidden
+   caption and the visually-hidden header label inside this table are
+   position:absolute, and without a positioned ancestor here they resolve
+   against the frame instead — escaping this scroller and widening the whole
+   page by however far the widest column sits past the window. */
+.market-table-scroll{position:relative;overflow-x:auto}
+.market-table{border-collapse:collapse;width:100%;text-align:left;white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.market-table th{height:41px;padding:0 20px;color:#7a8797;background:#fafbfc;
+  font-size:10px;font-weight:500}
+.market-table td{height:82px;padding:15px 20px;border-top:1px solid #edf0f3;font-size:13px}
+.market-table th:not(:first-child),.market-table td:not(:first-child){text-align:right}
+.market-table th:first-child,.market-table td:first-child{padding-left:26px}
+.market-table th:last-child,.market-table td:last-child{width:36px;padding-left:0;padding-right:22px}
+.market-table tbody tr:hover{background:#fcfdfe}
+
+.market-asset{display:flex;align-items:center;gap:12px;text-align:left}
+.asset-mark{flex:none;width:34px;height:34px;border-radius:8px;display:flex;
+  align-items:center;justify-content:center;font:650 11px/1 var(--sans)}
+.asset-mark.us{background:#e8edf4;color:#45658b}
+.asset-mark.cn{background:#f0e6db;color:#9c7445}
+.asset-mark.crypto{background:#ece4f5;color:#7b61a0}
+.asset-symbol{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:650;color:var(--text)}
+.asset-market{padding:1px 5px;border-radius:3px;background:var(--inset);color:#7b8796;
+  font-size:9px;font-weight:400}
+.asset-name{display:block;max-width:190px;overflow:hidden;text-overflow:ellipsis;
+  margin-top:3px;color:var(--dim);font-size:10px}
+
+.quote-price{font-weight:600}
+.quote-unit{display:block;color:#8a95a3;font-size:9px;margin-top:3px}
+.quote-change-col.market-up{color:var(--green)}
+.quote-change-col.market-down{color:var(--red)}
+.quote-change-pill{
+  display:inline-block;min-width:73px;border-radius:5px;padding:5px 7px;text-align:center;
+  font-size:11px;font-weight:600;background:var(--inset);color:var(--text);
+}
+.quote-change-pill.market-up{background:#edf7f0;color:var(--green)}
+.quote-change-pill.market-down{background:#fdf0ee;color:var(--red)}
+.quote-source{max-width:190px;overflow:hidden;text-overflow:ellipsis;color:var(--dim);font-size:10px}
+.quote-time{display:block;color:#8a95a3;font-size:9px;margin-top:3px}
+
+.watchlist-remove{width:27px;height:27px;border:none;background:transparent;
+  color:#a0a9b6;border-radius:5px;font-size:17px}
+.watchlist-remove:enabled:hover{color:var(--red);background:#fdf0ee}
+
+.watchlist-footer{min-height:46px;display:flex;align-items:center;justify-content:space-between;
+  flex-wrap:wrap;gap:8px;padding:12px 26px;border-top:1px solid var(--line);
+  color:#8a95a3;font-size:10px}
+.market-footer-divider{margin:0 10px;color:#c1c9d2}
+.market-up{color:var(--green)}
+.market-down{color:var(--red)}
+
+.market-data-status{display:flex;align-items:flex-start;justify-content:space-between;
+  gap:20px;margin:17px 2px 0;color:#8290a0;font-size:10px;line-height:1.7}
+.market-local-note{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.market-data-note{margin:7px 2px 0;max-width:850px;color:#8290a0;font-size:10px;line-height:1.7}
+
+.market-sr-only{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0;
+}
+
+/* account surface */
+.account-page{background:var(--side-bg);font-size:14px}
+
+.account-topbar{
+  display:flex;align-items:center;gap:17px;height:68px;padding:0 40px;
+  background:var(--panel);border-bottom:1px solid var(--line);color:var(--dim);font-size:12px;
+}
+.account-brand{color:var(--text);font-weight:700;letter-spacing:.12em}
+.account-divider{color:#c4cbd3}
+.account-back{margin-left:auto;color:var(--dim);font-size:11px}
+
+.account-main{width:100%;max-width:1280px;margin:0 auto;padding:38px 40px 54px}
+
+.account-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:27px}
+.account-eyebrow{margin:0 0 7px;color:var(--dim);font-size:10px;font-weight:600;letter-spacing:.16em}
+.account-heading h1{margin:0;font-size:26px;font-weight:650;letter-spacing:-.025em;color:var(--text)}
+.account-refresh-wrap{display:flex;align-items:center;gap:12px}
+.account-stamp{color:var(--dim);font-size:10px;text-align:right}
+.account-button{
+  min-height:35px;display:inline-flex;align-items:center;gap:7px;padding:7px 12px;
+  border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);
+  font-size:11px;font-weight:500;
+}
+.account-button svg{stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+
+.account-notice{
+  margin:0 0 16px;padding:12px 15px;border:1px solid #e9d8c0;border-radius:8px;
+  color:#80602f;background:#fffaf2;font-size:11px;
+}
+
+.account-overview,.account-records{border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.account-overview{padding:26px 30px 0}
+.account-overview-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.account-label{color:var(--dim);font-size:12px}
+.account-badge{
+  display:inline-flex;align-items:center;gap:5px;flex:none;padding:4px 9px;border-radius:5px;
+  font-size:10px;font-weight:500;line-height:1.4;white-space:nowrap;background:var(--inset);color:var(--dim);
+}
+.account-badge.paper{background:#eef7f1;color:var(--green)}
+
+.account-balance{
+  margin:12px 0 6px;font-size:48px;font-weight:600;letter-spacing:-.045em;line-height:1.2;
+  font-variant-numeric:tabular-nums;overflow-wrap:anywhere;color:var(--text);
+}
+.account-change{min-height:18px;margin:0 0 25px;color:var(--dim);font-size:12px}
+.account-change span+span{margin-left:8px}
+
+.account-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0;
+  padding:22px 0 25px;border-top:1px solid var(--line)}
+.account-metric{padding:0 27px}
+.account-metric:first-child{padding-left:0}
+.account-metric:not(:first-child){border-left:1px solid var(--line)}
+.account-metric dt{margin:0 0 7px;color:var(--dim);font-size:11px}
+.account-metric dd{margin:0;font-size:21px;line-height:1.3;font-weight:550;font-variant-numeric:tabular-nums}
+
+.pos{color:var(--green)}
+.neg{color:var(--red)}
+
+.account-records{margin-top:24px;overflow:hidden}
+.account-toolbar{min-height:70px;padding:0 26px;display:flex;align-items:center;
+  justify-content:space-between;gap:16px;border-bottom:1px solid var(--line)}
+.account-tabs{display:flex;align-self:stretch;align-items:center;gap:25px}
+.account-tab{position:relative;display:flex;align-items:center;gap:7px;padding:0 1px;
+  border:none;background:transparent;color:var(--dim);font-size:12px;white-space:nowrap}
+.account-tab.active{color:var(--text);font-weight:600}
+.account-tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;
+  height:2px;background:var(--accent)}
+.account-tab-count{min-width:19px;padding:1px 5px;border-radius:4px;background:var(--inset);
+  color:var(--dim);font-size:10px;text-align:center;font-variant-numeric:tabular-nums}
+.account-filters{display:flex;align-items:center;gap:9px}
+.account-select,.account-search{height:31px;border:1px solid var(--line);border-radius:6px;
+  background:var(--panel);font-size:11px;color:var(--text)}
+.account-select{max-width:140px;padding:0 24px 0 9px}
+.account-search{width:150px;padding:0 10px}
+
+.account-records-panel{min-height:270px}
+.account-table-scroll{position:relative;width:100%;overflow-x:auto}
+.account-table{width:100%;border-collapse:collapse;text-align:left;white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.account-table th{height:38px;padding:0 18px;background:#f9fafb;color:var(--dim);
+  font-size:11px;font-weight:500}
+.account-table td{height:66px;padding:12px 18px;border-bottom:1px solid var(--line);font-size:13px}
+.account-table tbody tr:last-child td{border-bottom:none}
+.account-table th:first-child,.account-table td:first-child{padding-left:27px}
+.account-table th:last-child,.account-table td:last-child{padding-right:27px}
+.account-table th:not(:first-child),.account-table td:not(:first-child){text-align:right}
+.account-table tbody tr:hover{background:#fbfcfd}
+.account-symbol{font-size:12px;font-weight:650;letter-spacing:.015em}
+.account-subvalue{display:block;margin-top:3px;color:var(--dim);font-size:10px;font-weight:400}
+.account-pnl.pos .account-subvalue{color:var(--green)}
+.account-pnl.neg .account-subvalue{color:var(--red)}
+.account-table-footer{padding:13px 26px;border-top:1px solid var(--line);color:var(--dim);
+  font-size:10px;line-height:1.6}
+
+.account-empty{min-height:270px;padding:45px 24px;display:flex;flex-direction:column;
+  align-items:center;text-align:center}
+.account-empty-icon{width:48px;height:48px;display:flex;align-items:center;justify-content:center;
+  margin-bottom:15px;border:1px solid var(--line);border-radius:12px;background:var(--inset);color:var(--dim)}
+.account-empty h2{margin:0 0 7px;font-size:15px;font-weight:600;color:var(--text)}
+.account-empty p{margin:0;max-width:430px;color:var(--dim);font-size:12px;line-height:1.7}
+
+.account-details{margin-top:8px}
+.account-details>summary{list-style:none;min-height:60px;padding:18px 4px;display:flex;
+  align-items:center;gap:12px;font-size:12px;font-weight:500;cursor:pointer;color:var(--text)}
+.account-details>summary::-webkit-details-marker{display:none}
+.account-details>summary::after{content:"⌄";margin-left:auto;color:var(--dim);font-size:13px}
+.account-details[open]>summary::after{transform:rotate(180deg)}
+.account-details-hint{margin-left:auto;color:var(--dim);font-size:10px;font-weight:400}
+.account-details-content{padding:22px 26px 24px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+/* Both halves of the product's pair, because the second is what decides how this
+   page renders. The rule separates stacked info grids from each other; the page
+   carries exactly one and it opens the disclosure, so the reset is the rule that
+   applies and no line is drawn above it — which is also why none is visible at
+   any width, folded or not. */
+.account-info{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px 24px;
+  margin:0;padding:20px 0;border-top:1px solid var(--line)}
+.account-info:first-child{padding-top:0;border-top:0}
+.account-info dt{margin:0 0 6px;color:var(--dim);font-size:10px}
+.account-info dd{margin:0;font-size:11px;line-height:1.6;color:var(--text)}
+.account-detail-note{margin:9px 0 0;color:var(--dim);font-size:10px;line-height:1.7;overflow-wrap:anywhere}
+
+.account-sr-only{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0;
+}
+
+/* payment surfaces — the agent's wallet. Every payment state on this page is
+   spelled with the strategy badge, so signed / enqueued / settled / draft read
+   the same way wherever they appear; the wallet page itself is built from the
+   account page's classes, so it folds exactly where the account folds. */
+.mono{font-family:var(--mono)}
+.ch-badge[data-status="settled"]{color:var(--green);border-color:currentColor}
+.ch-badge[data-status="enqueued"],.ch-badge[data-status="signed"]{color:var(--accent);border-color:currentColor}
+.ch-badge[data-status="rejected"],.ch-badge[data-status="expired-unused"]{color:var(--red);border-color:currentColor}
+.ch-badge[data-status="draft"]{color:var(--danger);border-color:var(--danger)}
+.ch-badge[data-status="disabled"]{opacity:.5}
+.account-table .mono{font-size:11px}
+.account-table th.text,.account-table td.text{text-align:left}
+/* a label, not a control: the wallet's record groups are single tables, so the
+   tab is a span and neither offers a click nor needs greying out */
+.account-tab.static{cursor:default}
+/* the one line in this table allowed to wrap: a status cut to "e…" says nothing */
+.quote-pay{display:block;max-width:190px;white-space:normal;color:#8a95a3;font-size:9px;line-height:1.5;margin-top:3px}
+.quote-pay .mono{font-size:9px}
+/* a collapsible card has no visible left border, so the colour lives in the
+   kind label, as it does for dispatch */
+.card.pay .kind{color:var(--green)}
+.card.pay .sum{color:var(--text)}
+.card.pay.refused .kind{color:var(--danger)}
+.card-body{margin:4px 0 0 18px;font:11px/1.6 var(--mono);color:var(--dim);white-space:pre-wrap}
+
+/* sidebar channel list — shared chrome, filled in for the strategy surface */
+.conv-group{
+  padding:10px 16px 3px;display:flex;align-items:baseline;gap:6px;
+  font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--accent);
+}
+.conv-group .chev{flex:none;font:10px var(--mono);color:var(--dim)}
+.needs-you{color:var(--danger);font-size:9px;margin-left:4px}
+.conv-group-n{margin-left:auto;font:10px var(--mono);color:var(--dim)}
+.conv{padding:10px 16px;border-bottom:1px solid var(--line)}
+.conv.active{background:var(--active-bg)}
+.conv-top{display:flex}
+.conv-name{font-weight:600;font-size:14px}
+.conv-sub{display:flex;align-items:center;gap:6px;margin-top:4px}
+.chip{
+  flex:none;font:500 9.5px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em;
+  padding:2px 6px;border:1px solid var(--line);border-radius:var(--r-chip);color:var(--dim);
+}
+.chip.waiting{color:var(--danger);border-color:var(--danger)}
+
+/* strategy surface — the channel landing view */
+.strategy-page .detail-inner{max-width:760px;margin:0 auto;padding:22px 24px 40px}
+
+.ch-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 10px}
+.ch-title{margin:0;font:650 20px/1.3 var(--sans);color:var(--text)}
+.ch-badge{
+  flex:none;font:500 9.5px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em;
+  padding:2px 7px;border:1px solid var(--line);border-radius:var(--r-chip);color:var(--dim);
+}
+.ch-badge[data-status="retired"]{color:var(--red);border-color:currentColor}
+.ch-chip-sample{
+  flex:none;font:500 9.5px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em;
+  padding:2px 6px;border:1px solid var(--line);border-radius:var(--r-chip);color:var(--dim);
+}
+.ch-path{flex-basis:100%;margin-top:-4px;font:10.5px/1.5 var(--mono);color:var(--dim);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ch-chips{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:2px}
+.ch-chips-label{font:500 10px/1 var(--sans);letter-spacing:.06em;text-transform:uppercase;
+  color:var(--dim);margin-right:2px}
+.ch-chip{
+  border:1px solid var(--line);background:var(--panel);color:var(--dim);border-radius:var(--r-chip);
+  font:500 11.5px var(--mono);padding:3px 11px;
+}
+.ch-chip.on{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+
+.ch-sec{margin:24px 0 0}
+.ch-sec h3{font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+  color:var(--dim);margin:0 0 10px}
+.ch-sec details{margin-top:10px}
+.ch-sec summary{font:11px var(--mono);color:var(--accent);cursor:pointer}
+
+.md p{margin:0 0 8px;white-space:pre-wrap}
+.md-h{font-weight:650;line-height:1.35;margin:14px 0 6px;color:var(--text)}
+.md-h1{font-size:17px}
+.md-h2{font-size:15.5px}
+.md-list{margin:0 0 8px;padding-left:22px}
+.md-list li{margin:2px 0}
+.md-redacted{color:var(--dim)}
+
+.ch-file{font:12px/1.7 var(--mono);color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.viz-scroll.detail-table{border:1px solid var(--line);border-radius:var(--r-card);background:var(--panel);overflow:auto}
+.viz-table{border-collapse:collapse;width:100%;font-size:12.5px}
+.viz-table td{padding:5px 10px;border-bottom:1px solid var(--viz-grid);white-space:normal}
+.viz-table tr:last-child td{border-bottom:none}
+
+/* agent surface — the room (a channel session with bots rostered) */
+.room-page{background:var(--bg)}
+
+.topbar{display:flex;align-items:center;gap:8px;padding:10px 20px;
+  background:var(--panel);border-bottom:1px solid var(--line)}
+.topbar-name{font-weight:600;font-size:15px;color:var(--text)}
+.raw{margin-left:auto;font:11px var(--mono);color:var(--dim);
+  text-decoration:underline dotted;text-underline-offset:2px}
+
+.strip{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 18px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.strip-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;
+  border:1px solid var(--line);border-radius:var(--r-chip);font:11px var(--mono);
+  color:var(--dim);background:var(--bg)}
+.strip-chip .avatar{color:var(--accent)}
+.strip-chip .strip-name{color:var(--text)}
+.strip-state{text-transform:uppercase;letter-spacing:.06em;font-size:9.5px}
+.strip-chip[data-state="idle"] .strip-state{display:none}
+.strip-chip[data-state="organizing"],
+.strip-chip[data-state="thinking"],
+.strip-chip[data-state="writing"],
+.strip-chip[data-state="called"]{border-color:var(--accent)}
+.strip-chip[data-state="waiting for you"]{border-color:var(--danger);color:var(--danger)}
+.strip-chip[data-state="answered"] .strip-state{color:var(--green)}
+.strip-chip[data-state="failed"] .strip-state,
+.strip-chip[data-state="timed-out"] .strip-state{color:var(--red)}
+.strip-chip.left{opacity:.6}
+
+.room-sample-note{padding:8px 18px 0;margin:0}
+
+.flow-inner{max-width:760px;margin:0 auto;padding:18px 20px 28px;
+  display:flex;flex-direction:column;gap:10px}
+
+.msg{display:flex;flex-direction:column;max-width:78%}
+.msg.op{align-self:flex-end;align-items:flex-end}
+.msg.k{align-self:flex-start;align-items:flex-start;min-width:0;max-width:100%}
+.msg.k.doc{max-width:100%}
+
+.bubble{padding:9px 14px;border-radius:var(--r-bubble);font-size:14.5px;line-height:1.55;
+  overflow-wrap:break-word}
+.bubble.pre{white-space:pre-wrap}
+.msg.op .bubble{background:var(--op-bubble);color:var(--op-text);border:none;
+  border-bottom-right-radius:5px}
+
+.msg.k .who{margin:0 0 3px 4px;font:10.5px var(--mono);letter-spacing:.1em;
+  text-transform:uppercase;color:var(--dim)}
+.msg.k .bubble{background:var(--k-bubble);border:1px solid var(--line);
+  border-radius:var(--r-bubble);border-bottom-left-radius:5px}
+.md-bubble{font-size:14px}
+
+.msg.bot .who{display:flex;align-items:center;gap:6px;text-transform:none;letter-spacing:.04em}
+.msg.bot .avatar{font-size:11px;color:var(--accent)}
+.msg.bot .bubble{border-left:3px solid var(--accent)}
+
+.room-view-details{margin-top:12px;padding-top:8px;border-top:1px solid var(--line);
+  font:12px/1.6 var(--sans)}
+.room-view-details summary{cursor:pointer;color:var(--dim);padding:2px 0}
+.room-view-details summary:hover{color:var(--text)}
+.room-view-details summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.room-view-details[open]>summary{margin-bottom:10px}
+.room-view-fields{display:flex;flex-direction:column;gap:10px}
+.room-view-field{margin-top:8px;min-width:0}
+.room-view-label{font:600 11px/1.5 var(--sans);color:var(--dim)}
+.room-view-list{margin:5px 0 0;padding-left:19px;white-space:pre-wrap}
+.room-view-list li+li{margin-top:5px}
+.room-view-empty{color:var(--dim);font-size:11px;line-height:1.6}
+.room-view-note{color:var(--dim);font-size:11px;line-height:1.6;margin:4px 0}
+.room-brief-text{white-space:pre-wrap}
+
+.answer-trace{min-width:0;margin-top:10px}
+.trace-toggle{display:flex;align-items:center;justify-content:flex-end;gap:6px;
+  width:fit-content;margin-left:auto;padding:3px 6px;border-radius:6px;color:var(--dim);
+  font:11px/1.5 var(--sans);list-style:none;cursor:pointer;user-select:none}
+.trace-toggle::-webkit-details-marker{display:none}
+.trace-toggle:hover{color:var(--accent);background:var(--active-bg)}
+.trace-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.trace-count{font:10px var(--mono)}
+.trace-chevron{font-size:14px;line-height:1;transition:transform .12s}
+.answer-trace[open] .trace-chevron{transform:rotate(180deg)}
+.trace-content{display:flex;flex-direction:column;gap:6px;margin-top:8px;padding-top:10px;
+  border-top:1px solid var(--line);min-width:0}
+/* A trace whose turn ended without an answer stays in the flow on its own,
+   left-aligned and full width, instead of hanging off an answer bubble. */
+.trace-pending{align-self:flex-start;width:100%;margin-top:0}
+.trace-pending>.trace-toggle{margin-left:0}
+
+.card{align-self:stretch;margin:2px 0;padding:10px 14px;background:var(--card-bg);
+  border:1px solid var(--line);border-left:2px solid var(--line);border-radius:var(--r-card)}
+.card.collapsible{background:transparent;border:none;padding:3px 14px;margin:0}
+.card-head{display:flex;align-items:baseline;gap:8px;min-width:0;cursor:pointer;user-select:none}
+.chev{font:10px/1 var(--mono);color:var(--dim)}
+.kind{font:600 10px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+.sum{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px var(--mono);color:var(--dim)}
+.producer{flex:none;font:11px var(--mono);color:var(--dim)}
+.card.dispatch{border-left-color:var(--accent)}
+.card.dispatch .kind{color:var(--accent)}
+.card.dispatch .sum{color:var(--text)}
+.card.think .kind{color:var(--accent)}
+
+.room-round-end{display:flex;flex-direction:column;align-self:stretch;gap:10px;min-width:0;margin:6px 0 14px}
+.room-line{align-self:center;max-width:88%;margin:4px 0;padding:3px 10px;
+  border:1px dashed var(--line);border-radius:var(--r-chip);font:11px var(--mono);
+  letter-spacing:.04em;color:var(--dim);text-align:center}
+.room-discussion{align-self:center;width:min(100%,960px);padding:16px;
+  border:1px solid var(--line);border-radius:10px;background:var(--panel);
+  font:13px/1.6 var(--sans);overflow-wrap:anywhere}
+.room-discussion-title{font-weight:650;font-size:14px}
+.room-brief{margin:14px 0;padding:11px 12px;border-left:2px solid var(--accent);background:var(--card-bg)}
+.room-brief-question{margin-top:3px;white-space:pre-wrap}
+.room-discussion-voices{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));
+  gap:10px;margin:14px 0}
+.room-discussion-voice{border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
+.room-discussion-voice-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:5px 9px;margin-bottom:9px}
+.room-discussion-name{font-size:12px;font-weight:650;color:var(--accent)}
+.room-conversation{border:0;padding:0;background:transparent;color:var(--dim);cursor:pointer;
+  font:11px/1.5 var(--sans);text-align:left}
+.room-conversation:enabled:hover{color:var(--accent);text-decoration:underline}
+.room-conversation:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.room-view-turn{color:var(--dim);font-size:10px}
+.room-view-position{white-space:pre-wrap;padding-bottom:9px;border-bottom:1px solid var(--line)}
+.room-discussion-voice .room-view-list{font-size:12px}
+.room-disagreements,.room-discussion-missing{border-top:1px solid var(--line);padding-top:11px;margin-top:13px}
+
+/* An inert control reads the same way on every surface: present, dimmed, and
+   carrying no pointer. This was written once per surface and the room is the
+   surface that never got a copy — its five 查看原对话 buttons sat at full
+   strength with a pointer and a link-coloured hover, under an annotation that
+   says the page greys its controls out. One rule cannot be forgotten by a
+   surface. It sits here, below every rule it has to beat, and the two :hover
+   rules that could still light a disabled control are scoped to :enabled where
+   they are written. Disclosure summaries keep their pointer and their hover:
+   they are the navigation that does work. */
+:disabled{opacity:.5;cursor:default}
+
+/* ── responsive ──────────────────────────────────────────────────────────────
+   The product is a desktop workbench: its own stylesheets fold the market
+   surface at 1050/740/500, the account surface at 900/640 and the room's
+   comparison card at 600, and carry no breakpoint at all for the frame — rail,
+   sidebar and lane never reflow there. So everything below is the product's own
+   folding, at the product's own widths, with two exceptions, each marked where
+   it sits: the 900px frame fold, which the page's opening annotation declares as
+   its own, and one wrapping line in the market's last fold.
+
+   Ordered widest to narrowest, because the narrower rules override the wider
+   ones on the properties they share (the market gutters, most of all).
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* the market's first fold: 成交量 goes, the rest keeps its shape */
+@media (max-width:1050px){
+  .market-topbar{padding:0 28px}
+  .market-main{padding:35px 28px}
+  .market-tabs{gap:19px}
+  .market-table th,.market-table td{padding-left:15px;padding-right:15px}
+  .market-table .quote-volume-col{display:none}
+}
+
+/* the frame folds: the rail lies down across the top, the sidebar sits above
+   the surface, and the lane has the window to itself. The page's own rule. */
+@media (max-width:900px){
+  /* the frame stops being the scrollport too: folded, the page is one column
+     again and the document scrolls the ordinary way */
+  html,body{height:auto}
+  body{display:block;overflow:visible}
+  .site-frame{display:block;flex:none;min-height:0;overflow:visible}
+  .rail{
+    position:static;width:auto;height:auto;
+    flex-direction:row;flex-wrap:wrap;gap:4px;padding:6px 10px;
+    border-right:0;border-bottom:1px solid var(--line);
+  }
+  .rail-btn{flex-direction:row;gap:7px;padding:7px 10px}
+  /* the bottom pin has no bottom to reach in a row; order is unchanged */
+  .rail-account{margin-top:0}
+  .sidebar{position:static;height:auto;width:auto;min-width:0;
+    border-right:0;border-bottom:1px solid var(--line)}
+  /* the channel list keeps its own scroll rather than pushing the surface a
+     screen and a half down the page */
+  .conv-list{max-height:196px}
+  .note{max-width:none}
+  .main>.note{margin:14px 19px}
+
+  .account-main{padding:30px 26px 40px}
+  .account-topbar{padding:0 26px}
+  .account-stamp{max-width:155px}
+  .account-toolbar{padding:0 20px;gap:12px}
+  .account-tabs{gap:19px}
+  .account-search{width:135px}
+  .account-info{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* the market's second fold: 涨跌额 goes; the signed percentage stays */
+@media (max-width:740px){
+  .market-topbar{height:64px;padding:0 19px;gap:12px}
+  .market-search-trigger{width:230px}
+  .market-main{padding:29px 19px}
+  .market-heading h1{font-size:28px}
+  .watchlist-toolbar{flex-wrap:wrap;padding:0 18px;gap:0}
+  .market-tabs{width:100%;height:59px;gap:23px}
+  .watchlist-actions{width:100%;justify-content:flex-end;padding:10px 0;
+    border-top:1px solid #edf0f3}
+  .market-data-status{flex-direction:column;gap:5px}
+  .market-table th:first-child,.market-table td:first-child{padding-left:18px}
+  .market-table .quote-change-col{display:none}
+}
+
+/* the account's second fold: the three metrics unstack into labelled rows */
+@media (max-width:640px){
+  .account-topbar{height:56px;padding:0 14px;gap:12px;font-size:11px}
+  .account-back{font-size:10px}
+  .account-main{padding:24px 14px 35px}
+  .account-heading{align-items:flex-start;gap:10px;margin-bottom:19px}
+  .account-heading h1{font-size:22px;white-space:nowrap}
+  .account-eyebrow{font-size:9px}
+  .account-refresh-wrap{gap:8px;flex-direction:column-reverse;align-items:flex-end}
+  .account-stamp{max-width:130px;font-size:9px}
+  .account-overview{padding:21px 20px 0}
+  .account-overview-head{align-items:flex-start;gap:7px}
+  .account-balance{font-size:36px;margin-top:14px}
+  .account-change{font-size:11px;margin-bottom:20px}
+  .account-metrics{display:block;padding:2px 0}
+  .account-metric,.account-metric:first-child{display:flex;align-items:center;
+    justify-content:space-between;gap:12px;padding:17px 0}
+  .account-metric:not(:first-child){border-left:0;border-top:1px solid var(--line)}
+  .account-metric dt{margin:0;flex:none;font-size:10px}
+  .account-metric dd{font-size:18px;text-align:right}
+  .account-records{margin-top:18px}
+  .account-toolbar{min-height:63px;padding:0 16px;align-items:stretch;flex-wrap:wrap;gap:0}
+  .account-tabs{width:100%;min-height:58px;gap:25px}
+  .account-filters{width:100%;padding:0 0 13px}
+  .account-search{flex:1;width:0;min-width:85px}
+  .account-table th,.account-table td{padding-left:14px;padding-right:14px}
+  .account-table th:first-child,.account-table td:first-child{padding-left:18px}
+  .account-table th:last-child,.account-table td:last-child{padding-right:18px}
+  .account-records-panel,.account-empty{min-height:250px}
+  .account-empty{padding:35px 19px}
+  .account-table-footer{padding:11px 17px}
+  .account-details>summary{min-height:55px;padding:17px 3px}
+  .account-details-hint{font-size:9px}
+  .account-details-content{padding:18px 17px}
+  .account-info{gap:18px 15px}
+}
+
+/* the room's comparison card: the voices stop sitting side by side */
+@media (max-width:600px){
+  .room-discussion{padding:12px}
+  .room-discussion-voices{grid-template-columns:1fr}
+}
+
+/* the market's last fold: 行情来源 and the asset mark go. What survives is the
+   symbol, the price, and the signed percentage — the sign is what the order of
+   these three folds exists to protect, because colour never carries direction
+   on its own here. */
+@media (max-width:500px){
+  .market-topbar{padding:0 14px;gap:9px}
+  .market-brand{font-size:10px}
+  .market-section{font-size:10px}
+  .market-search-trigger{width:35px;min-height:34px;padding:7px;justify-content:center}
+  .market-search-trigger span,.market-search-trigger kbd{display:none}
+  .market-main{padding:28px 13px}
+  .market-heading{align-items:flex-start;gap:10px;margin-bottom:23px}
+  .market-eyebrow{font-size:8px;letter-spacing:.1em}
+  .market-heading h1{font-size:26px}
+  .market-description{max-width:175px;font-size:10px;line-height:1.7}
+  .market-heading .market-button{margin-top:24px;padding:7px 9px;min-height:33px;
+    font-size:10px;white-space:nowrap}
+  .watchlist-toolbar{padding:0 13px}
+  .market-tabs{gap:15px;justify-content:space-between}
+  .market-tab{gap:4px;font-size:10px}
+  .market-count{font-size:9px;min-width:16px;padding:1px 4px}
+  .watchlist-footer{padding:12px 14px;font-size:9px}
+  .market-footer-divider{margin:0 5px}
+  .market-table td{height:75px}
+  /* The one rule here the product does not carry. Its price cell keeps the
+     currency and the event time on one unwrappable line, which at this width
+     is wider than the phone itself and pushes the signed percentage out of the
+     first screen — the column order above exists precisely so that percentage
+     is what survives. Letting that one line wrap costs no datum and no column;
+     nothing else in the table is allowed to wrap. */
+  .quote-price .quote-unit{white-space:normal}
+  .market-table .quote-source-col{display:none}
+  .asset-mark{display:none}
+  .asset-market{display:none}
+  .market-asset{gap:0}
+  .asset-name{max-width:85px;font-size:9px}
+  .asset-symbol{font-size:11px}
+  .market-table th,.market-table td{padding:12px 9px;font-size:11px}
+  .market-table th:last-child,.market-table td:last-child{padding-right:10px}
+  .quote-change-pill{min-width:62px;font-size:10px;padding:4px}
+}
+</style>
+</head>
+<body>
+<div class="site-banner">
+  以下为产品界面复刻，所有行情、账户、对话与付款数据均为虚构样例；链上哈希取自本地测试链的一次演示运行，不对应任何真实资产。
+</div>
+
+<div class="site-frame">
+  <nav class="rail" aria-label="primary navigation">
+    <a class="rail-btn active" data-nav="market" href="#market" aria-current="page">
+      <svg class="rail-glyph" viewBox="0 0 18 18" width="16" height="16" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="2,13 6.5,8 10,10.5 16,3.5"></polyline>
+        <polyline points="12,3.5 16,3.5 16,7.5"></polyline>
+      </svg>
+      <span class="rail-label">market</span>
+    </a>
+    <a class="rail-btn" data-nav="strategy" href="#strategy">
+      <span class="rail-glyph" aria-hidden="true">❖</span><span class="rail-label">strategy</span>
+    </a>
+    <a class="rail-btn" data-nav="agent" href="#agent">
+      <span class="rail-glyph" aria-hidden="true">◎</span><span class="rail-label">agent</span>
+    </a>
+    <a class="rail-btn" data-nav="wallet" href="#wallet">
+      <svg class="rail-glyph" viewBox="0 0 18 18" width="16" height="16" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="4.5" width="14" height="10" rx="2"></rect>
+        <path d="M2 8h14"></path>
+        <path d="M11 11.5h3"></path>
+      </svg>
+      <span class="rail-label">wallet</span>
+    </a>
+    <span class="rail-btn rail-off" data-nav="memory" aria-disabled="true">
+      <span class="rail-glyph" aria-hidden="true">▤</span><span class="rail-label">memory</span>
+    </span>
+    <span class="rail-btn rail-off" data-nav="plugin" aria-disabled="true">
+      <span class="rail-glyph" aria-hidden="true">⚙</span><span class="rail-label">plugin</span>
+    </span>
+    <a class="rail-btn rail-account" data-nav="account" href="#account">
+      <svg class="rail-glyph" viewBox="0 0 18 18" width="16" height="16" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="4.5" width="14" height="10" rx="2"></rect>
+        <path d="M11.5 9.5h4.5"></path>
+        <circle cx="11.8" cy="9.5" r="1" fill="currentColor" stroke="none"></circle>
+      </svg>
+      <span class="rail-label">account</span>
+    </a>
+  </nav>
+
+  <aside class="sidebar" hidden>
+    <div class="side-head">
+      <div class="side-brand">Kairos</div>
+    </div>
+    <div class="conv-list">
+      <div class="conv-group">
+        <span class="chev" aria-hidden="true">▾</span>
+        <span class="conv-group-name">跟进研究</span>
+        <span class="conv-group-n">1</span>
+      </div>
+      <div class="conv active">
+        <div class="conv-top"><span class="conv-name">反向假设复核</span></div>
+      </div>
+
+      <div class="conv-group">
+        <span class="chev" aria-hidden="true">▾</span>
+        <span class="conv-group-name">波动率择时</span>
+        <span class="needs-you" title="a session in this channel is waiting on you">●</span>
+        <span class="conv-group-n">3</span>
+      </div>
+      <div class="conv">
+        <div class="conv-top"><span class="conv-name">初始假设梳理</span></div>
+      </div>
+      <div class="conv">
+        <div class="conv-top"><span class="conv-name">证伪条款讨论</span></div>
+        <div class="conv-sub"><span class="chip waiting">waiting</span></div>
+      </div>
+      <div class="conv">
+        <div class="conv-top"><span class="conv-name">数据口径核对</span></div>
+        <div class="conv-sub"><span class="chip">running</span></div>
+      </div>
+
+      <div class="conv-group">
+        <span class="chev" aria-hidden="true">▾</span>
+        <span class="conv-group-name">跨市场估值离散</span>
+        <span class="conv-group-n">2</span>
+      </div>
+      <div class="conv">
+        <div class="conv-top"><span class="conv-name">样本市场选取</span></div>
+      </div>
+      <div class="conv">
+        <div class="conv-top"><span class="conv-name">初步相关性观察</span></div>
+      </div>
+
+      <div class="conv-group">
+        <span class="chev" aria-hidden="true">▸</span>
+        <span class="conv-group-name">archived</span>
+        <span class="conv-group-n">4</span>
+      </div>
+    </div>
+    <div class="side-foot">演示 · 示例数据</div>
+  </aside>
+
+  <main class="main">
+    <div class="note">
+      <span class="note-i">关于这张页面本身</span>
+      这套工作台按 1280×800 的桌面尺寸设计，产品本身没有移动端形态；窗口变窄时行情与账户表格折叠掉部分列，那是产品自己的规则。把导航栏与侧边栏一并重排到窄屏，则是这张介绍页自己加的处理，不是产品的一项能力。
+    </div>
+    <div class="note">
+      <span class="note-i">这张页面上哪些东西会动</span>
+      除左侧导航栏的五站与账户页的持仓 / 订单两个标签外，页面上的按钮、搜索框与排序控件一律置灰不可用（钱包页的「对账」按钮也是），本页也不发出任何请求。导航栏上的 memory 与 plugin 是产品里真实存在的界面，这次介绍不展开，因此它们在这里不可点。
+    </div>
+    <section data-surface="market" class="surface market-page">
+      <header class="market-topbar">
+        <span class="market-brand">KAIROS</span>
+        <span class="market-divider">/</span>
+        <span class="market-section">Market</span>
+        <button class="market-search-trigger" type="button" disabled>
+          <svg viewBox="0 0 18 18" width="18" height="18" aria-hidden="true">
+            <circle cx="8.5" cy="8.5" r="5.5"></circle>
+            <path d="m13 13 4 4"></path>
+          </svg>
+          <span>搜索股票、加密货币</span>
+          <kbd>⌘ K</kbd>
+        </button>
+      </header>
+
+      <div class="market-main">
+        <div class="market-heading">
+          <div>
+            <p class="market-eyebrow">YOUR MARKETS, TOGETHER</p>
+            <h1>自选股<span class="market-heading-dot">.</span></h1>
+            <p class="market-description">美股、A 股与加密货币，关注尽在一处。</p>
+          </div>
+          <button class="market-button primary" type="button" disabled><span aria-hidden="true">＋</span> 添加自选</button>
+        </div>
+
+        <div class="market-notice" role="status">本页为产品介绍用的界面复刻，行情为虚构样例，不代表任何真实报价或持仓。</div>
+
+        <section class="watchlist" aria-label="自选行情">
+          <div class="watchlist-toolbar">
+            <div class="market-tabs" role="group" aria-label="按市场筛选">
+              <button class="market-tab active" type="button" aria-pressed="true" disabled>全部<span class="market-count">5</span></button>
+              <button class="market-tab" type="button" aria-pressed="false" disabled>美股<span class="market-count">2</span></button>
+              <button class="market-tab" type="button" aria-pressed="false" disabled>A 股<span class="market-count">1</span></button>
+              <button class="market-tab" type="button" aria-pressed="false" disabled>加密货币<span class="market-count">2</span></button>
+            </div>
+            <div class="watchlist-actions">
+              <label class="market-sr-only" for="watchlist-sort">自选排序</label>
+              <select id="watchlist-sort" disabled>
+                <option>添加顺序</option>
+                <option>代码 A → Z</option>
+                <option>涨幅优先</option>
+                <option>跌幅优先</option>
+              </select>
+              <button class="market-icon-button" type="button" aria-label="刷新行情" title="刷新行情" disabled>
+                <svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true">
+                  <path d="M16 7.5a6.5 6.5 0 1 0 .2 4M16 3.5v4h-4"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="market-table-scroll">
+            <table class="market-table">
+              <caption class="market-sr-only">自选行情；缺失数据以横线表示。各标的标明行情来源、事件时间及实时、延迟或过期状态；每行末尾的付费一行来自钱包账本，写明单价、mandate 摘要与结算状态。</caption>
+              <thead>
+                <tr>
+                  <th scope="col">标的 / 名称</th>
+                  <th scope="col">最新价</th>
+                  <th scope="col" class="quote-change-col">涨跌额</th>
+                  <th scope="col">涨跌幅</th>
+                  <th scope="col" class="quote-volume-col">成交量</th>
+                  <th scope="col" class="quote-source-col">行情来源 / 时间 / 付费</th>
+                  <th scope="col"><span class="market-sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>
+                    <div class="market-asset">
+                      <span class="asset-mark us" aria-hidden="true">AAP</span>
+                      <div>
+                        <span class="asset-symbol">AAPL<span class="asset-market">美股</span></span>
+                        <span class="asset-name">Apple</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="quote-price">$188.40
+                    <span class="quote-unit">USD · 2026/09/15 GMT-4 16:00:02（本地）</span>
+                    <span class="quote-unit">实时</span>
+                  </td>
+                  <td class="quote-change-col market-up">+2.16</td>
+                  <td>
+                    <span class="quote-change-pill market-up">+1.16%</span>
+                    <span class="quote-unit">较昨收</span>
+                  </td>
+                  <td class="quote-volume-col">41,250,000<span class="quote-unit">股</span></td>
+                  <td class="quote-source-col">
+                    <div class="quote-source">示例行情源</div>
+                    <span class="quote-time">2026/09/15 GMT-4 16:00:02（本地）— 实时</span>
+                    <span class="quote-pay">付费 $0.001 · <span class="mono">0x3ecce516..dfcf</span> · settled</span>
+                  </td>
+                  <td><button class="watchlist-remove" type="button" aria-label="移除 Apple" title="移除 Apple" disabled>×</button></td>
+                </tr>
+                <tr>
+                  <td>
+                    <div class="market-asset">
+                      <span class="asset-mark us" aria-hidden="true">SPY</span>
+                      <div>
+                        <span class="asset-symbol">SPY<span class="asset-market">美股</span></span>
+                        <span class="asset-name">SPDR S&amp;P 500 ETF</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="quote-price">$517.30
+                    <span class="quote-unit">USD · 2026/09/15 GMT-4 16:00:02（本地）</span>
+                    <span class="quote-unit">定时更新 · 常规交易休市</span>
+                  </td>
+                  <td class="quote-change-col market-down">-3.05</td>
+                  <td>
+                    <span class="quote-change-pill market-down">-0.59%</span>
+                    <span class="quote-unit">较昨收</span>
+                  </td>
+                  <td class="quote-volume-col">68,400,000<span class="quote-unit">股</span></td>
+                  <td class="quote-source-col">
+                    <div class="quote-source">示例行情源</div>
+                    <span class="quote-time">2026/09/15 GMT-4 16:00:02（本地）— 定时更新 · 常规交易休市</span>
+                    <span class="quote-pay">付费 $0.001 · <span class="mono">0xe831823a..3c3a</span> · settled</span>
+                  </td>
+                  <td><button class="watchlist-remove" type="button" aria-label="移除 SPDR S&amp;P 500 ETF" title="移除 SPDR S&amp;P 500 ETF" disabled>×</button></td>
+                </tr>
+                <tr>
+                  <td>
+                    <div class="market-asset">
+                      <span class="asset-mark cn" aria-hidden="true">贵</span>
+                      <div>
+                        <span class="asset-symbol">600519<span class="asset-market">A 股</span></span>
+                        <span class="asset-name">贵州茅台</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="quote-price">¥1,438.50
+                    <span class="quote-unit">CNY · 2026/09/15 GMT+8 15:00:00（本地）</span>
+                    <span class="quote-unit">定时更新</span>
+                  </td>
+                  <td class="quote-change-col market-down">-12.60</td>
+                  <td>
+                    <span class="quote-change-pill market-down">-0.87%</span>
+                    <span class="quote-unit">较昨收</span>
+                  </td>
+                  <td class="quote-volume-col">3,120,000</td>
+                  <td class="quote-source-col">
+                    <div class="quote-source">示例行情源</div>
+                    <span class="quote-time">2026/09/15 GMT+8 15:00:00（本地）— 定时更新</span>
+                    <span class="quote-pay">免费来源 · 未签 mandate</span>
+                  </td>
+                  <td><button class="watchlist-remove" type="button" aria-label="移除 贵州茅台" title="移除 贵州茅台" disabled>×</button></td>
+                </tr>
+                <tr>
+                  <td>
+                    <div class="market-asset">
+                      <span class="asset-mark crypto" aria-hidden="true">BTC</span>
+                      <div>
+                        <span class="asset-symbol">BTC/USD<span class="asset-market">加密货币</span></span>
+                        <span class="asset-name">Bitcoin</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="quote-price">$61,805.40
+                    <span class="quote-unit">USD · 2026/09/16 GMT+8 09:41:18（本地）</span>
+                    <span class="quote-unit">实时</span>
+                  </td>
+                  <td class="quote-change-col market-up">+1,240.60</td>
+                  <td>
+                    <span class="quote-change-pill market-up">+2.05%</span>
+                    <span class="quote-unit">24 小时</span>
+                  </td>
+                  <td class="quote-volume-col">18,420.315<span class="quote-unit">24h · BTC</span></td>
+                  <td class="quote-source-col">
+                    <div class="quote-source">示例行情源</div>
+                    <span class="quote-time">2026/09/16 GMT+8 09:41:18（本地）— 实时</span>
+                    <span class="quote-pay">付费 $0.001 · <span class="mono">0xf2424453..09df</span> · enqueued</span>
+                  </td>
+                  <td><button class="watchlist-remove" type="button" aria-label="移除 Bitcoin" title="移除 Bitcoin" disabled>×</button></td>
+                </tr>
+                <tr>
+                  <td>
+                    <div class="market-asset">
+                      <span class="asset-mark crypto" aria-hidden="true">ETH</span>
+                      <div>
+                        <span class="asset-symbol">ETH/USD<span class="asset-market">加密货币</span></span>
+                        <span class="asset-name">Ethereum</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="quote-price">—
+                    <span class="quote-unit">暂无报价</span>
+                  </td>
+                  <td class="quote-change-col">—</td>
+                  <td>
+                    <span class="quote-change-pill">—</span>
+                    <span class="quote-unit">24 小时</span>
+                  </td>
+                  <td class="quote-volume-col">—</td>
+                  <td class="quote-source-col">
+                    <div class="quote-source">示例行情源</div>
+                    <span class="quote-time">— — 暂无报价</span>
+                    <span class="quote-pay">未付费 · 签名前被拒：mandate_insufficient_budget</span>
+                  </td>
+                  <td><button class="watchlist-remove" type="button" aria-label="移除 Ethereum" title="移除 Ethereum" disabled>×</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="watchlist-footer">
+            <span>5 个自选</span>
+            <span>原币报价<span class="market-footer-divider">·</span><span class="market-up">绿涨</span> / <span class="market-down">红跌</span></span>
+          </div>
+        </section>
+
+        <div class="note">
+          <span class="note-i">行情来源 / 时间 这一列</span>
+          每一行都标明报价的事件时间，以及它是实时、定时更新、延迟还是已经过期。页面不会把一个旧报价显示成当前价。
+        </div>
+        <div class="note">
+          <span class="note-i">ETH/USD 那一行的横线</span>
+          拿不到数据就显示横线，并写明「暂无报价」。缺失会被说出来，不会被补成 0，也不会被静默跳过。
+        </div>
+        <div class="note">
+          <span class="note-i">行情来源下面的付费一行</span>
+          这一行是钱包账本的记录，不是行情源给的：金额是这条报价的单价，状态跟着结算处理器（SP）的结算走。免费来源不会有签名；ETH/USD 那一行拿不到报价，是因为这次付费在签名前就被预算拒了，原因照写在这里。协议里数据源是先把 mandate 交给 SP 排队、再交付结果，所以「没拿到数据就不付钱」是对数据源的信任，不是协议给的保证。
+        </div>
+        <div class="note">
+          <span class="note-i">涨跌幅的正负号与页脚的绿涨 / 红跌</span>
+          方向永远同时由符号和颜色表示。窄屏下会依次折叠成交量、涨跌额和来源列，但带符号的涨跌幅始终保留。
+        </div>
+        <div class="note">
+          <span class="note-i">自选列表整体</span>
+          这里只有价格，没有持仓、数量或成本。自选是关注列表，不是账本。
+        </div>
+
+        <div class="market-data-status">
+          <span>行情已连接</span>
+          <span class="market-local-note">🔒 自选保存在此浏览器</span>
+        </div>
+        <p class="market-data-note">美股与 A 股涨跌以昨收为基准；加密货币为过去 24 小时。时间显示行情事件时间，非页面刷新时间。付费一行来自钱包账本，不来自行情源；行情源只知道它收到了一张 mandate。</p>
+      </div>
+    </section>
+    <section data-surface="strategy" class="surface strategy-page" hidden>
+      <div class="detail-inner">
+        <div class="ch-head">
+          <h2 class="ch-title">市场情绪</h2>
+          <span class="ch-badge" data-status="retired">RETIRED</span>
+          <span class="ch-chip-sample">界面复刻</span>
+          <div class="ch-path">channel · market-sentiment · 已退役</div>
+          <div class="ch-chips">
+            <span class="ch-chips-label">agents in this channel</span>
+            <span class="ch-chip">研究助手</span>
+          </div>
+          <div class="ch-chips">
+            <span class="ch-chips-label">bots in this channel</span>
+            <span class="ch-chip">多头视角</span>
+            <span class="ch-chip">数据核查</span>
+            <span class="ch-chip on">反向视角</span>
+            <span class="ch-chip">基准率检查</span>
+          </div>
+        </div>
+
+        <section class="ch-sec">
+          <h3>thesis</h3>
+          <div class="md">
+            <div class="md-h md-h1">市场情绪 (Market Sentiment)</div>
+            <p><strong>状态：</strong> retired（已证伪）· <strong>负责方：</strong> 代理 + 操作者</p>
+            <p>*策略在 researching 阶段被预注册的证伪条款证伪——见下方 Verdict。相关的广度测量工具本身仍然可用，但它作为「市场时钟」的说法在这份样本上不成立。*</p>
+
+            <div class="md-h md-h2">Thesis</div>
+            <p>假设：把一组衡量市场广度的信号合成为一个每日更新的复合分数，可以当作判断当下该进攻还是防守的市场时钟——它只给方向性的场景判断，不生成具体买卖点，每一次个股决策仍需要自己的论证。</p>
+
+            <div class="md-h md-h2">Falsification</div>
+            <p>证伪条款在数据跑出来之前就已写定，共三条，这里展示其中两条：</p>
+            <ol class="md-list">
+              <li>The clock adds nothing if the in-market mean daily return ≤ buy-and-hold's mean daily return, and the hot-bin 5-day mean ≤ the neutral-bin 5-day mean.</li>
+              <li>It is noise if the cold-bin next-5-day hit rate ≥ the hot-bin hit rate.</li>
+              <li class="md-redacted">第三条已略去：它约束的是本页不展示的方法取值，而且它触发后指向的不是退役，是改后重跑并把改动记录在案。</li>
+            </ol>
+            <p>上面两条任一成立 → 策略 retired，结论记录在案，不在同一样本上重新调参。</p>
+
+            <div class="md-h md-h2">Verdict (2026-09-02)</div>
+            <p><strong>Falsified — retired.</strong> Signal window 2025-07-03..2026-07-09（255 个评分交易日）。在可交易的 254 个交易日上：</p>
+            <ul class="md-list">
+              <li><strong>核心假设方向相反。</strong> 按分数分档统计的下一个 5 日收益：cold +0.82%（命中 65%），neutral +0.38%（命中 65%），hot +0.04%（命中 53%）。以上两条证伪条款均已触发。</li>
+              <li><strong>没有造假，没有数据缺失</strong>：0 个 SPY 缺失交易日，0 个个股-日缺失；两套独立计算结果精确一致（误差 1e-9）。</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="ch-sec">
+          <h3>latest evidence</h3>
+          <div class="ch-file">记录日期 · 2026-09-02</div>
+          <div class="viz-scroll detail-table">
+            <table class="viz-table">
+              <tbody>
+                <tr><td class="ch-k">computed_at</td><td class="ch-v">2026-09-02</td></tr>
+                <tr><td class="ch-k">n_signal_days</td><td class="ch-v">255</td></tr>
+                <tr><td class="ch-k">n_investable_days</td><td class="ch-v">254</td></tr>
+                <tr><td class="ch-k">discarded.spy_days_missing</td><td class="ch-v">0</td></tr>
+                <tr><td class="ch-k">discarded.symbol_day_missing</td><td class="ch-v">0</td></tr>
+                <tr><td class="ch-k">conditioning.5d.cold.n</td><td class="ch-v">49</td></tr>
+                <tr><td class="ch-k">conditioning.5d.cold.mean</td><td class="ch-v">0.008171487665160562</td></tr>
+                <tr><td class="ch-k">conditioning.5d.cold.hit_rate</td><td class="ch-v">0.6530612244897959</td></tr>
+                <tr><td class="ch-k">conditioning.5d.neutral.n</td><td class="ch-v">138</td></tr>
+                <tr><td class="ch-k">conditioning.5d.neutral.mean</td><td class="ch-v">0.0037542376450406634</td></tr>
+                <tr><td class="ch-k">conditioning.5d.neutral.hit_rate</td><td class="ch-v">0.6521739130434783</td></tr>
+                <tr><td class="ch-k">conditioning.5d.hot.n</td><td class="ch-v">62</td></tr>
+                <tr><td class="ch-k">conditioning.5d.hot.mean</td><td class="ch-v">0.00040617327015784126</td></tr>
+                <tr><td class="ch-k">conditioning.5d.hot.hit_rate</td><td class="ch-v">0.532258064516129</td></tr>
+                <tr><td class="ch-k">buyhold_signal_window.total_return</td><td class="ch-v">0.20169169025119627</td></tr>
+                <tr><td class="ch-k">buyhold_signal_window.max_drawdown</td><td class="ch-v">-0.0913116616105698</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="note">
+          <span class="note-i">标题旁的 RETIRED 徽章</span>
+          生命周期只有五个词：idea、researching、validated、paper、retired。这里显示 retired，因为这项研究的假设被证伪了，策略已经退役。
+        </div>
+        <div class="note">
+          <span class="note-i">Falsification 与 Verdict 两节</span>
+          证伪条件在跑数据之前就已写定，结论直接对照这些条款给出。这是本工作台唯一一个走完的研究循环，结果是否定的。
+        </div>
+        <div class="note">
+          <span class="note-i">latest evidence 的扁平表格</span>
+          表里的每一行都按记录原本的精度照抄，浮点数不做四舍五入。这不是记录的全部字段：讲方法的那些行按同一个决定被略去，跟着它们一起略去的还有一批结果行——换一组取值、换一个窗口、换一个持有期算出来的那些对照，都没有列在这里。
+        </div>
+        <div class="note">
+          <span class="note-i">哪些是记录，哪些是样例</span>
+          thesis、Falsification 与 Verdict 三节是把真实研究记录译成中文后的呈现，其中的研究方法细节已被略去；标题旁的路径行、chip 与侧栏的频道列表都是为这个介绍页搭建的样例外壳，不代表任何真实频道。
+        </div>
+      </div>
+    </section>
+    <section data-surface="agent" class="surface room-page" hidden>
+      <header class="topbar">
+        <span class="topbar-name">反向假设复核</span>
+        <span class="raw">raw</span>
+      </header>
+      <div id="strip" class="strip">
+        <span class="strip-chip kairos" data-state="organizing">
+          <span class="strip-name">Kairos</span><span class="strip-state">organizing</span>
+        </span>
+        <span class="strip-chip" data-state="passed">
+          <span class="avatar">■</span><span class="strip-name">多头视角</span><span class="strip-state">passed</span>
+        </span>
+        <span class="strip-chip" data-state="answered">
+          <span class="avatar">▲</span><span class="strip-name">数据核查</span><span class="strip-state">answered</span>
+        </span>
+        <span class="strip-chip" data-state="answered">
+          <span class="avatar">○</span><span class="strip-name">反向视角</span><span class="strip-state">answered</span>
+        </span>
+        <span class="strip-chip" data-state="passed">
+          <span class="avatar">⬟</span><span class="strip-name">基准率检查</span><span class="strip-state">passed</span>
+        </span>
+      </div>
+      <div class="room-view-note room-sample-note">以下为产品介绍用的虚构对话样例，不是真实研究记录。四个 bot 运行在同一个底层模型上。</div>
+
+      <div class="flow-inner">
+        <div class="msg op"><div class="bubble pre">上一轮「市场情绪」被证伪后留下一个反向假设：冷读数之后的 5 日收益反而更高（cold +0.82%，hit 65%；neutral +0.38%，hit 65%；hot +0.04%，hit 53%）。&#10;问题：这个反向假设值得在一个全新窗口上做预注册吗？&#10;请各自给出立场、所列依据、不确定性、改判条件。不要给买卖建议。</div></div>
+
+        <details class="answer-trace trace-pending">
+          <summary class="trace-toggle">
+            <span>思考轨迹</span><span class="trace-count">1</span><span class="trace-chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="trace-content">
+            <div class="card collapsible collapsed tool dispatch">
+              <div class="card-head">
+                <span class="chev">▸</span>
+                <span class="kind">dispatch</span>
+                <span class="sum">Dispatched 多头视角, 数据核查, 反向视角, 基准率检查 (serial), round 1 of this operator message; 2 rounds left after it. Not called: none.</span>
+                <span class="producer">done</span>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="msg k bot">
+          <div class="who"><span class="avatar">■</span><span class="who-name">多头视角</span></div>
+          <div class="bubble md-bubble">
+            <div class="md"><p>值得预注册，而且应该现在就写死条款。上一轮真正有价值的产出不是那三个数字，而是「先写证伪条件、再跑数据」这套流程本身跑通了一次——同一套流程换一个假设、换一个窗口，成本极低。反向假设至少有一个可陈述的机制：恐慌性抛售之后的流动性回补。我的立场是预注册，不是相信它成立。</p></div>
+            <details class="room-view-details">
+              <summary>依据 · 不确定性 · 改判条件</summary>
+              <div class="room-view-fields">
+                <div class="room-view-field">
+                  <div class="room-view-label">所列依据</div>
+                  <ul class="room-view-list">
+                    <li>上一轮的三条证伪条款在结果出来之前就已写定，事后没有被改动</li>
+                    <li>冷读数与热读数的 5 日均值方向相反，不是强弱之别</li>
+                    <li>流动性回补是一个可以事先陈述的机制，不是事后凑出来的解释</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">不确定性</div>
+                  <ul class="room-view-list">
+                    <li>我没有能力判断 49 个冷读数样本够不够</li>
+                    <li>「机制可陈述」和「机制成立」是两回事，我把它们混在一起说了</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">改判条件</div>
+                  <div class="room-view-empty">未提供</div>
+                </div>
+              </div>
+            </details>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count"></span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible collapsed tool pay">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">pay</span><span class="sum">GET /quote/AAPL · quotes.example.net · $0.001000 · im_cc3f74a85f72 · 0x3ecce516..dfcf · settled · tx 0xab8e12a9..fe74</span><span class="producer">200</span></div>
+                </div>
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">权衡「流程跑通」与「机制成立」是否是一回事</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="msg k bot">
+          <div class="who"><span class="avatar">▲</span><span class="who-name">数据核查</span></div>
+          <div class="bubble md-bubble">
+            <div class="md"><p>不值得按现在这个形式预注册。冷读数一共 49 天，热读数 62 天，命中率 65% 对 53% 在这个样本量下不构成可区分的差异——把它当成一个待验证的方向可以，把它写成一条预注册假设，就等于把噪声抬成了命题。另外这个窗口的暖机吃掉了 2025 年 4 月的整段下跌，也就是说样本里几乎没有真正的冷读数极值。</p></div>
+            <details class="room-view-details">
+              <summary>依据 · 不确定性 · 改判条件</summary>
+              <div class="room-view-fields">
+                <div class="room-view-field">
+                  <div class="room-view-label">所列依据</div>
+                  <ul class="room-view-list">
+                    <li>冷读数 n=49，热读数 n=62；命中率差 12 个百分点落在这个量级的抽样波动内</li>
+                    <li>信号窗口 2025-07-03 起，暖机期覆盖了该数据集里最大的一次事件</li>
+                    <li>换了几档不同的阈值重新跑，方向都一样，说明这个阈值不是为了凑这个结论调出来的</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">不确定性</div>
+                  <ul class="room-view-list">
+                    <li>我没有做正式的显著性检验，只是按量级判断</li>
+                    <li>新窗口能否包含足够的冷读数极值，取决于取数期间的市场本身</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">改判条件</div>
+                  <ul class="room-view-list">
+                    <li>新窗口的冷读数样本达到 150 天以上，且方向一致</li>
+                    <li>或者在一个包含完整下跌段的窗口上重跑，结论不变</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">这位 bot 指出的分歧</div>
+                  <ul class="room-view-list">
+                    <li>对 bull-view：你自己都说没法判断 49 个冷读数够不够，却还是把这个方向反过来的读数当依据列了出来——这正是我说不该现在写成预注册假设的地方</li>
+                  </ul>
+                </div>
+              </div>
+            </details>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count"></span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible collapsed tool pay">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">pay</span><span class="sum">GET /quote/SPY · quotes.example.net · $0.001000 · im_cc3f74a85f72 · 0xe831823a..3c3a · settled · tx 0xab8e12a9..fe74</span><span class="producer">200</span></div>
+                </div>
+                <div class="card collapsible collapsed tool pay">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">pay</span><span class="sum">GET /quote/BTC-USD · quotes.example.net · $0.001000 · im_1f3218efc2a7 · 0xf2424453..09df · enqueued · SP 承诺 17:31:58 前结算</span><span class="producer">200</span></div>
+                </div>
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">按样本量核对命中率差异是否可区分</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="msg k bot">
+          <div class="who"><span class="avatar">○</span><span class="who-name">反向视角</span></div>
+          <div class="bubble md-bubble">
+            <div class="md"><p>应该预注册，但不是作为「反向时钟」预注册。上一轮的失败不在于方向反了，而在于它一开始就被写成了一个择时工具。我建议把它降级为一个只在极端冷读数上触发的观察指标，先只记录、不进出。这样即使新窗口再次证伪，损失的也只是一段观察期。我不同意把样本量当成不做的理由——样本量是设计参数，不是否决权。</p></div>
+            <details class="room-view-details">
+              <summary>依据 · 不确定性 · 改判条件</summary>
+              <div class="room-view-fields">
+                <div class="room-view-field">
+                  <div class="room-view-label">所列依据</div>
+                  <ul class="room-view-list">
+                    <li>按分数分档之后，冷读数与热读数往后一段的次序整个反了过来，极端读数确实携带信息</li>
+                    <li>但同一份记录里，把这个分数当成进出依据的做法在它试过的每一种设定下都没有带来优势，记录自己的结论是它减少痛苦、不增加优势——所以它不是一个择时工具</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">不确定性</div>
+                  <ul class="room-view-list">
+                    <li>「只观察不进出」在实践中很容易滑向择时，我没有办法从设计上杜绝</li>
+                    <li>极端冷读数在任何窗口里都稀少，观察期可能长到没有意义</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">改判条件</div>
+                  <ul class="room-view-list">
+                    <li>新窗口的极端冷读数少于 20 天，则这个指标无法被检验，直接放弃</li>
+                    <li>观察期内出现与上一轮同向的反转，则回到「已证伪」结论</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">这位 bot 指出的分歧</div>
+                  <ul class="room-view-list">
+                    <li>对 evidence-check：你把「样本不够」当成不做的理由，但样本量是设计参数，不是否决权——可以先把它降级成只记录的观察指标，不必现在就不做</li>
+                  </ul>
+                </div>
+              </div>
+            </details>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count"></span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">把「不做」和「降级为观察」区分开</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="room-round-end">
+          <div class="room-line"><span class="room-line-text">round 1 · settled · answered: 多头视角, 数据核查, 反向视角 · passed: 基准率检查 · paid $0.003000 (3)</span></div>
+          <section class="room-discussion" aria-label="本轮讨论对照">
+            <div class="room-discussion-title">本轮讨论对照</div>
+            <div class="room-view-note">按各 bot 的发言整理；所列依据仍需核实。</div>
+            <div class="room-brief">
+              <div class="room-view-label">本轮问题</div>
+              <div class="room-brief-question">已被证伪的反向假设，值得在一个全新窗口上做预注册吗？</div>
+              <details class="room-view-details">
+                <summary>讨论背景与要求</summary>
+                <div class="room-view-field">
+                  <div class="room-view-label">背景</div>
+                  <div class="room-brief-text">上一轮研究以证伪告终，策略已退役；反向假设是当时记录在案的两条后续之一</div>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">证伪条件</div>
+                  <div class="room-brief-text">新窗口的冷读数样本不足，或方向与上一轮不一致</div>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">期望输出</div>
+                  <div class="room-brief-text">立场 + 所列依据 + 不确定性 + 改判条件，不要买卖建议</div>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">证据要求</div>
+                  <ul class="room-view-list">
+                    <li>只引用已写入研究记录的数字</li>
+                    <li>区分「机制可陈述」与「机制成立」</li>
+                  </ul>
+                </div>
+              </details>
+            </div>
+
+            <div class="room-discussion-voices">
+              <article class="room-discussion-voice">
+                <div class="room-discussion-voice-head">
+                  <span class="room-discussion-name">多头视角</span>
+                  <button class="room-conversation" type="button" disabled>查看原对话 ↗</button>
+                  <span class="room-view-turn">第 1 次发言</span>
+                </div>
+                <div class="room-view-position">值得预注册，价值在流程而不在上一轮的数字。</div>
+                <div class="room-view-fields">
+                  <div class="room-view-field">
+                    <div class="room-view-label">所列依据</div>
+                    <ul class="room-view-list">
+                      <li>三条证伪条款在结果之前就已写定</li>
+                      <li>冷热读数 5 日均值方向相反</li>
+                      <li>流动性回补是可事先陈述的机制</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">不确定性</div>
+                    <ul class="room-view-list">
+                      <li>无法判断 49 个冷读数样本是否足够</li>
+                      <li>混淆了「机制可陈述」与「机制成立」</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">改判条件</div>
+                    <div class="room-view-empty">未提供</div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="room-discussion-voice">
+                <div class="room-discussion-voice-head">
+                  <span class="room-discussion-name">数据核查</span>
+                  <button class="room-conversation" type="button" disabled>查看原对话 ↗</button>
+                  <span class="room-view-turn">第 1 次发言</span>
+                </div>
+                <div class="room-view-position">不值得按现在的形式预注册；样本量撑不起这条命题。</div>
+                <div class="room-view-fields">
+                  <div class="room-view-field">
+                    <div class="room-view-label">所列依据</div>
+                    <ul class="room-view-list">
+                      <li>冷 n=49 / 热 n=62，12 个百分点落在抽样波动内</li>
+                      <li>暖机期吃掉了窗口内最大的一次事件</li>
+                      <li>换了几档不同的阈值重新跑，方向没有变</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">不确定性</div>
+                    <ul class="room-view-list">
+                      <li>未做正式显著性检验</li>
+                      <li>新窗口是否含足够冷读数取决于市场本身</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">改判条件</div>
+                    <ul class="room-view-list">
+                      <li>新窗口冷读数 ≥150 天且方向一致</li>
+                      <li>或在含完整下跌段的窗口重跑后结论不变</li>
+                    </ul>
+                  </div>
+                </div>
+              </article>
+
+              <article class="room-discussion-voice">
+                <div class="room-discussion-voice-head">
+                  <span class="room-discussion-name">反向视角</span>
+                  <button class="room-conversation" type="button" disabled>查看原对话 ↗</button>
+                  <span class="room-view-turn">第 1 次发言</span>
+                </div>
+                <div class="room-view-position">预注册，但降级为只记录的观察指标，不作择时。</div>
+                <div class="room-view-fields">
+                  <div class="room-view-field">
+                    <div class="room-view-label">所列依据</div>
+                    <ul class="room-view-list">
+                      <li>冷热读数分档后的次序整个反了过来，极端读数携带信息</li>
+                      <li>按分数进出在记录试过的每种设定下都没有带来优势，记录的结论是减少痛苦、不增加优势</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">不确定性</div>
+                    <ul class="room-view-list">
+                      <li>「只观察」在实践中易滑向择时</li>
+                      <li>极端冷读数稀少，观察期可能过长</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">改判条件</div>
+                    <ul class="room-view-list">
+                      <li>极端冷读数 &lt;20 天则放弃</li>
+                      <li>出现与上一轮同向的反转则回到已证伪结论</li>
+                    </ul>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <div class="room-disagreements">
+              <div class="room-view-label">明确指出的分歧</div>
+              <div class="room-view-note">以下分歧由发言者明确指出。</div>
+              <ul class="room-view-list">
+                <li>数据核查 对 多头视角：你自己都说没法判断 49 个冷读数够不够，却还是把这个方向反过来的读数当依据列了出来——这正是我说不该现在写成预注册假设的地方</li>
+                <li>反向视角 对 数据核查：你把「样本不够」当成不做的理由，但样本量是设计参数，不是否决权——可以先把它降级成只记录的观察指标，不必现在就不做</li>
+              </ul>
+            </div>
+          </section>
+        </div>
+
+        <div class="msg k">
+          <div class="who">Kairos</div>
+          <div class="bubble md-bubble">
+            <div class="md">
+              <p>三个回答在一件事上一致：没有人认为上一轮的结论应该被推翻。分歧在于「下一步该花多少成本」——多头视角看流程，数据核查看样本量，反向视角想把假设降级后再试。</p>
+              <p>需要说明一点：这些 bot 跑在同一个底层模型上，它们倾向于收敛；上面这三种立场之所以能分开，是因为提问时要求各自先写改判条件，而不是因为它们真的独立。多头视角没有填改判条件，这一栏显示「未提供」，不要当成它同意其他两位。</p>
+              <p>我的整理：把它按反向视角的降级形式预注册，同时采用数据核查的样本量门槛作为启动条件。这是一个整理，不是结论。</p>
+            </div>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count">2</span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">比较三份立场的共同点与分歧点</span></div>
+                </div>
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">起草整理意见，避免把未填字段读成同意</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="msg op"><div class="bubble pre">如果新窗口取不到 150 天冷读数，还有别的检验方式吗？</div></div>
+
+        <details class="answer-trace trace-pending">
+          <summary class="trace-toggle">
+            <span>思考轨迹</span><span class="trace-count">1</span><span class="trace-chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="trace-content">
+            <div class="card collapsible collapsed tool dispatch">
+              <div class="card-head">
+                <span class="chev">▸</span>
+                <span class="kind">dispatch</span>
+                <span class="sum">Dispatched 多头视角, 数据核查, 反向视角, 基准率检查 (serial), round 1 of this operator message; 2 rounds left after it. Not called: none.</span>
+                <span class="producer">done</span>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="msg k bot">
+          <div class="who"><span class="avatar">▲</span><span class="who-name">数据核查</span></div>
+          <div class="bubble md-bubble">
+            <div class="md"><p>可以换成按事件对齐而不是按日历窗口取样，但那是另一个假设，需要另写一份证伪条款。</p></div>
+            <details class="room-view-details">
+              <summary>依据 · 不确定性 · 改判条件</summary>
+              <div class="room-view-fields">
+                <div class="room-view-field">
+                  <div class="room-view-label">所列依据</div>
+                  <ul class="room-view-list">
+                    <li>按日历窗口取样是本轮冷读数样本不足的直接原因</li>
+                    <li>按事件对齐取样是同一数据集里可以尝试的另一种切法</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">不确定性</div>
+                  <ul class="room-view-list">
+                    <li>按事件对齐会如何改变样本量，我还没有算过</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">改判条件</div>
+                  <ul class="room-view-list">
+                    <li>新窗口按事件对齐仍无法凑够样本，则放弃这个切法</li>
+                  </ul>
+                </div>
+              </div>
+            </details>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count"></span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible tool pay refused">
+                  <div class="card-head"><span class="chev">▾</span><span class="kind">pay</span><span class="sum">GET /quote/ETH-USD · refused before signing · mandate_insufficient_budget · im_cc3f74a85f72 · remaining $0.000000 &lt; $0.001000 · 已提交预算请求 im_7d02c41e9b50（等待批准）</span><span class="producer">—</span></div>
+                  <div class="card-body">Remaining budget 0 is below the price 1000 (atomic units).
+Do not retry: the same call will be refused until the budget changes.
+Ask the user to approve a larger or additional intent mandate.</div>
+                </div>
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">比较按日历取样与按事件取样的样本量</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="msg k bot">
+          <div class="who"><span class="avatar">○</span><span class="who-name">反向视角</span></div>
+          <div class="bubble md-bubble">
+            <div class="md"><p>同意换成事件对齐；我没有别的办法，这一轮我没有要补充的反对意见。</p></div>
+            <details class="room-view-details">
+              <summary>依据 · 不确定性 · 改判条件</summary>
+              <div class="room-view-fields">
+                <div class="room-view-field">
+                  <div class="room-view-label">所列依据</div>
+                  <ul class="room-view-list">
+                    <li>数据核查提出的事件对齐是同一数据集内可执行的方案</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">不确定性</div>
+                  <ul class="room-view-list">
+                    <li>我没有自己验证过事件对齐是否可行</li>
+                  </ul>
+                </div>
+                <div class="room-view-field">
+                  <div class="room-view-label">改判条件</div>
+                  <ul class="room-view-list">
+                    <li>若事件对齐同样凑不出足够样本，则回到已证伪结论</li>
+                  </ul>
+                </div>
+              </div>
+            </details>
+            <details class="answer-trace">
+              <summary class="trace-toggle">
+                <span>思考轨迹</span><span class="trace-count"></span><span class="trace-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="trace-content">
+                <div class="card collapsible collapsed think">
+                  <div class="card-head"><span class="chev">▸</span><span class="kind">think</span><span class="sum">检查是否还有未提出的反对意见</span></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="room-round-end">
+          <div class="room-line"><span class="room-line-text">round 1 · settled · answered: 数据核查, 反向视角 · passed: 多头视角, 基准率检查 · paid $0.000000 · refused 1</span></div>
+          <section class="room-discussion" aria-label="本轮讨论对照">
+            <div class="room-discussion-title">本轮讨论对照</div>
+            <div class="room-view-note">按各 bot 的发言整理；所列依据仍需核实。</div>
+
+            <div class="room-brief">
+              <div class="room-view-label">本轮问题</div>
+              <div class="room-brief-question">如果新窗口凑不到足够的冷读数，还有没有别的检验方式？</div>
+            </div>
+
+            <div class="room-discussion-voices">
+              <article class="room-discussion-voice">
+                <div class="room-discussion-voice-head">
+                  <span class="room-discussion-name">数据核查</span>
+                  <button class="room-conversation" type="button" disabled>查看原对话 ↗</button>
+                  <span class="room-view-turn">第 2 次发言</span>
+                </div>
+                <div class="room-view-position">可以换成按事件对齐而不是按日历窗口取样，但那是另一个假设。</div>
+                <div class="room-view-fields">
+                  <div class="room-view-field">
+                    <div class="room-view-label">所列依据</div>
+                    <ul class="room-view-list">
+                      <li>按日历窗口取样是本轮冷读数样本不足的直接原因</li>
+                      <li>按事件对齐取样是同一数据集里可以尝试的另一种切法</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">不确定性</div>
+                    <ul class="room-view-list">
+                      <li>按事件对齐会如何改变样本量，我还没有算过</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">改判条件</div>
+                    <ul class="room-view-list">
+                      <li>新窗口按事件对齐仍无法凑够样本，则放弃这个切法</li>
+                    </ul>
+                  </div>
+                </div>
+              </article>
+
+              <article class="room-discussion-voice">
+                <div class="room-discussion-voice-head">
+                  <span class="room-discussion-name">反向视角</span>
+                  <button class="room-conversation" type="button" disabled>查看原对话 ↗</button>
+                  <span class="room-view-turn">第 2 次发言</span>
+                </div>
+                <div class="room-view-position">同意换成事件对齐；没有要补充的反对意见。</div>
+                <div class="room-view-fields">
+                  <div class="room-view-field">
+                    <div class="room-view-label">所列依据</div>
+                    <ul class="room-view-list">
+                      <li>数据核查提出的事件对齐是同一数据集内可执行的方案</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">不确定性</div>
+                    <ul class="room-view-list">
+                      <li>我没有自己验证过事件对齐是否可行</li>
+                    </ul>
+                  </div>
+                  <div class="room-view-field">
+                    <div class="room-view-label">改判条件</div>
+                    <ul class="room-view-list">
+                      <li>若事件对齐同样凑不出足够样本，则回到已证伪结论</li>
+                    </ul>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <div class="room-disagreements">
+              <div class="room-view-label">明确指出的分歧</div>
+              <div class="room-view-note">未记录明确分歧；这不代表已经达成共识。</div>
+            </div>
+          </section>
+        </div>
+
+        <div class="note">
+          <span class="note-i">顶部的参与者条</span>
+          每个 bot 在自己的会话里单独作答，用固定的字形和名字署名。这两轮都是 serial 模式：后面发言的 bot 能看到前面已经给出的回答，这也是它能针对某个具体立场说出分歧的原因。Kairos 只负责组织，它自己没有字形，也只会在组织这一轮时显示 organizing；其余时候它的状态位是空的。
+        </div>
+        <div class="note">
+          <span class="note-i">参与者条为什么和上面的发言对不上</span>
+          参与者条只反映最近一次召集之后的状态：新一轮开始时，上一轮记的状态会被整个换掉，不是叠加上去的。下面的对话记录保留的是完整的两轮历史，所以一个 bot 可能在条上显示 passed，却在更早的一轮里给出过完整回答——条上看的是「现在」，往下翻看的是「全部」。
+        </div>
+        <div class="note">
+          <span class="note-i">某个 bot 气泡左侧的蓝色竖条</span>
+          带竖条的是 bot 的回答，其余是 Kairos 的整理。每条回答都附带自己的立场、依据、不确定性和改判条件。
+        </div>
+        <div class="note">
+          <span class="note-i">本轮讨论对照卡片</span>
+          同一轮的所有回答在这里并排对比，方便你看出它们在哪里真的分开。这是让不同意见可比，不是让结论更可靠。
+        </div>
+        <div class="note">
+          <span class="note-i">多头视角那一栏的「未提供」</span>
+          某位 bot 没填的字段会被原样写成「未提供」，不会被悄悄删掉，也不会被当成它同意别人。
+        </div>
+        <div class="note">
+          <span class="note-i">「明确指出的分歧」下方的说明行</span>
+          分歧列表只收录发言者自己点名的分歧。没有列出分歧时，页面会写明「这不代表已经达成共识」。
+        </div>
+        <div class="note">
+          <span class="note-i">每条回答右下角的「思考轨迹」</span>
+          任何一条回答背后的过程都只隔一次点击；对照卡片上那个「查看原对话」在产品里通向这位 bot 自己的会话，在这张复刻页上它和其余动作按钮一样置灰不可用。回答是证据，不是裁决。Kairos 召集这一步本身没有写出回答，它的过程行就单独留在对话流里，成为一条不挂在任何回答下的轨迹。
+        </div>
+        <div class="note">
+          <span class="note-i">轮次结束行</span>
+          bot 可以选择不发言，这时它不会产生气泡，但会被写进轮次行，并在参与者条上标成 passed。沉默被记录，而不是被填满。轮次编号按每一次提问重新从 1 开始计，所以第二次提问之后的那一轮，行首同样写 round 1。
+        </div>
+        <div class="note">
+          <span class="note-i">轨迹里的 pay 卡片</span>
+          bot 的每次付费调用和它的回答放在同一条轨迹里：调了哪个资源、花了多少、从哪个预算出、mandate 摘要、有没有结算，都写出来。付费和回答一样只隔一次点击；轮次行末尾把这一轮的付费合计也记上。
+        </div>
+        <div class="note">
+          <span class="note-i">refused 那一张</span>
+          拒绝发生在签名之前：数据源没有收到请求，也没有钱移动。卡片正文是钱包给 bot 的原话，它告诉 bot 不要重试、去问用户。bot 做的是提出一条新的预算请求（钱包页里那条 draft），然后停下来等人批。
+        </div>
+        <div class="note">
+          <span class="note-i">Kairos 的整理气泡</span>
+          多个声音并不等于更好的研究。它们跑在同一个底层模型上，天然倾向于收敛，能分开往往是因为提问方式，而不是因为它们互相独立。
+        </div>
+      </div>
+    </section>
+    <section data-surface="wallet" class="surface account-page wallet-page" hidden>
+      <header class="account-topbar">
+        <span class="account-brand">KAIROS</span>
+        <span class="account-divider" aria-hidden="true">/</span>
+        <span class="account-section">Wallet</span>
+        <span class="account-back">返回对话 <span aria-hidden="true">↗</span></span>
+      </header>
+
+      <div class="account-main">
+        <div class="account-heading">
+          <div>
+            <p class="account-eyebrow">AGENT WALLET</p>
+            <h1>Agent 钱包</h1>
+          </div>
+          <div class="account-refresh-wrap">
+            <span class="account-stamp" role="status">样例数据 · 09/16 GMT+8 14:32:07</span>
+            <button class="account-button" type="button" disabled>
+              <svg viewBox="0 0 18 18" width="15" height="15" aria-hidden="true">
+                <path d="M14.5 7a5.8 5.8 0 1 0 .2 3M14.5 3v4h-4"></path>
+              </svg>
+              <span>对账</span>
+            </button>
+          </div>
+        </div>
+
+        <p class="account-notice" role="status">本页为界面复刻，余额、预算与支付记录均为虚构样例；地址、mandate 摘要与交易哈希取自本地测试链上的一次演示运行，不对应任何公网资产。</p>
+
+        <section class="account-overview" aria-label="链上余额">
+          <div class="account-overview-head">
+            <span class="account-label">链上余额 · USDC</span>
+            <span class="account-badge paper">测试链 · eip155:31337</span>
+          </div>
+          <div class="account-balance">$9.976000</div>
+          <div class="account-change">
+            <span>可扣 $7.976000</span>
+            <span>提现待解锁 $2.000000 · 09/16 GMT+8 17:32:07 解锁</span>
+          </div>
+          <dl class="account-metrics">
+            <div class="account-metric">
+              <dt>已授权 SP</dt>
+              <dd class="mono">0x90F79bf6..b906</dd>
+            </div>
+            <div class="account-metric">
+              <dt>队列中</dt>
+              <dd>1 笔 · $0.001000</dd>
+            </div>
+            <div class="account-metric">
+              <dt>累计已结算</dt>
+              <dd>24 笔 · $0.024000</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="account-records" aria-label="预算">
+          <div class="account-toolbar">
+            <div class="account-tabs">
+              <span class="account-tab active static">预算<span class="account-tab-count">4</span></span>
+            </div>
+          </div>
+          <div class="account-records-panel">
+            <div class="account-table-scroll" tabindex="0" aria-label="预算明细">
+              <table class="account-table">
+                <caption class="account-sr-only">预算（intent mandate）明细；未填写的字段以横线表示。</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">预算</th>
+                    <th scope="col">额度</th>
+                    <th scope="col">已花</th>
+                    <th scope="col">剩余</th>
+                    <th scope="col" class="text">允许 host</th>
+                    <th scope="col">有效期至</th>
+                    <th scope="col" class="text">状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><div class="account-symbol"><strong class="mono">im_1f3218efc2a7</strong><span class="account-subvalue">行情与文本分析</span></div></td>
+                    <td>$5.000000</td>
+                    <td>$0.022000<span class="account-subvalue">预留 $0.000000</span></td>
+                    <td>$4.978000</td>
+                    <td class="text mono">quotes.example.net, text.example.net</td>
+                    <td>09/16 15:29:41</td>
+                    <td class="text"><span class="ch-badge" data-status="signed">signed</span></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong class="mono">im_cc3f74a85f72</strong><span class="account-subvalue">三次报价</span></div></td>
+                    <td>$0.003000</td>
+                    <td>$0.003000<span class="account-subvalue">预留 $0.000000</span></td>
+                    <td>$0.000000</td>
+                    <td class="text mono">quotes.example.net</td>
+                    <td>09/16 15:29:41</td>
+                    <td class="text"><span class="ch-badge" data-status="signed">signed</span></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong class="mono">im_7d02c41e9b50</strong><span class="account-subvalue">反向假设复核 · 新闻全文（数据核查请求）</span></div></td>
+                    <td>$3.000000</td>
+                    <td>—</td>
+                    <td>—</td>
+                    <td class="text mono">news.example.net</td>
+                    <td>—</td>
+                    <td class="text"><span class="ch-badge" data-status="draft">draft · 等待你批准</span></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong class="mono">im_a91c5e0d27b4</strong><span class="account-subvalue">回测数据集下载（市场情绪频道，已退役）</span></div></td>
+                    <td>$20.000000</td>
+                    <td>$12.400000<span class="account-subvalue">预留 $0.000000</span></td>
+                    <td>$7.600000</td>
+                    <td class="text mono">data.example.net</td>
+                    <td>09/30 00:00:00</td>
+                    <td class="text"><span class="ch-badge" data-status="disabled">disabled</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="account-table-footer" role="status">4 个预算 · 预算是承诺上限，不是余额</div>
+          </div>
+        </section>
+
+        <section class="account-records" aria-label="支付记录">
+          <div class="account-toolbar">
+            <div class="account-tabs">
+              <span class="account-tab active static">支付记录<span class="account-tab-count">25</span></span>
+            </div>
+          </div>
+          <div class="account-records-panel">
+            <div class="account-table-scroll" tabindex="0" aria-label="支付记录明细">
+              <table class="account-table">
+                <caption class="account-sr-only">钱包账本；未结算的记录在结算 tx 一列以横线表示。</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">时间</th>
+                    <th scope="col" class="text">资源</th>
+                    <th scope="col">金额</th>
+                    <th scope="col" class="text">mandate</th>
+                    <th scope="col" class="text">状态</th>
+                    <th scope="col">SP 承诺结算时限</th>
+                    <th scope="col" class="text">结算 tx</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>09/16 14:31:58</td>
+                    <td class="text"><div class="account-symbol"><strong>GET /quote/BTC-USD</strong><span class="account-subvalue">quotes.example.net</span></div></td>
+                    <td>$0.001000</td>
+                    <td class="text mono">0xf2424453..09df</td>
+                    <td class="text"><span class="ch-badge" data-status="enqueued">enqueued</span></td>
+                    <td>09/16 17:31:58</td>
+                    <td class="text">—</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:29:41</td>
+                    <td class="text"><div class="account-symbol"><strong>POST /analyze</strong><span class="account-subvalue">text.example.net</span></div></td>
+                    <td>$0.010000</td>
+                    <td class="text mono">0x72b9eb6d..a52b</td>
+                    <td class="text"><span class="ch-badge" data-status="settled">settled</span></td>
+                    <td>09/16 17:29:41</td>
+                    <td class="text mono">0xab8e12a9..fe74</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:29:41</td>
+                    <td class="text"><div class="account-symbol"><strong>GET /quote/AAPL</strong><span class="account-subvalue">quotes.example.net</span></div></td>
+                    <td>$0.001000</td>
+                    <td class="text mono">0x3ecce516..dfcf</td>
+                    <td class="text"><span class="ch-badge" data-status="settled">settled</span></td>
+                    <td>09/16 17:29:41</td>
+                    <td class="text mono">0xab8e12a9..fe74</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:29:40</td>
+                    <td class="text"><div class="account-symbol"><strong>GET /quote/SPY</strong><span class="account-subvalue">quotes.example.net</span></div></td>
+                    <td>$0.001000</td>
+                    <td class="text mono">0xe831823a..3c3a</td>
+                    <td class="text"><span class="ch-badge" data-status="settled">settled</span></td>
+                    <td>09/16 17:29:40</td>
+                    <td class="text mono">0xab8e12a9..fe74</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:29:39</td>
+                    <td class="text"><div class="account-symbol"><strong>GET /quote/BTC-USD</strong><span class="account-subvalue">quotes.example.net</span></div></td>
+                    <td>$0.001000</td>
+                    <td class="text mono">0xf81a77e4..16fe</td>
+                    <td class="text"><span class="ch-badge" data-status="settled">settled</span></td>
+                    <td>09/16 17:29:39</td>
+                    <td class="text mono">0xab8e12a9..fe74</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:20:12</td>
+                    <td class="text"><div class="account-symbol"><strong>POST /analyze</strong><span class="account-subvalue">text.example.net</span></div></td>
+                    <td>$0.010000</td>
+                    <td class="text mono">0x5c0e19b3..7a41</td>
+                    <td class="text"><span class="ch-badge" data-status="rejected">rejected</span><span class="account-subvalue">402 settlement_unavailable: insufficient_balance</span></td>
+                    <td>—</td>
+                    <td class="text">—</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="account-table-footer" role="status">最近 6 / 25 条 · 来自本地 ledger.jsonl · 上次对账 09/16 14:30:12</div>
+          </div>
+        </section>
+
+        <section class="account-records" aria-label="策略拒绝">
+          <div class="account-toolbar">
+            <div class="account-tabs">
+              <span class="account-tab active static">策略拒绝<span class="account-tab-count">2</span></span>
+            </div>
+          </div>
+          <div class="account-records-panel">
+            <div class="account-table-scroll" tabindex="0" aria-label="策略拒绝明细">
+              <table class="account-table">
+                <caption class="account-sr-only">在签名之前被钱包策略拒绝的付费；这些不进账本。</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">时间</th>
+                    <th scope="col" class="text">原因</th>
+                    <th scope="col" class="text">资源</th>
+                    <th scope="col" class="text">预算</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>09/16 14:31:59</td>
+                    <td class="text mono">mandate_insufficient_budget</td>
+                    <td class="text">GET /quote/ETH-USD</td>
+                    <td class="text mono">im_cc3f74a85f72</td>
+                  </tr>
+                  <tr>
+                    <td>09/16 14:20:12</td>
+                    <td class="text mono">host_not_allowed</td>
+                    <td class="text">GET /news/search</td>
+                    <td class="text mono">im_1f3218efc2a7</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="account-table-footer" role="status">2 次 · 没有签名，所以不进账本；记在钱包报告里</div>
+          </div>
+        </section>
+
+        <details class="account-details" open>
+          <summary>
+            <span>结算处理器（SP）</span>
+            <span class="account-details-hint">承诺 · 队列 · 最近一次批量结算</span>
+          </summary>
+          <div class="account-details-content">
+            <dl class="account-info">
+              <div>
+                <dt>SP 地址</dt>
+                <dd class="mono">0x90F79bf6..b906</dd>
+              </div>
+              <div>
+                <dt>结算窗口</dt>
+                <dd>10800 s（3 小时）</dd>
+              </div>
+              <div>
+                <dt>提现延迟</dt>
+                <dd>10800 s（3 小时）</dd>
+              </div>
+              <div>
+                <dt>合约</dt>
+                <dd class="mono">AEP2DebitWallet 0xe7f1725e..0512</dd>
+              </div>
+              <div>
+                <dt>队列</dt>
+                <dd>pending 0 · settling 0 · settled 25 · failed 0 · expired 0</dd>
+              </div>
+              <div>
+                <dt>最近批量</dt>
+                <dd class="mono">settleBatch(1) 0x27cc9500..1120 · 14:32:03</dd>
+              </div>
+              <div>
+                <dt>上一批</dt>
+                <dd class="mono">settleBatch(24) 0xab8e12a9..fe74 · 14:30:05 · ≈43k gas / 笔</dd>
+              </div>
+              <div>
+                <dt>每批上限</dt>
+                <dd>50 笔 · 5 s 一轮</dd>
+              </div>
+            </dl>
+            <p class="account-detail-note">以上字段对应 SP 的 /supported 与 /health 两个只读接口；本页不会去请求它们。</p>
+          </div>
+        </details>
+
+        <div class="note">
+          <span class="note-i">先授权、后结算</span>
+          每次付费 Kairos 只签一张一次性 mandate 交给数据源，数据源立刻返回结果；钱要等结算处理器把很多张 mandate 打成一笔链上交易时才真正扣。所以上面 24 笔已结算共用同一个 tx，而付款当时链上余额一动不动。
+        </div>
+        <div class="note">
+          <span class="note-i">支付记录里那一行 enqueued</span>
+          这一页显示的是钱包自己的账本，不是 SP 的队列。SP 那边这笔已经结算（见下方 SP 的最近批量），账本还写 enqueued，因为对账上一次跑在它之前。页面不替账本补状态，「对账」按钮才是补状态的地方。
+        </div>
+        <div class="note">
+          <span class="note-i">预算是在签字之前查的</span>
+          额度、host、有效期、单笔上限都在签任何东西之前核对，不通过就不会有签名出门。策略拒绝表里那两行就是这样的拒绝：没有花钱，也没有拿到数据。被拒的付费不写进账本（没有签名就没有条目），但记在钱包报告里，并原样出现在这里和对话流的思考轨迹中。
+        </div>
+        <div class="note">
+          <span class="note-i">一张 mandate 只买一次交付</span>
+          同一张 mandate 再送一次，数据源回 409，不再送数据也不再记账。反过来的保证并不存在：数据源是先把 mandate 交给 SP 排队、再执行请求的，「没拿到数据就不扣钱」不是协议给的承诺。
+        </div>
+        <div class="note">
+          <span class="note-i">状态列写 draft 的那一行</span>
+          Kairos 或它的 bot 可以起草一个预算，但只能停在这里等你批准；起草人自己不能批准、启用或加额，拒绝提示里的补救建议也只是「去问用户」。这和侧栏里 waiting 的意思相同：有一件事在等你。
+        </div>
+        <div class="note">
+          <span class="note-i">SP 承诺结算时限这一列</span>
+          那是 SP 签过名的承诺，不是结算本身。到期没送上链，对账会把这笔标成 SP 违约并把预算退回来，但链上没有任何东西强制 SP 履约。
+        </div>
+        <div class="note">
+          <span class="note-i">提现待解锁与可扣余额</span>
+          提现要等一段不短于结算窗口的延迟，期间已排队的 mandate 仍从全部余额里结算；SP 只按「余额减去待提现」这个可扣余额接收新的 mandate。这一格是 0 时新付费会被拒收，旧的仍会被扣。
+        </div>
+        <div class="note">
+          <span class="note-i">哪些在链上，哪些不在；哪些是样例</span>
+          链上只有余额、你授权的 SP、用过的 nonce 和提现计时，结算是一笔 settleBatch；预算、账本、SP 收据与队列都在链下，预算的签名也没有任何合约去校验。地址、mandate 摘要、两笔 tx 与前两个预算 id 来自演示；余额、待提现金额、时间戳、draft 与 disabled 两行、那行 rejected、每笔 gas 都是为这张页面选的样例。
+        </div>
+      </div>
+    </section>
+    <section data-surface="account" class="surface account-page" hidden>
+      <header class="account-topbar">
+        <span class="account-brand">KAIROS</span>
+        <span class="account-divider" aria-hidden="true">/</span>
+        <span class="account-section">Account</span>
+        <span class="account-back">返回对话 <span aria-hidden="true">↗</span></span>
+      </header>
+
+      <div class="account-main">
+        <div class="account-heading">
+          <div>
+            <p class="account-eyebrow">PORTFOLIO</p>
+            <h1>账户总览</h1>
+          </div>
+          <div class="account-refresh-wrap">
+            <span class="account-stamp" role="status">样例数据 · 09/16 GMT+8 14:32:07</span>
+            <button class="account-button" type="button" disabled>
+              <svg viewBox="0 0 18 18" width="15" height="15" aria-hidden="true">
+                <path d="M14.5 7a5.8 5.8 0 1 0 .2 3M14.5 3v4h-4"></path>
+              </svg>
+              <span>刷新</span>
+            </button>
+          </div>
+        </div>
+
+        <p class="account-notice" role="status">本页为界面复刻，下面的持仓与账户数字都是虚构样例。产品连接的是模拟盘账户；这套系统至今没有提交过任何订单。</p>
+
+        <section class="account-overview" aria-label="资产概览">
+          <div class="account-overview-head">
+            <span class="account-label">账户总资产</span>
+            <span class="account-badge paper">Paper · 模拟</span>
+          </div>
+          <div class="account-balance">$128,450.00</div>
+          <div class="account-change">
+            <span class="pos">+$980.25 (+0.77%)</span>
+            <span>较上日</span>
+          </div>
+          <dl class="account-metrics">
+            <div class="account-metric">
+              <dt>可用现金</dt>
+              <dd>$62,656.00</dd>
+            </div>
+            <div class="account-metric">
+              <dt>购买力</dt>
+              <dd>$125,312.00</dd>
+            </div>
+            <div class="account-metric">
+              <dt>持仓浮动盈亏</dt>
+              <dd class="pos">+$1,494.00</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="account-records">
+          <div class="account-toolbar">
+            <div class="account-tabs" role="tablist" aria-label="账户记录">
+              <button id="account-tab-positions" class="account-tab active" type="button" role="tab"
+                      aria-selected="true" aria-controls="account-records-panel">
+                持仓<span class="account-tab-count">6</span>
+              </button>
+              <button id="account-tab-orders" class="account-tab" type="button" role="tab"
+                      aria-selected="false" aria-controls="account-records-panel-orders">
+                订单<span class="account-tab-count">0</span>
+              </button>
+            </div>
+            <div class="account-filters">
+              <label class="account-sr-only" for="account-status">订单状态</label>
+              <select id="account-status" class="account-select" aria-label="订单状态" hidden disabled>
+                <option>全部状态</option>
+                <option>进行中</option>
+                <option>已成交</option>
+                <option>已结束</option>
+              </select>
+              <label class="account-sr-only" for="account-search">搜索股票代码</label>
+              <input id="account-search" class="account-search" type="search" autocomplete="off"
+                     spellcheck="false" placeholder="搜索代码" disabled>
+            </div>
+          </div>
+
+          <div id="account-records-panel" class="account-records-panel" role="tabpanel"
+               aria-labelledby="account-tab-positions">
+            <div class="account-table-scroll" tabindex="0" aria-label="持仓明细">
+              <table class="account-table">
+                <caption class="account-sr-only">持仓明细；缺失数据以横线表示。</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">股票</th>
+                    <th scope="col">持有数量</th>
+                    <th scope="col">成本价</th>
+                    <th scope="col">现价</th>
+                    <th scope="col">持仓市值</th>
+                    <th scope="col">浮动盈亏</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><div class="account-symbol"><strong>AAPL</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>40</td>
+                    <td>$180.00</td>
+                    <td>$188.40</td>
+                    <td>$7,536.00</td>
+                    <td><div class="account-pnl pos"><span>+$336.00</span><span class="account-subvalue pos">+4.67%</span></div></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong>MSFT</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>25</td>
+                    <td>$400.00</td>
+                    <td>$392.10</td>
+                    <td>$9,802.50</td>
+                    <td><div class="account-pnl neg"><span>-$197.50</span><span class="account-subvalue neg">-1.98%</span></div></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong>SPY</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>60</td>
+                    <td>$500.00</td>
+                    <td>$517.30</td>
+                    <td>$31,038.00</td>
+                    <td><div class="account-pnl pos"><span>+$1,038.00</span><span class="account-subvalue pos">+3.46%</span></div></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong>NVDA</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>30</td>
+                    <td>$120.00</td>
+                    <td>$116.25</td>
+                    <td>$3,487.50</td>
+                    <td><div class="account-pnl neg"><span>-$112.50</span><span class="account-subvalue neg">-3.13%</span></div></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong>KO</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>100</td>
+                    <td>$60.00</td>
+                    <td>$62.40</td>
+                    <td>$6,240.00</td>
+                    <td><div class="account-pnl pos"><span>+$240.00</span><span class="account-subvalue pos">+4.00%</span></div></td>
+                  </tr>
+                  <tr>
+                    <td><div class="account-symbol"><strong>JNJ</strong><span class="account-subvalue">多头</span></div></td>
+                    <td>50</td>
+                    <td>$150.00</td>
+                    <td>$153.80</td>
+                    <td>$7,690.00</td>
+                    <td><div class="account-pnl pos"><span>+$190.00</span><span class="account-subvalue pos">+2.53%</span></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="account-table-footer" role="status">6 / 6 项持仓</div>
+          </div>
+
+          <div id="account-records-panel-orders" class="account-records-panel" role="tabpanel"
+               aria-labelledby="account-tab-orders" hidden>
+            <div class="account-empty">
+              <div class="account-empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 32 32" width="27" height="27" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linejoin="round">
+                  <path d="M7 8h18v18H7z M11 8V5h10v3 M11 14h10 M11 19h6"></path>
+                </svg>
+              </div>
+              <h2>暂无订单</h2>
+              <p>本次读取没有返回订单记录。</p>
+            </div>
+            <div class="account-table-footer" role="status">0 / 0 笔订单 · Alpaca 最近 50 笔订单 · 包含所有状态</div>
+          </div>
+        </section>
+
+        <details class="account-details" open>
+          <summary>
+            <span>账户详情</span>
+            <span class="account-details-hint">连接与交易权限</span>
+          </summary>
+          <div class="account-details-content">
+            <dl class="account-info">
+              <div>
+                <dt>账户状态</dt>
+                <dd>ACTIVE</dd>
+              </div>
+              <div>
+                <dt>货币</dt>
+                <dd>USD</dd>
+              </div>
+              <div>
+                <dt>连接地址</dt>
+                <dd>paper-api.alpaca.markets</dd>
+              </div>
+              <div>
+                <dt>页面功能</dt>
+                <dd>账户查看</dd>
+              </div>
+            </dl>
+            <p class="account-detail-note">本页仅查看账户。刷新读取服务端快照，账户数据最多缓存 60 秒。</p>
+          </div>
+        </details>
+
+        <details class="account-details" open>
+          <summary>
+            <span>Agent 钱包</span>
+            <span class="account-details-hint">付数据费的钱，与模拟盘无关</span>
+          </summary>
+          <div class="account-details-content">
+            <dl class="account-info">
+              <div>
+                <dt>链上可扣余额</dt>
+                <dd>$7.976000 USDC</dd>
+              </div>
+              <div>
+                <dt>队列中</dt>
+                <dd>1 笔 · $0.001000</dd>
+              </div>
+              <div>
+                <dt>有效预算</dt>
+                <dd>2 个 · 剩余合计 $4.978000</dd>
+              </div>
+              <div>
+                <dt>待你批准</dt>
+                <dd>1 个（draft）</dd>
+              </div>
+              <div>
+                <dt>已授权 SP</dt>
+                <dd class="mono">0x90F79bf6..b906</dd>
+              </div>
+              <div>
+                <dt>累计已结算</dt>
+                <dd>24 笔 · $0.024000</dd>
+              </div>
+            </dl>
+            <p class="account-detail-note">总资产是 Alpaca 模拟盘里的美元，这里是 Kairos 付数据费的 USDC；两笔钱互不相通，也不合计。完整记录在导航栏的 wallet 一站。</p>
+          </div>
+        </details>
+
+        <div class="note">
+          <span class="note-i">账户总资产旁的 Paper · 模拟 徽章</span>
+          账户层读取的是模拟盘。这个徽章始终显示账户类型，你不需要点开任何地方才知道自己在看什么。
+        </div>
+        <div class="note">
+          <span class="note-i">订单标签页的空状态</span>
+          订单页列的是本次读取拿回的订单，页脚写明了它的取数范围：最近 50 笔、包含所有状态——这是一个近期活动窗口，不是完整历史。这次读取没有拿回任何一笔，页面就把「暂无订单」连同这句话写出来，而不是留一片空白。
+        </div>
+        <div class="note">
+          <span class="note-i">持仓浮动盈亏这一格</span>
+          只有当每一条持仓都报出了自己的盈亏，这个合计才会显示；缺任何一条，整格变成横线。合计不会用部分数据凑出来。
+        </div>
+        <div class="note">
+          <span class="note-i">账户详情里的「页面功能 / 账户查看」</span>
+          这一页只能查看，不能交易，页面自己把这件事写在明处。刷新读的是服务端快照，缓存时长也一并说明。
+        </div>
+        <div class="note">
+          <span class="note-i">账户详情下面的 Agent 钱包</span>
+          上面是券商模拟盘，Kairos 帮你看的钱；这里是 agent 自己付 API 的钱。两个数字分开显示、不合计、不互转，页面也不提供从一边到另一边的按钮。
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const buttons = [...document.querySelectorAll('.rail-btn')]
+const surfaces = [...document.querySelectorAll('.surface')]
+const TOURED = new Set(['market', 'strategy', 'agent', 'wallet', 'account'])
+
+// The channel sidebar is the chat page's furniture. The product serves its two
+// instrument surfaces with the rail alone, so those two stops carry the rail
+// alone here too — and the lane they get is the lane the product gives them.
+const sidebar = document.querySelector('.sidebar')
+const CHAT = new Set(['strategy', 'agent'])
+
+const show = (name) => {
+  if (!TOURED.has(name)) return
+  if (sidebar) sidebar.hidden = !CHAT.has(name)
+  for (const s of surfaces) s.hidden = s.dataset.surface !== name
+  for (const b of buttons) {
+    const on = b.dataset.nav === name
+    b.classList.toggle('active', on)
+    if (on) b.setAttribute('aria-current', 'page')
+    else b.removeAttribute('aria-current')
+  }
+}
+
+for (const b of buttons) {
+  b.addEventListener('click', (e) => {
+    const name = b.dataset.nav
+    if (!TOURED.has(name)) { e.preventDefault(); return }
+    e.preventDefault()
+    show(name)
+  })
+}
+
+// Account records: 持仓/订单 tabs swap the visible panel. This is navigation
+// (which view you're looking at), not an action control, so it stays wired —
+// every other control on the account surface remains inert.
+const acctTabs = [...document.querySelectorAll('.account-tab')]
+const acctPanels = [...document.querySelectorAll('.account-records-panel')]
+
+const selectAccountTab = (tab) => {
+  const panelId = tab.getAttribute('aria-controls')
+  for (const t of acctTabs) {
+    const on = t === tab
+    t.classList.toggle('active', on)
+    t.setAttribute('aria-selected', String(on))
+  }
+  for (const p of acctPanels) {
+    p.hidden = p.id !== panelId
+  }
+}
+
+for (const tab of acctTabs) {
+  tab.addEventListener('click', () => selectAccountTab(tab))
+}
+
+// A process disclosure's badge is the number of rows it holds. The host's own
+// rows are already in hand, so its badge is filled from the start; a member's
+// rows arrive on first open, and the badge is written in the same pass that
+// puts them there — so the badge is never blank above rows that are showing.
+for (const trace of document.querySelectorAll('.answer-trace')) {
+  trace.addEventListener('toggle', () => {
+    if (!trace.open) return
+    const badge = trace.querySelector('.trace-count')
+    const body = trace.querySelector('.trace-content')
+    if (badge && body) badge.textContent = String(body.childElementCount)
+  })
+}
+</script>
+</body>
+</html>
