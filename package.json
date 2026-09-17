@@ -1,0 +1,36 @@
+{
+  "name": "agentpay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authorize-first, settle-later payments for AI agents: an AEP2-style debit wallet, settlement processor, payee middleware, agent wallet SDK and CLI.",
+  "workspaces": [
+    "packages/core",
+    "contracts",
+    "services/sp",
+    "packages/payee",
+    "packages/wallet",
+    "packages/cli",
+    "demo"
+  ],
+  "scripts": {
+    "typecheck": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "gen-abi": "npm run gen:abi --workspace @agentpay/contracts",
+    "demo": "npm run gen-abi && npm run demo --workspace @agentpay/demo",
+    "sp": "npm run start --workspace @agentpay/sp",
+    "payee": "npm run start --workspace @agentpay/payee",
+    "cli": "tsx packages/cli/src/cli.ts",
+    "deploy:local": "npm run deploy:local --workspace @agentpay/contracts",
+    "deploy:base-sepolia": "npm run deploy:base-sepolia --workspace @agentpay/contracts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

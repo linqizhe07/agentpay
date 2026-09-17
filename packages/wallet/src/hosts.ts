@@ -1,0 +1,46 @@
+/**
+ * Host allowlist matching for intent mandates.
+ *
+ * A pattern is one of:
+ *   - an exact host            'api.example.com'
+ *   - an exact host with port  'api.example.com:8080'
+ *   - a wildcard subdomain     '*.example.com' (any depth, never the apex itself)
+ *   - '*'                      any host
+ *
+ * Matching is case-insensitive. Because a pattern may or may not carry a port,
+ * callers compare each pattern against BOTH `url.hostname` and `url.host`
+ * (see `urlHostCandidates`).
+ */
+export function matchHost(pattern: string, host: string): boolean {
+  const p = pattern.trim().toLowerCase();
+  const h = host.trim().toLowerCase();
+  if (!p || !h) return false;
+  if (p === '*') return true;
+  if (p.startsWith('*.')) {
+    const suffix = p.slice(1); // '.example.com' or '.example.com:8080'
+    return h.endsWith(suffix) && h.length > suffix.length;
+  }
+  return p === h;
+}
+
+/** 'host:port' -> 'host'; '[::1]:8080' -> '[::1]'; already-bare hosts pass through. */
+export function hostnameOf(host: string): string {
+  const m = /^(\[[^\]]*\]|[^:]+)(?::\d+)?$/.exec(host.trim());
+  return m ? m[1] : host.trim();
+}
+
+/** The strings a URL's host may be matched under: hostname first, then host:port when different. */
+export function urlHostCandidates(u: URL): string[] {
+  return u.host !== u.hostname ? [u.hostname, u.host] : [u.hostname];
+}
+
+/** Same as urlHostCandidates but for a bare 'host' or 'host:port' string. */
+export function hostCandidates(host: string): string[] {
+  const bare = hostnameOf(host);
+  return bare !== host.trim() ? [bare, host.trim()] : [bare];
+}
+
+/** True when any pattern in the allowlist matches any of the candidate host strings. */
+export function hostAllowed(allowlist: readonly string[], candidates: readonly string[]): boolean {
+  return allowlist.some((pattern) => candidates.some((c) => matchHost(pattern, c)));
+}

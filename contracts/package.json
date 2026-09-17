@@ -1,0 +1,25 @@
+{
+  "name": "@agentpay/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "compile": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat compile",
+    "gen:abi": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat compile && node scripts/gen-abi.mjs",
+    "build": "tsc -p tsconfig.json --noEmit",
+    "test": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat compile && node scripts/gen-abi.mjs && vitest run",
+    "node": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat node",
+    "deploy:local": "tsx scripts/deploy-local.ts",
+    "deploy:base-sepolia": "tsx scripts/deploy-base-sepolia.ts"
+  },
+  "dependencies": {
+    "@agentpay/core": "*",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "^5.0.0",
+    "hardhat": "^2.22.0"
+  }
+}

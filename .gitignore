@@ -1,0 +1,10 @@
+node_modules/
+dist/
+artifacts/
+cache/
+*.log
+.env
+.DS_Store
+demo/out/
+services/sp/data/
+contracts/deployments/localhost.json
