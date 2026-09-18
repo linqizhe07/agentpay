@@ -68,8 +68,11 @@ function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
  * single sanctioned mutation and rewrites the file through a temp file plus
  * rename, so a crash mid-rewrite leaves the old ledger or the new one, never a
  * torn one. Only a truncated LAST line (an append cut short by a crash) is
- * tolerated: `read()` drops it and repairs the file, and `append()` never glues
- * a new line onto it. Any other malformed line throws.
+ * tolerated: `read()` ignores it, and the write paths get rid of it (`append()`
+ * truncates it away before writing so it never glues a new line onto it;
+ * `updateStatus()` rewrites the file without it). A reader never modifies the
+ * file, so `report()` in a second process cannot destroy an append the wallet
+ * process is in the middle of. Any other malformed line throws.
  *
  * Every write is fsynced: since the budget counters are rebuilt from this file
  * on load, a line lost to a power cut is not a stale report but a mandate that
@@ -93,10 +96,11 @@ export class Ledger {
   /**
    * Returns [] when the file does not exist yet. Throws on malformed lines,
    * except for a line without its newline at the very end: a complete one (a
-   * foreign writer forgot to terminate it) is kept and terminated, a torn one
-   * is dropped and the file truncated back to the last newline.
+   * foreign writer forgot to terminate it) is kept, a torn one is ignored.
+   * Only with `repair` (the append path) is the file touched: the complete
+   * line is terminated, the torn one truncated back to the last newline.
    */
-  read(): LedgerEntry[] {
+  read(opts: { repair?: boolean } = {}): LedgerEntry[] {
     if (!existsSync(this.path)) return [];
     const text = readFileSync(this.path, 'utf8');
     const lastNewline = text.lastIndexOf('\n');
@@ -120,10 +124,12 @@ export class Ledger {
       }
       if (entry) {
         entries.push(entry);
-        appendFileSync(this.path, '\n', 'utf8');
-      } else {
+        if (opts.repair) appendFileSync(this.path, '\n', 'utf8');
+      } else if (opts.repair) {
         truncateSync(this.path, Buffer.byteLength(complete, 'utf8'));
         this.log(`wallet: ledger ${this.path}: dropped truncated last line (${tail.length} chars)`);
+      } else {
+        this.log(`wallet: ledger ${this.path}: ignoring truncated last line (${tail.length} chars; dropped on the next append)`);
       }
     }
     return entries;
@@ -148,7 +154,9 @@ export class Ledger {
    * Makes sure the file is absent, empty, or newline-terminated before an
    * append, so a torn last line never gets a new line glued onto it. The common
    * case costs one stat and one byte; only an unterminated tail takes the full
-   * read() path (keep a complete line, drop a torn one).
+   * read() path (keep and terminate a complete line, drop a torn one). This is
+   * the one place a torn tail is truncated: `updateStatus()` drops it by
+   * rewriting the whole file, and plain readers leave the file alone.
    */
   private repairTail(): void {
     if (!existsSync(this.path)) return;
@@ -161,6 +169,6 @@ export class Ledger {
     } finally {
       closeSync(fd);
     }
-    if (last[0] !== 0x0a) this.read();
+    if (last[0] !== 0x0a) this.read({ repair: true });
   }
 }

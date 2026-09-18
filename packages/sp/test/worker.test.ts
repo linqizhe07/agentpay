@@ -173,6 +173,7 @@ describe('worker', () => {
   it('recovers after a restart on the same store file', async () => {
     const storePath = tmpStorePath('restart');
     const first = mkSP({ storePath });
+    expect(first.store.path).toBe(storePath); // the durable branch: a real file, not the memory opt-out
     await first.start();
     const a = await signed();
     const b = await signed({}, accounts.stranger);

@@ -199,18 +199,23 @@ describe('agentpay CLI', () => {
   it('reports a counter rebuild on stderr and keeps stdout to the one JSON document', async () => {
     // A mandates.json whose counters drifted from the ledger (a crash between the two
     // writes) is healed on load; the operator sees the delta without stdout changing shape.
+    const created = await run(['mandate-create', '--purpose', 'drift', '--limit', '1', '--hosts', '127.0.0.1'], env);
+    const id = (created.output as Out).mandate.id as string;
     const mandatesPath = join(home, 'mandates.json');
     const file = JSON.parse(readFileSync(mandatesPath, 'utf8')) as { mandates: Array<{ id: string; spentAmount: string }> };
-    const drifted = file.mandates[0];
+    const drifted = file.mandates.find((m) => m.id === id)!;
     drifted.spentAmount = String(BigInt(drifted.spentAmount) + 1n);
     writeFileSync(mandatesPath, JSON.stringify(file), 'utf8');
 
+    const rebuildLines = (stderr: string) => stderr.split('\n').filter((l) => l.includes('counters rebuilt'));
     const first = await execFileAsync('npx', ['tsx', 'src/cli.ts', 'mandate-list'], { cwd: CLI_DIR, env });
-    expect(first.stderr).toContain(`mandate ${drifted.id}: counters rebuilt from the ledger`);
+    expect(rebuildLines(first.stderr)).toEqual([expect.stringContaining(`mandate ${id}: counters rebuilt from the ledger`)]);
     expect((JSON.parse(first.stdout) as Out).ok).toBe(true);
 
+    // The heal was saved, so the next run has nothing to report (other stderr
+    // noise, e.g. a Node deprecation warning from a dependency, is not ours to assert on).
     const second = await execFileAsync('npx', ['tsx', 'src/cli.ts', 'mandate-list'], { cwd: CLI_DIR, env });
-    expect(second.stderr).toBe('');
+    expect(rebuildLines(second.stderr)).toEqual([]);
     expect((JSON.parse(second.stdout) as Out).ok).toBe(true);
   });
 });

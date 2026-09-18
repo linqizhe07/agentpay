@@ -187,7 +187,7 @@ describe('Ledger', () => {
     expect(() => ledger.updateStatus(('0x' + 'ee'.repeat(32)) as Hex, 'settled')).toThrow(/no ledger entry/);
   });
 
-  it('updateStatus rewrites through a temp file and leaves no .tmp behind', () => {
+  it('updateStatus leaves no .tmp behind (the tmp+fsync+rename sequence itself is pinned in ledger-durable.test.ts)', () => {
     const dir = join(root, 'ledger-atomic');
     const ledger = new Ledger(join(dir, 'ledger.jsonl'));
     const entry = ledgerEntry('ab');
@@ -198,29 +198,37 @@ describe('Ledger', () => {
     expect(ledger.read().map((e) => e.status)).toEqual(['expired-unused']);
   });
 
-  it('drops a truncated last line, repairs the file and keeps appending cleanly', () => {
+  it('ignores a truncated last line on read; append() drops it and keeps appending cleanly', () => {
     const path = join(root, 'ledger-truncated', 'ledger.jsonl');
     const w = new Ledger(path);
     const a = ledgerEntry('ab');
     w.append(a);
-    const good = readFileSync(path, 'utf8');
-    appendFileSync(path, '{"kind":"payment","mandateDigest":"0x00","status":"enq', 'utf8'); // crash mid-append
+    const torn = '{"kind":"payment","mandateDigest":"0x00","status":"enq';
+    appendFileSync(path, torn, 'utf8'); // crash mid-append
+    const asLeft = readFileSync(path, 'utf8');
 
+    // A plain reader (report(), reconcile(), the constructor's rebuild) sees the
+    // complete lines and leaves the file alone: it could be another process's
+    // append still in progress.
     const warnings: string[] = [];
     const r = new Ledger(path, (line) => warnings.push(line));
     expect(r.read()).toEqual([a]);
-    expect(warnings.join('\n')).toMatch(/truncated last line/);
-    expect(readFileSync(path, 'utf8')).toBe(good);
+    expect(warnings.join('\n')).toMatch(/ignoring truncated last line/);
+    expect(readFileSync(path, 'utf8')).toBe(asLeft);
 
     // fetch() appends before it ever read: the torn tail must not swallow the new line
-    appendFileSync(path, '{"kind":"payment","mandateDigest":"0x00","status":"enq', 'utf8');
     const b = ledgerEntry('cd');
-    new Ledger(path).append(b);
+    const repairs: string[] = [];
+    new Ledger(path, (line) => repairs.push(line)).append(b);
+    expect(repairs.join('\n')).toMatch(/dropped truncated last line/);
     expect(new Ledger(path).read()).toEqual([a, b]);
     expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3); // 2 lines + trailing newline
 
+    // updateStatus() rewrites only what parsed, so a torn tail goes away with it
+    appendFileSync(path, torn, 'utf8');
     r.updateStatus(a.mandateDigest, 'settled');
     expect(new Ledger(path).read().map((e) => e.status)).toEqual(['settled', 'enqueued']);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3);
   });
 
   it('keeps a complete but unterminated last line', () => {
@@ -231,12 +239,12 @@ describe('Ledger', () => {
     const warnings: string[] = [];
     expect(new Ledger(path, (line) => warnings.push(line)).read()).toEqual([a]);
     expect(warnings).toEqual([]);
-    expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(true);
-    // and append() on its own terminates it instead of gluing the next line on
-    writeFileSync(path, JSON.stringify(a), 'utf8');
+    expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(false); // a reader leaves the file alone
+    // append() terminates it instead of gluing the next line on
     const b = ledgerEntry('cd');
     new Ledger(path).append(b);
     expect(new Ledger(path).read()).toEqual([a, b]);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3);
   });
 
   it('refuses a corrupt line that is not the last one', () => {
@@ -979,9 +987,13 @@ describe('budget counters are rebuilt from the ledger on load', () => {
     l.append(ledgerEntry('06', { intentMandateId: m.id, amount: '32', status: 'expired-unused', httpStatus: 200 }));
     l.append(ledgerEntry('07', { intentMandateId: m.id, amount: '64', status: 'enqueued', httpStatus: 409, error: 'replay; sp status pending' }));
     l.append(ledgerEntry('08', { intentMandateId: 'im_gone', amount: '128', status: 'enqueued', httpStatus: 200 })); // not in the store: ignored
+    // SP defaults: a line written before the flag existed (legacy error prefix only) and a flagged one
+    l.append(ledgerEntry('09', { intentMandateId: m.id, amount: '256', status: 'expired-unused', httpStatus: 200, error: 'sp_default: legacy line' }));
+    l.append(ledgerEntry('0a', { intentMandateId: m.id, amount: '512', status: 'expired-unused', httpStatus: 200, spDefault: true, error: 'anything' }));
     const again = makeWallet({ mandatesPath, ledgerPath }).wallet;
     expect(again.getMandate(m.id)).toMatchObject({ pendingSpentAmount: '3', spentAmount: '92' });
     expect(again.listMandates().map((x) => x.id)).toEqual([m.id]);
+    expect(again.report().totals).toMatchObject({ expiredUnused: 3, spDefaults: 2 });
   });
 
   it('counters that already agree are left alone: nothing logged, nothing rewritten', async () => {

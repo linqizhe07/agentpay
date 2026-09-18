@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, renameSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /**
@@ -40,15 +40,29 @@ export function appendDurableSync(path: string, line: string): void {
   fsyncDir(path);
 }
 
-/** Writes `data` to `tmp`, fsyncs it, renames it over `path` and fsyncs the directory: readers see the old file or the new one. */
+/**
+ * Writes `data` to `tmp`, fsyncs it, renames it over `path` and fsyncs the
+ * directory: readers see the old file or the new one. A failure anywhere before
+ * the rename lands leaves `path` untouched and removes `tmp` (callers mint a
+ * fresh temp name per call, so a leftover would otherwise accumulate).
+ */
 export function replaceDurableSync(path: string, tmp: string, data: string): void {
-  const fd = openSync(tmp, 'w');
   try {
-    writeAll(fd, data);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    const fd = openSync(tmp, 'w');
+    try {
+      writeAll(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best effort: the temp file may never have been created */
+    }
+    throw err;
   }
-  renameSync(tmp, path);
   fsyncDir(path);
 }

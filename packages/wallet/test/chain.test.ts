@@ -301,17 +301,21 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
     await w.revokeSP(sp.address);
     const { revokeAt } = await w.authorizationOf(sp.address);
     expect(revokeAt).toBeGreaterThan(t + 60);
-    // G: receipted as the revocation lands: the promise (revokeAt + 60) outlives the
-    // authorization. A compliant SP refuses this with sp_revocation_pending; the stub
-    // receipts anyway, which is exactly the receipt the SP cannot be blamed for.
-    t = revokeAt;
+    // G: receipted so that its promise ends exactly at revokeAt (enqueueDeadline =
+    // min(t + 120, t + 60) = revokeAt): the boundary case. The authorization is
+    // strict (block.timestamp < revokeAt) while the receipt covers enqueueDeadline
+    // inclusive, so at equality the promise's last second was never keepable and
+    // revokedBy() must say so with `<=`, not `<`. A compliant SP refuses this with
+    // sp_revocation_pending; the stub receipts anyway, which is exactly the
+    // receipt the SP cannot be blamed for.
+    t = revokeAt - 60;
     expect((await w.fetch(`${short.url}/predict`)).status).toBe(200);
     const [F, G] = readFileSync(join(dir, 'ledger-revoked.jsonl'), 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l) as LedgerEntry);
     expect([F.status, G.status]).toEqual(['enqueued', 'enqueued']);
-    expect(G.spReceipt?.enqueueDeadline).toBe(revokeAt + 60);
+    expect(G.spReceipt?.enqueueDeadline).toBe(revokeAt);
     expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '2000', pendingSpentAmount: '0' });
 
     // Neither settles; both expire (deadline + grace).
@@ -324,8 +328,9 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
         .map((l) => JSON.parse(l) as LedgerEntry)
         .map((e) => [e.mandateDigest, e]),
     );
-    expect(after[F.mandateDigest]).toMatchObject({ status: 'expired-unused', error: expect.stringMatching(/^sp_default/) });
+    expect(after[F.mandateDigest]).toMatchObject({ status: 'expired-unused', spDefault: true, error: expect.stringMatching(/^sp_default/) });
     expect(after[G.mandateDigest]).toMatchObject({ status: 'expired-unused', error: expect.stringMatching(/^payer_revoked/) });
+    expect(after[G.mandateDigest].spDefault).toBeUndefined();
     // Both budgets come back; only F counts as an SP default.
     expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '0' });
     expect(w.report().totals).toMatchObject({ expiredUnused: 2, spDefaults: 1 });

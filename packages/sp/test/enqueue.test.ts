@@ -76,6 +76,19 @@ describe('POST /enqueue', () => {
     expect(rec).toMatchObject({ status: 'pending', attempts: 0, chainId: fixture().chainId, wallet: fixture().wallet, payerSig: s.payerSig });
     expect(rec?.receipt).toEqual(receipt);
     expect(sp.store.reserved(accounts.payer.address, fixture().usdc)).toBeGreaterThanOrEqual(AMOUNT);
+    expect(sp.store.path).toBeUndefined(); // storePath ':memory:' reaches the store as "no file", not as a file named ':memory:'
+  });
+
+  it("storePath ':memory:' is announced as MEMORY-ONLY at start-up", async () => {
+    const lines: string[] = [];
+    const m = mkSP({ log: (l) => lines.push(l) });
+    await m.start();
+    try {
+      expect(m.store.path).toBeUndefined();
+      expect(lines.some((l) => l.includes('MEMORY-ONLY'))).toBe(true);
+    } finally {
+      await m.stop();
+    }
   });
 
   it('receipt enqueueDeadline is capped by the mandate deadline', async () => {

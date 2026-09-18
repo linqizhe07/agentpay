@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { MEMORY_STORE_PATH, SP_DEFAULTS, loadConfigFromEnv, resolveConfig, type SPConfig } from '../src/index.js';
+import { DEFAULT_WITHDRAW_DELAY } from '@agentpay/contracts';
+import { MEMORY_STORE_PATH, SP_DEFAULTS, WITHDRAW_DELAY_MARGIN_SECONDS, loadConfigFromEnv, resolveConfig, type SPConfig } from '../src/index.js';
 import { KEYS } from './helpers.js';
 
 const WALLET = '0x5fbdb2315678afecb367f032d93f642f64180aa3';
@@ -118,6 +119,12 @@ describe('resolveConfig', () => {
     expect(r.storePath).toBe(DEFAULT_STORE);
     expect(typeof r.clock()).toBe('number');
     expect(typeof r.log).toBe('function');
+  });
+
+  it("the contracts package's default withdrawDelay clears the SP's default window plus margin", () => {
+    // deployAll() with no withdrawDelay and an SP with no SETTLE_WINDOW must fit
+    // together, or assertStartup() refuses the library's own defaults.
+    expect(DEFAULT_WITHDRAW_DELAY).toBeGreaterThanOrEqual(SP_DEFAULTS.settleWindowSeconds + WITHDRAW_DELAY_MARGIN_SECONDS);
   });
 
   it('resolves storePath by the same rule as the env loader', () => {

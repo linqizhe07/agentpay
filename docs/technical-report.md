@@ -10,7 +10,7 @@ agentpay 是一套给 AI agent 用的支付系统，复刻 FluxA 的 AEP2（Agen
 |---|---|
 | 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 合约 1 个（229 行） |
 | 链 | 本地 Hardhat 已跑通；Base Sepolia 部署脚本就绪，未部署 |
-| 测试 | 7 个工作区共 196 个测试，全绿；端到端 demo 7 个场景全过 |
+| 测试 | 7 个工作区共 203 个测试，全绿；端到端 demo 7 个场景全过 |
 | 安全 | 一轮内部安全评审，7 项修复已合入 |
 | 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库（`KairosPan/Evolving-Alpha-US`，PR #1 待合并） |
 | 不做 | escrow、争议、追索、ZK 批量证明、KYC、前端 |
@@ -333,7 +333,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 | SP：发送后、收到收据前 | 记录停在 `settling` 带 txHash；启动恢复查收据或按 nonce 决定 |
 | 钱包对账时 RPC 不可用 | 快速失败，不改任何状态 |
 
-存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+fsync+rename 重写）和 `ledger.jsonl`（只追加，每行 fsync；状态更新同样 tmp+fsync+rename 重写，所以崩溃或断电后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错。预算计数器从账本重算，所以账本和 `mandates.json` 的耐久性必须一致，否则丢账本会放开预算）、收款方的幂等存储在内存。CLI 把钱包的修复日志（丢弃的尾行、重算的计数器）写到 stderr，stdout 仍只有一个 JSON 文档。
+存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+fsync+rename 重写）和 `ledger.jsonl`（只追加，每行 fsync；状态更新同样 tmp+fsync+rename 重写，所以崩溃或断电后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错；读取只忽略这样的尾行，追加前才把它截掉——纯读取的进程如 `agentpay report` 不会碰文件，也就不会毁掉另一个进程正在写的行。预算计数器从账本重算，所以账本和 `mandates.json` 的耐久性必须一致，否则丢账本会放开预算）、收款方的幂等存储在内存。CLI 把钱包的修复日志（丢弃的尾行、重算的计数器）写到 stderr，stdout 仍只有一个 JSON 文档。
 
 ## 12. 测试与验证
 
@@ -341,9 +341,9 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 |---|---|---|
 | core | 22 | 摘要与合约逐字节一致、签名规范化、头部编解码、收据校验、金额解析 |
 | contracts | 17 | 存取、授权、延迟撤销、提现延迟、fee-on-transfer 存款、`settle` 各错误、`settleBatch` 跳过语义 |
-| sp | 56 | 接纳各拒绝码、幂等、区块钉住、并发接纳（HTTP 级与 `Queue.claim` 单 tick 级）、撤销待生效、store 耐久与写失败回滚、withdrawDelay 余量、worker 状态机、启动恢复、传输失败 |
+| sp | 60 | 接纳各拒绝码、幂等、区块钉住、并发接纳（HTTP 级与 `Queue.claim` 单 tick 级）、撤销待生效、store 耐久（入队 fsync 可观测）与写失败回滚、`:memory:` 选入、withdrawDelay 余量、worker 状态机、启动恢复、传输失败 |
 | payee | 28 | 八步顺序、重放（含并发）、SP 各种坏响应（stub SP 多种模式）、链上预检 |
-| wallet | 60 | 策略闸、预算并发预留、账本状态、账本尾行/原子重写、计数器重算、对账（含 SP 违约、付款人撤销、双花 nonce） |
+| wallet | 63 | 策略闸、预算并发预留、账本状态、账本尾行/原子重写（fsync 与 tmp+rename 序列本身可观测）、计数器重算、对账（含 SP 违约、付款人撤销及其 `revokeAt == enqueueDeadline` 边界、双花 nonce） |
 | cli | 10 | 命令 JSON 契约、配置优先级、美元金额、stderr 修复日志 |
 | demo | 3 | 端到端 |
 
