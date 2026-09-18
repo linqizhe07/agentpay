@@ -19,7 +19,7 @@ export type { ClaimResult, Precheck } from './queue.js';
 export { checkTerms, parseEnqueueBody } from './validate.js';
 export type { EnqueueRequest, Failure, TermsOptions } from './validate.js';
 export { enqueueDeadlineFor, issueReceipt } from './receipt.js';
-export { ChainClient, assertStartup, classifyError, parseSettleLogs } from './chain.js';
+export { ChainClient, WITHDRAW_DELAY_MARGIN_SECONDS, assertStartup, classifyError, parseSettleLogs } from './chain.js';
 export type { TokenInfo, SettleItem } from './chain.js';
 export { MAX_BODY_BYTES } from './server.js';
 

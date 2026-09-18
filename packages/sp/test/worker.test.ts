@@ -129,7 +129,7 @@ describe('worker', () => {
       const s = await signed({}, payer);
       const receipt = (await enqueue(sp, s)).json.receipt as SpReceipt;
       const revokeAt = await revoke(payer, spAddress); // the payer took delivery and revokes in the next block
-      expect(revokeAt).toBeGreaterThanOrEqual(receipt.enqueueDeadline); // the receipt's promise is still keepable
+      expect(revokeAt).toBeGreaterThan(receipt.enqueueDeadline); // the receipt's promise is still keepable
       const r = await sp.tick();
       expect(r.settled).toEqual([s.digest]);
       expect(r.skipped).toEqual([]);

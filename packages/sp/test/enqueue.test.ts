@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SP_ERROR_CODES, verifySpReceipt, type Hex, type SpReceipt } from '@agentpay/core';
-import { MAX_BODY_BYTES, type SPHandle } from '../src/index.js';
+import { MAX_BODY_BYTES, WITHDRAW_DELAY_MARGIN_SECONDS, type SPHandle } from '../src/index.js';
 import {
   AMOUNT,
   SETTLE_WINDOW,
@@ -205,7 +205,7 @@ describe('POST /enqueue', () => {
     const revoking = mkSP({ clock: () => spNow });
     await revoking.start();
     try {
-      const revokeAt = await revoke(payer, sp.address); // = revoke block + withdrawDelay (== SETTLE_WINDOW here)
+      const revokeAt = await revoke(payer, sp.address); // = revoke block + withdrawDelay (> SETTLE_WINDOW)
       // A receipt issued now would promise settlement by revokeAt itself, which the
       // contract already refuses: no receipt, nothing reserved.
       spNow = revokeAt - SETTLE_WINDOW;
@@ -471,9 +471,14 @@ describe('startup assertions', () => {
     await expect(sp.start()).rejects.toThrow(/serves chain 31337 but the configuration says 1/);
   });
 
-  it('refuses a settlement window longer than the withdrawal delay', async () => {
-    const sp = mkSP({ settleWindowSeconds: fixture().withdrawDelay + 1 });
-    await expect(sp.start()).rejects.toThrow(/withdrawDelay is 600s but settleWindowSeconds is 601s/);
+  it('refuses a settlement window that ends within the skew margin of the withdrawal delay', async () => {
+    // withdrawDelay == window + margin is the last accepted configuration; one second more is refused.
+    const widest = fixture().withdrawDelay - WITHDRAW_DELAY_MARGIN_SECONDS;
+    const sp = mkSP({ settleWindowSeconds: widest + 1 });
+    await expect(sp.start()).rejects.toThrow(/withdrawDelay is 900s but settleWindowSeconds is 841s \(needs at least 60s more/);
+    const ok = mkSP({ settleWindowSeconds: widest });
+    await ok.start();
+    await ok.stop();
   });
 
   it('refuses a token that does not answer decimals() and a wallet that is not a debit wallet', async () => {

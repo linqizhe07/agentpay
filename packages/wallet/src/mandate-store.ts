@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hashTypedData, recoverTypedDataAddress } from 'viem';
 import { newId, parseAmount, type Address, type Hex, type TypedDataSigner } from '@agentpay/core';
+import { replaceDurableSync } from './durable.js';
 
 /** What a human (or an agent drafting on their behalf) supplies to create an intent mandate. */
 export interface IntentMandateInput {
@@ -182,7 +183,8 @@ interface StoreFile {
 /**
  * Intent mandates plus their budget counters. Memory-only when constructed
  * without a path; otherwise loaded from `path` on construction and written
- * back by `save()` (temp file + rename, so readers never see a torn file).
+ * back by `save()` (fsynced temp file + rename, so readers never see a torn
+ * file and a power cut cannot leave it emptier than the ledger).
  */
 export class IntentMandateStore {
   private readonly byId = new Map<string, IntentMandate>();
@@ -221,7 +223,6 @@ export class IntentMandateStore {
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
     const file: StoreFile = { version: 1, mandates: this.list() };
     const tmp = `${this.path}.${process.pid}.${++this.saveSeq}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, 'utf8');
-    renameSync(tmp, this.path);
+    replaceDurableSync(this.path, tmp, `${JSON.stringify(file, null, 2)}\n`);
   }
 }

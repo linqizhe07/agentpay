@@ -1,18 +1,7 @@
-import {
-  appendFileSync,
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readSync,
-  renameSync,
-  statSync,
-  truncateSync,
-  writeFileSync,
-} from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Address, Hex, Mandate, SpReceipt } from '@agentpay/core';
+import { appendDurableSync, replaceDurableSync } from './durable.js';
 
 /**
  * One payer-side record of a signed mandate that left the wallet: the full
@@ -81,6 +70,10 @@ function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
  * torn one. Only a truncated LAST line (an append cut short by a crash) is
  * tolerated: `read()` drops it and repairs the file, and `append()` never glues
  * a new line onto it. Any other malformed line throws.
+ *
+ * Every write is fsynced: since the budget counters are rebuilt from this file
+ * on load, a line lost to a power cut is not a stale report but a mandate that
+ * no longer counts against its limit.
  */
 export class Ledger {
   private writeSeq = 0;
@@ -94,7 +87,7 @@ export class Ledger {
     const dir = dirname(this.path);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
     this.repairTail();
-    appendFileSync(this.path, `${JSON.stringify(entry)}\n`, 'utf8');
+    appendDurableSync(this.path, `${JSON.stringify(entry)}\n`);
   }
 
   /**
@@ -148,8 +141,7 @@ export class Ledger {
     }
     if (!hit) throw new Error(`no ledger entry with mandateDigest ${digest} in ${this.path}`);
     const tmp = `${this.path}.${process.pid}.${++this.writeSeq}.tmp`;
-    writeFileSync(tmp, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`, 'utf8');
-    renameSync(tmp, this.path);
+    replaceDurableSync(this.path, tmp, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
   }
 
   /**

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -194,5 +194,23 @@ describe('agentpay CLI', () => {
     expect(parsed.count).toBeGreaterThanOrEqual(2);
 
     await expect(execFileAsync('npx', ['tsx', 'src/cli.ts'], { cwd: CLI_DIR, env })).rejects.toMatchObject({ code: 2 });
+  });
+
+  it('reports a counter rebuild on stderr and keeps stdout to the one JSON document', async () => {
+    // A mandates.json whose counters drifted from the ledger (a crash between the two
+    // writes) is healed on load; the operator sees the delta without stdout changing shape.
+    const mandatesPath = join(home, 'mandates.json');
+    const file = JSON.parse(readFileSync(mandatesPath, 'utf8')) as { mandates: Array<{ id: string; spentAmount: string }> };
+    const drifted = file.mandates[0];
+    drifted.spentAmount = String(BigInt(drifted.spentAmount) + 1n);
+    writeFileSync(mandatesPath, JSON.stringify(file), 'utf8');
+
+    const first = await execFileAsync('npx', ['tsx', 'src/cli.ts', 'mandate-list'], { cwd: CLI_DIR, env });
+    expect(first.stderr).toContain(`mandate ${drifted.id}: counters rebuilt from the ledger`);
+    expect((JSON.parse(first.stdout) as Out).ok).toBe(true);
+
+    const second = await execFileAsync('npx', ['tsx', 'src/cli.ts', 'mandate-list'], { cwd: CLI_DIR, env });
+    expect(second.stderr).toBe('');
+    expect((JSON.parse(second.stdout) as Out).ok).toBe(true);
   });
 });

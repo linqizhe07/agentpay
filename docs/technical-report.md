@@ -10,7 +10,7 @@ agentpay 是一套给 AI agent 用的支付系统，复刻 FluxA 的 AEP2（Agen
 |---|---|
 | 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 合约 1 个（229 行） |
 | 链 | 本地 Hardhat 已跑通；Base Sepolia 部署脚本就绪，未部署 |
-| 测试 | 7 个工作区共 169 个测试，全绿；端到端 demo 7 个场景全过 |
+| 测试 | 7 个工作区共 196 个测试，全绿；端到端 demo 7 个场景全过 |
 | 安全 | 一轮内部安全评审，7 项修复已合入 |
 | 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库（`KairosPan/Evolving-Alpha-US`，PR #1 待合并） |
 | 不做 | escrow、争议、追索、ZK 批量证明、KYC、前端 |
@@ -75,7 +75,7 @@ sequenceDiagram
   A->>P: GET /quote + PAYMENT-SIGNATURE
   P->>P: 验报价回显、条款、签名、占位摘要
   P->>S: POST /enqueue {mandate, payerSig}
-  S->>C: 读 authorizedSP / usedNonces / debitableBalance（钉在一个区块）
+  S->>C: 读 authorizationOf / usedNonces / debitableBalance（钉在一个区块）
   S-->>P: 收据 SPReceipt(digest, enqueueDeadline)
   P-->>A: 200 + PAYMENT-RESPONSE（收据）
   Note over A: 账本 enqueued
@@ -147,7 +147,7 @@ enqueueDeadline = min(mandate.deadline, now + settleWindowSeconds)
 | 收款方 | `deadline ≤ now + 30s` 拒 `mandate_expired`；`deadline < now + settleWindow` 拒 `mandate_deadline_too_short` |
 | SP | `deadline < now + 120s` 拒 `deadline_too_soon`；`deadline > now + 86400s` 拒 `deadline_too_far` |
 | SP worker | 距 deadline 不足 30s 的 pending 项本地标 expired，不再发送 |
-| 钱包对账 | `now > deadline + 60s` 且 nonce 未用 → `expired-unused`；有收据却未结算 → 记 `sp_default` |
+| 钱包对账 | `now > deadline + 60s` 且 nonce 未用 → `expired-unused`；有收据却未结算 → 记 `sp_default`（撤销在收据窗口内生效则记 `payer_revoked`） |
 
 ### 4.5 错误码
 
@@ -170,7 +170,7 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 | `withdrawals[payer][token]` | 待提现 `{amount, unlockAt}`，每对 (payer, token) 最多一笔 |
 | `usedNonces[payer][nonce]` | nonce 已消耗 |
 | `_authorizations[payer][sp]` | `{enabled, revokeAt}`：该 payer 是否允许这个 SP 扣款，以及已排定的撤销生效时刻（0 = 未排定）。视图 `authorizedSP(owner, sp)` = `enabled && (revokeAt == 0 \|\| now < revokeAt)`，`authorizationOf(owner, sp)` 返回原始记录 |
-| `withdrawDelay`（immutable） | 提现锁定秒数，必须 ≥ 所有 SP 的结算窗口 |
+| `withdrawDelay`（immutable） | 提现锁定秒数（撤销 SP 同样延迟）。合约只要求非零；SP 启动时要求它比自己的结算窗口至少长 60 秒（时钟偏差余量，见 §6.4） |
 
 ### 5.2 函数
 
@@ -194,11 +194,11 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 
 提现要等 `withdrawDelay`；期间已排队的 mandate 仍按**全部**余额结算，`executeWithdraw` 只付剩下的。SP 用 `debitableBalance` 接纳新 mandate，所以永远不会针对已在路上的钱接单。这与 FluxA「自动延长的提现计时器」等价，但不需要计时器。
 
-撤销 SP 同样延迟：`revokeSP` 在 `withdrawDelay` 后生效，期间 SP 仍有授权，撤销前 SP 已签收的 mandate（都在其 ≤ `withdrawDelay` 的结算窗口内到期）仍可结算；否则付款人可以拿到数据后下一块撤销授权，绕过提现延迟。SP 拒绝收据窗口会跨过待生效撤销的新 mandate（`sp_revocation_pending`）；钱包对账把撤销导致的过期记 `payer_revoked` 而非 `sp_default`。
+撤销 SP 同样延迟：`revokeSP` 在 `withdrawDelay` 后生效，期间 SP 仍有授权，撤销前 SP 已签收的 mandate（都在其短于 `withdrawDelay` 的结算窗口内到期）仍可结算；否则付款人可以拿到数据后下一块撤销授权，绕过提现延迟。这只堵住付款人自己的 `revokeSP` / `requestWithdraw` 路径：付款人另授权的 SP（包括付款人自己控制的地址）仍可先消耗该 mandate 的 nonce 或余额，见 §15。SP 拒绝收据窗口会跨过待生效撤销的新 mandate（`sp_revocation_pending`）；钱包对账把撤销导致的过期记 `payer_revoked` 而非 `sp_default`。
 
 ### 5.4 Gas
 
-本地演示：24 张 mandate 一笔 `settleBatch` 共 1,028,617 gas，每张约 42.9k。批量摊薄交易开销，每张仍要一次 ecrecover。
+本地演示：24 张 mandate 一笔 `settleBatch` 约 1.03M gas，每张约 42.9k（随签名与 calldata 逐次略有浮动；Hardhat 基线待合约测试的 gas 上限一起钉住）。批量摊薄交易开销，每张仍要一次 ecrecover。
 
 ## 6. 结算处理器（SP）
 
@@ -230,7 +230,7 @@ schema → 链与代币受支持 → 金额和 payee 非零 → deadline 窗口 
 
 ### 6.4 配置
 
-环境变量：`SP_PK`、`RPC_URL`、`CHAIN_ID`、`WALLET_ADDRESS`、`SUPPORTED_TOKENS`（逗号分隔）、`SP_PORT`、`STORE_PATH`（默认 `packages/sp/data/sp-queue.jsonl`，按包位置锚定，与运行目录无关；`:memory:` 显式选入纯内存，启动时会打印警告）、`SETTLE_WINDOW`（10800）、`MIN_DEADLINE_MARGIN`（120）、`MAX_DEADLINE_HORIZON`（86400）、`BATCH_INTERVAL_MS`（5000）、`BATCH_MAX`（50）、`SEND_MARGIN`（30）、`MAX_ATTEMPTS`（8）。缺 `WALLET_ADDRESS` / `SUPPORTED_TOKENS` 时从 `packages/contracts/deployments/<DEPLOYMENT ?? localhost>.json` 补。
+环境变量：`SP_PK`、`RPC_URL`、`CHAIN_ID`、`WALLET_ADDRESS`、`SUPPORTED_TOKENS`（逗号分隔）、`SP_PORT`、`STORE_PATH`（默认 `packages/sp/data/sp-queue.jsonl`，按包位置锚定，与运行目录无关；`:memory:` 显式选入纯内存，启动时会打印警告）、`SETTLE_WINDOW`（10800；启动时读链上 `withdrawDelay`，不比窗口至少长 60 秒则拒绝启动）、`MIN_DEADLINE_MARGIN`（120）、`MAX_DEADLINE_HORIZON`（86400）、`BATCH_INTERVAL_MS`（5000）、`BATCH_MAX`（50）、`SEND_MARGIN`（30）、`MAX_ATTEMPTS`（8）。缺 `WALLET_ADDRESS` / `SUPPORTED_TOKENS` 时从 `packages/contracts/deployments/<DEPLOYMENT ?? localhost>.json` 补。
 
 ## 7. 收款方 paywall
 
@@ -305,7 +305,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 |---|---|---|
 | 收款方 → SP | 收据是签名承诺，链上没有强制 | SP 不结算：收款方拿不到钱；钱包对账记 `sp_default` 并释放预算 |
 | 付款方 → 收款方 | 入队后会交付 | 协议不给「没拿到数据就退款」，无追索 |
-| SP / 收款方 → 付款方 | 余额与授权在链上可查 | 余额不足的 mandate 会被跳过；提现和撤销 SP 都在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 仍可结算 |
+| SP / 收款方 → 付款方 | 余额与授权在链上可查 | 余额不足的 mandate 会被跳过；提现和撤销 SP 都在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 不会被付款人自己的提现或撤销作废；但付款人通过另一个（自己控制的）已授权 SP 仍能先消耗其 nonce 或余额（§15） |
 | 用户 → 钱包程序 | 预算只在链下由钱包自己遵守 | 预算凭证合约不校验 |
 
 评审后已合入的修复：
@@ -333,18 +333,18 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 | SP：发送后、收到收据前 | 记录停在 `settling` 带 txHash；启动恢复查收据或按 nonce 决定 |
 | 钱包对账时 RPC 不可用 | 快速失败，不改任何状态 |
 
-存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+rename 重写）和 `ledger.jsonl`（只追加；状态更新同样 tmp+rename 重写，所以崩溃后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错）、收款方的幂等存储在内存。
+存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+fsync+rename 重写）和 `ledger.jsonl`（只追加，每行 fsync；状态更新同样 tmp+fsync+rename 重写，所以崩溃或断电后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错。预算计数器从账本重算，所以账本和 `mandates.json` 的耐久性必须一致，否则丢账本会放开预算）、收款方的幂等存储在内存。CLI 把钱包的修复日志（丢弃的尾行、重算的计数器）写到 stderr，stdout 仍只有一个 JSON 文档。
 
 ## 12. 测试与验证
 
 | 工作区 | 测试数 | 覆盖 |
 |---|---|---|
 | core | 22 | 摘要与合约逐字节一致、签名规范化、头部编解码、收据校验、金额解析 |
-| contracts | 14 | 存取、授权、提现延迟、`settle` 各错误、`settleBatch` 跳过语义 |
-| sp | 46 | 接纳各拒绝码、幂等、区块钉住、worker 状态机、启动恢复、传输失败 |
-| payee | 27 | 八步顺序、重放、SP 各种坏响应（stub SP 多种模式）、链上预检 |
-| wallet | 45 | 策略闸、预算并发预留、账本状态、对账（含 SP 违约、双花 nonce） |
-| cli | 9 | 命令 JSON 契约、配置优先级、美元金额 |
+| contracts | 17 | 存取、授权、延迟撤销、提现延迟、fee-on-transfer 存款、`settle` 各错误、`settleBatch` 跳过语义 |
+| sp | 56 | 接纳各拒绝码、幂等、区块钉住、并发接纳（HTTP 级与 `Queue.claim` 单 tick 级）、撤销待生效、store 耐久与写失败回滚、withdrawDelay 余量、worker 状态机、启动恢复、传输失败 |
+| payee | 28 | 八步顺序、重放（含并发）、SP 各种坏响应（stub SP 多种模式）、链上预检 |
+| wallet | 60 | 策略闸、预算并发预留、账本状态、账本尾行/原子重写、计数器重算、对账（含 SP 违约、付款人撤销、双花 nonce） |
+| cli | 10 | 命令 JSON 契约、配置优先级、美元金额、stderr 修复日志 |
 | demo | 3 | 端到端 |
 
 测试基础设施：每个需要链的包在 vitest global-setup 里各起一个 Hardhat 节点（端口 8546 contracts、8547 sp、8548 payee、8549 wallet），用 Hardhat 公开开发账户（#0 部署者、#1 付款人、#2 收款人、#3 SP、#4 陌生人）。demo 用 8545 / 3001 / 4021。
@@ -355,22 +355,22 @@ demo 的 7 个场景：正常付款；无头 402 报价；预算 $0.003 付三�
 
 ## 13. 部署与运维
 
-- **本地**：`npm run deploy:local` 部署 `MockUSDC` + `AEP2DebitWallet`（`withdrawDelay` 10800），写 `packages/contracts/deployments/localhost.json`（`chainId`、`network`、`wallet`、`usdc`、`withdrawDelay`、`deployer`、`txHash`、`blockNumber`、`deployedAt`）；然后 `npm run sp`、`npm run payee`、`npm run cli -- …`。
+- **本地**：`npm run deploy:local` 部署 `MockUSDC` + `AEP2DebitWallet`（`withdrawDelay` 21600，SP 默认结算窗口 10800 的两倍），写 `packages/contracts/deployments/localhost.json`（`chainId`、`network`、`wallet`、`usdc`、`withdrawDelay`、`deployer`、`txHash`、`blockNumber`、`deployedAt`）；然后 `npm run sp`、`npm run payee`、`npm run cli -- …`。
 - **Base Sepolia**：`npm run deploy:base-sepolia`，需要有测试币的 `DEPLOYER_PK`；默认 RPC `https://sepolia.base.org`，USDC 用 Circle 的 `0x036CbD53842c5426634e7929541eC2318f3dCF7e`，`WITHDRAW_DELAY` 默认 86400；写 `deployments/base-sepolia.json`。SP 还需要一个有 gas 的 `SP_PK`。
-- **约束**：`WITHDRAW_DELAY` ≥ 每个 SP 的 `SETTLE_WINDOW`；SP 单进程单存储；收款方多实例需外部幂等存储；同一 `AGENTPAY_HOME` 只跑一个钱包进程。
+- **约束**：`WITHDRAW_DELAY` ≥ 每个 SP 的 `SETTLE_WINDOW` + 60（SP 启动时检查；收据承诺的最后一秒是闭区间，而 `revokeAt`/`unlockAt` 是开区间，再加 SP 时钟相对链的偏差）；本地 hardhat 重启并 `deploy:local` 后要删掉 `packages/sp/data/sp-queue.jsonl`（或用 `STORE_PATH=:memory:`），否则上一条链的队列会被重放；SP 单进程单存储；收款方多实例需外部幂等存储；同一 `AGENTPAY_HOME` 只跑一个钱包进程。
 
 ## 14. 与 FluxA 的差异（有意为之）
 
 1. `deadline` 用 `uint64`，`usedNonces` 按 `(owner, nonce)` 而非 `(owner, token, nonce)`；签名与 FluxA 已部署合约不互通。
 2. SP 收据是 EIP-712 typed data，FluxA 是 `personal_sign` 打包字节。
 3. 安全修复：`settle` 按**全部**余额检查，FluxA 参考合约的 `requestWithdraw` 立即扣减，付款人可先被服务再申请全额提现饿死结算。
-4. 安全修复：SP 由每个付款人 `authorizeSP` 授权，而非部署者的全局 `setSP`；撤销（`revokeSP`）在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 仍可结算；合约没有 admin。
+4. 安全修复：SP 由每个付款人 `authorizeSP` 授权，而非部署者的全局 `setSP`；撤销（`revokeSP`）在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 不会被付款人自己的撤销或提现作废（另一个已授权 SP 仍可，见 §15）；合约没有 admin。
 5. 没有 ZK 批量证明：`settleBatch` 逐张链上验签；批量只摊薄交易开销。
 
 ## 15. 已知限制
 
 - MVP，未审计；`MockUSDC` 可随意 mint；合约无手续费、无升级、无暂停。
-- 一个付款人授权多个 SP 时，每个 SP 各自按同一个 `debitableBalance` 预留，合计接纳额可能超出余额，后结算的一方会 `InsufficientBalance`；一次只授权一个 SP。
+- 一个付款人授权多个 SP 时，每个 SP 各自按同一个 `debitableBalance` 预留，合计接纳额可能超出余额，后结算的一方会 `InsufficientBalance`；一次只授权一个 SP。同一机制也让付款人能故意作废已签收的 mandate：`authorizeSP` 接受任何地址（包括付款人自己），链上 nonce 的消耗和余额都不与 SP 签收的那张 mandate 绑定，所以付款人拿到数据后可在下一块通过自己控制的 SP 结算一张同 nonce 的 1 单位 mandate（`NonceUsed`）或一张付给自己的全额 mandate（`InsufficientBalance`）。延迟撤销和延迟提现只防付款人自己的 `revokeSP` / `requestWithdraw`；收据最终靠付款人只授权了签收它的那个 SP，而合约既不能枚举授权也不强制这一点。
 - SP 单进程 + JSONL；队列文件只追加、不压缩，随历史线性增长，需要在 SP 停止时手动轮转；收款方幂等存储在内存；跨收款方重启的重放只在 60s 宽限期外被 SP 的 `created:false` 抓住。
 - 钱包预算文件单写者，两个进程共用一个 `AGENTPAY_HOME` 会互相覆盖计数。
 - 没有 KYC/KYB/KYA、争议处理、支付链接、卡、市场、UI。

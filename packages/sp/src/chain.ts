@@ -274,6 +274,17 @@ export interface StartupInfo {
   tokens: TokenInfo[];
 }
 
+/**
+ * How much longer than the settle window `withdrawDelay` must be. A receipt
+ * issued at SP clock T promises settlement through T + window inclusive, while
+ * a revocation or withdrawal mined at chain time T' >= T unlocks at T' +
+ * withdrawDelay, where the SP is already refused (`block.timestamp < revokeAt`
+ * is strict). Equality would leave the promise's last second unkeepable, and
+ * an SP clock ahead of the chain widens that tail; 60 s is the skew grace the
+ * wallet's receipt checks use.
+ */
+export const WITHDRAW_DELAY_MARGIN_SECONDS = 60;
+
 /** Startup invariants; throws an Error whose message says exactly what is wrong. */
 export async function assertStartup(
   chain: ChainClient,
@@ -296,9 +307,10 @@ export async function assertStartup(
       `wallet ${cfg.wallet} does not answer withdrawDelay() (is it an AEP2DebitWallet on chain ${chainId}?): ${errorMessage(err)}`,
     );
   }
-  if (withdrawDelay < cfg.settleWindowSeconds) {
+  if (withdrawDelay < cfg.settleWindowSeconds + WITHDRAW_DELAY_MARGIN_SECONDS) {
     throw new Error(
-      `wallet withdrawDelay is ${withdrawDelay}s but settleWindowSeconds is ${cfg.settleWindowSeconds}s: ` +
+      `wallet withdrawDelay is ${withdrawDelay}s but settleWindowSeconds is ${cfg.settleWindowSeconds}s ` +
+        `(needs at least ${WITHDRAW_DELAY_MARGIN_SECONDS}s more than the window): ` +
         'enqueued mandates could outlive the withdrawal lock; lower SETTLE_WINDOW',
     );
   }
