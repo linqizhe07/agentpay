@@ -1,12 +1,15 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { SP_DEFAULTS, loadConfigFromEnv, resolveConfig, type SPConfig } from '../src/index.js';
+import { MEMORY_STORE_PATH, SP_DEFAULTS, loadConfigFromEnv, resolveConfig, type SPConfig } from '../src/index.js';
 import { KEYS } from './helpers.js';
 
 const WALLET = '0x5fbdb2315678afecb367f032d93f642f64180aa3';
 const USDC = '0xe7f1725e7734ce288f8367e1bb143e90bb3f0512';
+/** The durable default lives next to the package, not in the caller's cwd (.gitignore lists it). */
+const DEFAULT_STORE = fileURLToPath(new URL('../data/sp-queue.jsonl', import.meta.url));
 
 describe('loadConfigFromEnv', () => {
   it('reads every variable', () => {
@@ -67,12 +70,21 @@ describe('loadConfigFromEnv', () => {
     expect(cfg.tokens.map((t) => t.toLowerCase())).toEqual([USDC]);
     expect(cfg.port).toBe(SP_DEFAULTS.port);
     expect(cfg.rpcUrl).toBe(SP_DEFAULTS.rpcUrl);
-    expect(cfg.storePath).toBeUndefined();
+    expect(cfg.storePath).toBe(DEFAULT_STORE);
     // explicit values win over the record
     const mixed = loadConfigFromEnv({ SP_PK: KEYS.sp, DEPLOYMENT: file, CHAIN_ID: '1', SUPPORTED_TOKENS: WALLET });
     expect(mixed.chainId).toBe(1);
     expect(mixed.tokens.map((t) => t.toLowerCase())).toEqual([WALLET]);
     expect(mixed.wallet.toLowerCase()).toBe(WALLET);
+  });
+
+  it('STORE_PATH: unset or blank is the package data file, :memory: opts out, anything else is taken as given', () => {
+    const base = { SP_PK: KEYS.sp, CHAIN_ID: '31337', WALLET_ADDRESS: WALLET, SUPPORTED_TOKENS: USDC };
+    expect(loadConfigFromEnv(base).storePath).toBe(DEFAULT_STORE);
+    expect(loadConfigFromEnv({ ...base, STORE_PATH: '  ' }).storePath).toBe(DEFAULT_STORE);
+    expect(loadConfigFromEnv({ ...base, STORE_PATH: ':memory:' }).storePath).toBe(MEMORY_STORE_PATH);
+    expect(loadConfigFromEnv({ ...base, STORE_PATH: ' ./data/q.jsonl ' }).storePath).toBe('./data/q.jsonl');
+    expect(SP_DEFAULTS.storePath).toBe(DEFAULT_STORE);
   });
 
   it('rejects a missing key, a missing deployment and non-integer numbers', () => {
@@ -103,9 +115,15 @@ describe('resolveConfig', () => {
       wallet: '0x5FbDB2315678afecb367f032d93F642f64180aa3',
       tokens: ['0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512'],
     });
-    expect(r.storePath).toBeUndefined();
+    expect(r.storePath).toBe(DEFAULT_STORE);
     expect(typeof r.clock()).toBe('number');
     expect(typeof r.log).toBe('function');
+  });
+
+  it('resolves storePath by the same rule as the env loader', () => {
+    expect(resolveConfig({ ...base, storePath: '' }).storePath).toBe(DEFAULT_STORE);
+    expect(resolveConfig({ ...base, storePath: MEMORY_STORE_PATH }).storePath).toBe(MEMORY_STORE_PATH);
+    expect(resolveConfig({ ...base, storePath: '/tmp/q.jsonl' }).storePath).toBe('/tmp/q.jsonl');
   });
 
   it('validates the inputs', () => {

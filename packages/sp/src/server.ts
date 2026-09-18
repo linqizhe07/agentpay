@@ -288,7 +288,7 @@ async function handleEnqueue(d: ServerDeps, req: IncomingMessage, res: ServerRes
 
   // (9)
   sendReceipt(res, claim.rec, claim.created);
-  if (claim.created && d.store.counts().pending >= cfg.batchMax) worker.kick();
+  if (claim.created && d.store.pending >= cfg.batchMax) worker.kick();
 }
 
 function handleStatus(d: ServerDeps, digest: string, res: ServerResponse): void {

@@ -134,12 +134,14 @@ curl -i http://127.0.0.1:4021/predict                  # 402 + PAYMENT-REQUIRED
 
 Then use the CLI as above with `AGENTPAY_KEY` = hardhat #1 (`0x59c6…690d`). All of these are Hardhat's public dev keys; never use them with real funds.
 
+The SP persists its queue to `STORE_PATH` (default `packages/sp/data/sp-queue.jsonl`, gitignored): every receipt it signs is fsynced to that file first, so a restart, `kill -9` included, resumes settling what it promised. `STORE_PATH=:memory:` keeps the queue in memory only; the SP says so at startup, and receipts do not survive a restart.
+
 ## Base Sepolia
 
 ```bash
 cp .env.example .env            # fill DEPLOYER_PK (funded with Base Sepolia ETH), SP_PK
 npm run deploy:base-sepolia     # deploys AEP2DebitWallet against Circle's testnet USDC 0x036CbD53842c5426634e7929541eC2318f3dCF7e
-DEPLOYMENT=base-sepolia npm run sp
+DEPLOYMENT=base-sepolia npm run sp                                 # STORE_PATH defaults to packages/sp/data/sp-queue.jsonl
 DEPLOYMENT=base-sepolia PAYEE_PK=… npm run payee
 DEPLOYMENT=base-sepolia AGENTPAY_KEY=… npm run cli -- deposit 1     # needs test USDC in the payer EOA
 ```
@@ -156,7 +158,7 @@ DEPLOYMENT=base-sepolia AGENTPAY_KEY=… npm run cli -- deposit 1     # needs te
 
 - MVP, unaudited. `MockUSDC` is a test token with open mint; `AEP2DebitWallet` has no fee logic, no upgradeability, no pause.
 - A payer may authorize several SPs, and each one reserves against the same `debitableBalance` on its own: their combined admissions can exceed it, and the later settlement then fails as `InsufficientBalance`. Authorize one SP at a time.
-- The SP is a single process with a JSONL store; the payee's idempotency store is in-memory (swap `IdempotencyStore` for Redis in multi-instance deployments). Across a payee restart, a replayed mandate is caught through the SP's `created: false` answer only once it is older than 60 s (`REPLAY_GRACE_SECONDS`); inside that window a re-presented mandate is treated as the payee's own retry after an SP timeout.
+- The SP is a single process with an append-only JSONL store that is never compacted (one line per enqueue and per status change, so it grows with the SP's history until you rotate it while the SP is stopped); the payee's idempotency store is in-memory (swap `IdempotencyStore` for Redis in multi-instance deployments). Across a payee restart, a replayed mandate is caught through the SP's `created: false` answer only once it is older than 60 s (`REPLAY_GRACE_SECONDS`); inside that window a re-presented mandate is treated as the payee's own retry after an SP timeout.
 - The wallet's budget store (`mandates.json`) is single-writer: it is loaded once per `MandateWallet` and rewritten whole on save, so two processes sharing one `AGENTPAY_HOME` (two concurrent `agentpay pay` runs, or an agent process plus the CLI) can overwrite each other's counters and overshoot a limit. Run one wallet process per home directory, or put a lock around it before multi-process use.
 - No KYC/KYB/KYA provider, no dispute processor, no payment links, cards, marketplace, or UI — FluxA's surfaces beyond the core protocol are out of scope here.
 - Trust model: the payee trusts the SP's receipt (the SP could fail to settle; `reconcile()` detects that as `spDefaults`, nothing enforces it on-chain yet), and the payer trusts the payee to deliver (no delivery receipt or recourse in AEP2).

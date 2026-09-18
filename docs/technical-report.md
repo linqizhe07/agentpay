@@ -202,7 +202,7 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 
 ## 6. 结算处理器（SP）
 
-`node:http` 服务，默认绑定 `127.0.0.1:3001`，JSONL 存储。
+`node:http` 服务，默认绑定 `127.0.0.1:3001`，追加式 JSONL 存储（默认 `packages/sp/data/sp-queue.jsonl`）。
 
 ### 6.1 HTTP API
 
@@ -230,7 +230,7 @@ schema → 链与代币受支持 → 金额和 payee 非零 → deadline 窗口 
 
 ### 6.4 配置
 
-环境变量：`SP_PK`、`RPC_URL`、`CHAIN_ID`、`WALLET_ADDRESS`、`SUPPORTED_TOKENS`（逗号分隔）、`SP_PORT`、`STORE_PATH`、`SETTLE_WINDOW`（10800）、`MIN_DEADLINE_MARGIN`（120）、`MAX_DEADLINE_HORIZON`（86400）、`BATCH_INTERVAL_MS`（5000）、`BATCH_MAX`（50）、`SEND_MARGIN`（30）、`MAX_ATTEMPTS`（8）。缺 `WALLET_ADDRESS` / `SUPPORTED_TOKENS` 时从 `packages/contracts/deployments/<DEPLOYMENT ?? localhost>.json` 补。
+环境变量：`SP_PK`、`RPC_URL`、`CHAIN_ID`、`WALLET_ADDRESS`、`SUPPORTED_TOKENS`（逗号分隔）、`SP_PORT`、`STORE_PATH`（默认 `packages/sp/data/sp-queue.jsonl`，按包位置锚定，与运行目录无关；`:memory:` 显式选入纯内存，启动时会打印警告）、`SETTLE_WINDOW`（10800）、`MIN_DEADLINE_MARGIN`（120）、`MAX_DEADLINE_HORIZON`（86400）、`BATCH_INTERVAL_MS`（5000）、`BATCH_MAX`（50）、`SEND_MARGIN`（30）、`MAX_ATTEMPTS`（8）。缺 `WALLET_ADDRESS` / `SUPPORTED_TOKENS` 时从 `packages/contracts/deployments/<DEPLOYMENT ?? localhost>.json` 补。
 
 ## 7. 收款方 paywall
 
@@ -326,11 +326,12 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 |---|---|
 | 钱包：签名后、发请求前 | 账本有 `in_flight`，预算已预留；对账后按链上状态收敛 |
 | 收款方：入队后、交付前 | SP 已有收据会结算；付款人未拿到数据（协议不保证） |
-| SP：入队后、落盘前 | 无记录、无收据；收款方收到错误不交付，可重试 |
+| SP：入队后、落盘前 | 无记录、无收据：`enq` 事件先 append + fsync 再进内存，写失败则内存不变、请求返回 500；收款方收到错误不交付，可重试 |
+| SP：收据发出后、`kill -9` | 记录已在盘上，重启后 pending 继续结算；丢的最多是一条未 fsync 的 `upd` 事件，启动对账从链上补回 |
 | SP：发送后、收到收据前 | 记录停在 `settling` 带 txHash；启动恢复查收据或按 nonce 决定 |
 | 钱包对账时 RPC 不可用 | 快速失败，不改任何状态 |
 
-存储都是本地文件：SP 的 `sp-queue.jsonl`、钱包的 `mandates.json`（单写者，整文件重写）和 `ledger.jsonl`、收款方的幂等存储在内存。
+存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件重写）和 `ledger.jsonl`、收款方的幂等存储在内存。
 
 ## 12. 测试与验证
 
@@ -368,7 +369,7 @@ demo 的 7 个场景：正常付款；无头 402 报价；预算 $0.003 付三�
 
 - MVP，未审计；`MockUSDC` 可随意 mint；合约无手续费、无升级、无暂停。
 - 一个付款人授权多个 SP 时，每个 SP 各自按同一个 `debitableBalance` 预留，合计接纳额可能超出余额，后结算的一方会 `InsufficientBalance`；一次只授权一个 SP。
-- SP 单进程 + JSONL；收款方幂等存储在内存；跨收款方重启的重放只在 60s 宽限期外被 SP 的 `created:false` 抓住。
+- SP 单进程 + JSONL；队列文件只追加、不压缩，随历史线性增长，需要在 SP 停止时手动轮转；收款方幂等存储在内存；跨收款方重启的重放只在 60s 宽限期外被 SP 的 `created:false` 抓住。
 - 钱包预算文件单写者，两个进程共用一个 `AGENTPAY_HOME` 会互相覆盖计数。
 - 没有 KYC/KYB/KYA、争议处理、支付链接、卡、市场、UI。
 - 信任模型如第 10 节：SP 失约无链上强制；收款方交付无追索。
