@@ -31,6 +31,8 @@ npm run demo        # fresh chain + SP + payee + agent, 7 scenarios, exit 0 iff 
 
 The demo prints, among other things: a paid call with the on-chain balance **unchanged** (settlement is deferred), a budget refusal *before* anything is signed, a 409 on replay, the SP refusing an unauthorized or unfunded payer, 20 calls settled by **one** `settleBatch` transaction, and a withdrawal that stays locked until the in-flight mandate has been settled.
 
+Node ≥ 22 (`.nvmrc`). The root `npm test` includes the demo's end-to-end test, which binds ports 8545 / 3001 / 4021, so it cannot run while a local `hardhat node`, SP or payee from "Running the pieces yourself" is up. CI (`.github/workflows/ci.yml`) runs `npm run typecheck`, `npm test`, then `npm run gen-abi` and fails if `packages/contracts/src/abi.ts` differs from what is committed — after touching a `.sol`, regenerate and commit the ABI.
+
 ## Packages
 
 | workspace | what it is |

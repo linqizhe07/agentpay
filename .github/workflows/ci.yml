@@ -1,0 +1,45 @@
+# One job, same commands a developer runs locally: type-check every workspace,
+# run every workspace's tests (contract / SP / payee / wallet suites and the
+# demo e2e each spawn their own hardhat node), then regenerate the ABI and fail
+# if the committed packages/contracts/src/abi.ts differs from the compiled
+# artifacts — a .sol change without `npm run gen-abi` goes red here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # solc binaries downloaded by `hardhat compile` (env-paths cache dir on Linux).
+      - name: Cache Hardhat compilers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hardhat-nodejs
+          key: hardhat-compilers-${{ runner.os }}-${{ hashFiles('packages/contracts/hardhat.config.cjs') }}
+          restore-keys: |
+            hardhat-compilers-${{ runner.os }}-
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: ABI drift gate
+        run: npm run gen-abi && git diff --exit-code packages/contracts/src/abi.ts

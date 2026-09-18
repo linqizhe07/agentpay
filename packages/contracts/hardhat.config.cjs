@@ -1,5 +1,5 @@
 /**
- * Bare Hardhat v2 config — no plugins (DESIGN.md §4).
+ * Bare Hardhat v2 config — no plugins.
  * Compilation and `hardhat node` only; tests run via vitest + viem.
  */
 module.exports = {

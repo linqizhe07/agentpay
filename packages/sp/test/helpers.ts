@@ -238,7 +238,6 @@ export function mkSP(over: Partial<SPConfig> = {}): SPHandle {
   });
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface Reply<T = any> {
   status: number;
   json: T;
