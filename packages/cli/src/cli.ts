@@ -24,7 +24,7 @@ wallet (on-chain)                  (amounts are US dollars: 5, 0.25, $0.001)
   withdraw-cancel                  cancel a pending withdrawal
   withdraw [--to 0x..]             pay out a matured withdrawal
   sp-authorize <0xsp>              let a settlement processor debit this account
-  sp-revoke <0xsp>                 revoke it
+  sp-revoke <0xsp>                 revoke it (takes effect after the withdrawal delay)
 
 intent mandates (budgets)
   mandate-request --purpose "…" --limit <usd> --hosts a.com[,b.com] [--valid-for s] [--category c] [--per-call usd] [--rate n]

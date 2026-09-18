@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseEventLogs } from 'viem';
 import { AEP2_DEBIT_WALLET_ABI } from '@agentpay/contracts';
-import type { Hex } from '@agentpay/core';
+import type { Hex, SpReceipt } from '@agentpay/core';
 import type { SPHandle } from '../src/index.js';
 import {
   AMOUNT,
@@ -17,6 +17,7 @@ import {
   nonceUsed,
   nowSec,
   publicClient,
+  revoke,
   rpcProxy,
   settleDirect,
   signed,
@@ -119,20 +120,21 @@ describe('worker', () => {
     }
   });
 
-  it('marks a mandate whose payer revoked the SP as failed:sp_not_authorized', async () => {
+  it('still settles a mandate enqueued before the payer revoked the SP (revocation is delayed by withdrawDelay)', async () => {
     const payer = extraAccount(8);
     await fund(payer, USDC('1'), spAddress);
     const sp = mkSP();
     await sp.start();
     try {
       const s = await signed({}, payer);
-      expect((await enqueue(sp, s)).status).toBe(200);
-      const { authorize } = await import('./helpers.js');
-      await authorize(payer, spAddress, false);
+      const receipt = (await enqueue(sp, s)).json.receipt as SpReceipt;
+      const revokeAt = await revoke(payer, spAddress); // the payer took delivery and revokes in the next block
+      expect(revokeAt).toBeGreaterThanOrEqual(receipt.enqueueDeadline); // the receipt's promise is still keepable
       const r = await sp.tick();
-      expect(r.skipped).toEqual([{ mandateDigest: s.digest, status: 'sp_not_authorized' }]);
-      expect(r.txHash).toBeUndefined();
-      expect(sp.store.get(s.digest)).toMatchObject({ status: 'failed', errorCode: 'sp_not_authorized' });
+      expect(r.settled).toEqual([s.digest]);
+      expect(r.skipped).toEqual([]);
+      expect(sp.store.get(s.digest)).toMatchObject({ status: 'settled', txHash: r.txHash });
+      expect(await nonceUsed(s.mandate.owner, s.mandate.nonce)).toBe(true);
       expect(sp.store.reserved(payer.address, fixture().usdc)).toBe(0n);
     } finally {
       await sp.stop();

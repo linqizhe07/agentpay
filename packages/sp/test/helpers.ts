@@ -125,16 +125,26 @@ export async function deposit(account: Signer, amount: bigint): Promise<void> {
   );
 }
 
-export async function authorize(account: Signer, sp: Address, enabled = true): Promise<void> {
+export async function authorize(account: Signer, sp: Address): Promise<void> {
   const f = fixture();
   await mined(
-    await walletFor(account).writeContract({
-      address: f.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'authorizeSP',
-      args: [sp, enabled],
-    }),
+    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'authorizeSP', args: [sp] }),
   );
+}
+
+/** revokeSP from `account`; returns the scheduled revokeAt (unix seconds). */
+export async function revoke(account: Signer, sp: Address): Promise<number> {
+  const f = fixture();
+  await mined(
+    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'revokeSP', args: [sp] }),
+  );
+  const [, revokeAt] = await publicClient().readContract({
+    address: f.wallet,
+    abi: AEP2_DEBIT_WALLET_ABI,
+    functionName: 'authorizationOf',
+    args: [account.address, sp],
+  });
+  return Number(revokeAt);
 }
 
 /** mint + deposit + authorizeSP: a payer ready to be settled by `sp`. */

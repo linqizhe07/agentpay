@@ -64,12 +64,15 @@ export async function withdraw(ctx: CommandContext, _positional: string[], flags
 
 export async function spAuthorize(ctx: CommandContext, positional: string[]): Promise<CliResult> {
   const sp = addressArg(positional, 'sp-authorize');
-  const tx = await ctx.wallet().authorizeSP(sp, true);
+  const tx = await ctx.wallet().authorizeSP(sp);
   return ok({ sp, enabled: true, tx });
 }
 
+/** The revocation takes effect at `revokeAt` (withdrawDelay later); mandates the SP already receipted still settle. */
 export async function spRevoke(ctx: CommandContext, positional: string[]): Promise<CliResult> {
   const sp = addressArg(positional, 'sp-revoke');
-  const tx = await ctx.wallet().authorizeSP(sp, false);
-  return ok({ sp, enabled: false, tx });
+  const wallet = ctx.wallet();
+  const tx = await wallet.revokeSP(sp);
+  const { revokeAt } = await wallet.authorizationOf(sp);
+  return ok({ sp, tx, revokeAt, revokeAtIso: new Date(revokeAt * 1000).toISOString() });
 }

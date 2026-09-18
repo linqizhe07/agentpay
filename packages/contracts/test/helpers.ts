@@ -148,14 +148,38 @@ export async function depositFor(f: Fixture, who: keyof typeof wallets, amount: 
   await publicClient.waitForTransactionReceipt({ hash: dep });
 }
 
-export async function authorizeSpFor(f: Fixture, who: keyof typeof wallets, sp: Address, enabled = true): Promise<void> {
-  const hash = await wallets[who].writeContract({
+/** authorizeSP / revokeSP / cancelRevoke from `who`, mined; returns the receipt for event assertions. */
+export async function setSpAuthorization(
+  f: Fixture,
+  who: keyof typeof wallets,
+  functionName: 'authorizeSP' | 'revokeSP' | 'cancelRevoke',
+  sp: Address,
+) {
+  const hash = await wallets[who].writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName, args: [sp] });
+  return publicClient.waitForTransactionReceipt({ hash });
+}
+
+export async function authorizeSpFor(f: Fixture, who: keyof typeof wallets, sp: Address): Promise<void> {
+  await setSpAuthorization(f, who, 'authorizeSP', sp);
+}
+
+export async function spAuthorized(f: Fixture, owner: Address, sp: Address): Promise<boolean> {
+  return publicClient.readContract({
     address: f.wallet,
     abi: AEP2_DEBIT_WALLET_ABI,
-    functionName: 'authorizeSP',
-    args: [sp, enabled],
+    functionName: 'authorizedSP',
+    args: [owner, sp],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+}
+
+export async function authorizationOf(f: Fixture, owner: Address, sp: Address): Promise<{ enabled: boolean; revokeAt: number }> {
+  const [enabled, revokeAt] = await publicClient.readContract({
+    address: f.wallet,
+    abi: AEP2_DEBIT_WALLET_ABI,
+    functionName: 'authorizationOf',
+    args: [owner, sp],
+  });
+  return { enabled, revokeAt: Number(revokeAt) };
 }
 
 export async function makeMandate(f: Fixture, overrides: Partial<Mandate> = {}): Promise<Mandate> {
