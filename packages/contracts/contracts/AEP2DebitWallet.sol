@@ -30,7 +30,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *         is <= withdrawDelay) can still be settled. Otherwise a payer could
  *         take delivery and revoke in the next block.
  *
- *         mandateDigest byte-matches the core package's mandateDigest().
+ *         No owner, admin, pause or proxy; withdrawDelay is the only deployment
+ *         parameter. mandateDigest byte-matches the core package's mandateDigest().
  */
 contract AEP2DebitWallet is EIP712, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -279,7 +280,7 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
         usedNonces[m.owner][m.nonce] = true;
         balances[m.owner][m.token] = bal - m.amount;
         emit Settled(m.owner, m.token, m.payee, m.amount, m.nonce, m.ref, digest);
-        // A protocol fee (feeBps split to a collector) would be taken here, before the payout.
+        // Extension point for a protocol fee; none is implemented (see README "Honest limitations").
         IERC20(m.token).safeTransfer(m.payee, m.amount);
         return (SettleStatus.Ok, digest);
     }
