@@ -331,7 +331,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 | SP：发送后、收到收据前 | 记录停在 `settling` 带 txHash；启动恢复查收据或按 nonce 决定 |
 | 钱包对账时 RPC 不可用 | 快速失败，不改任何状态 |
 
-存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件重写）和 `ledger.jsonl`、收款方的幂等存储在内存。
+存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+rename 重写）和 `ledger.jsonl`（只追加；状态更新同样 tmp+rename 重写，所以崩溃后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错）、收款方的幂等存储在内存。
 
 ## 12. 测试与验证
 

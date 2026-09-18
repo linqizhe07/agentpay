@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -142,39 +142,42 @@ describe('matchHost', () => {
   });
 });
 
+const ledgerEntry = (digest: string, over: Partial<LedgerEntry> = {}): LedgerEntry => ({
+  kind: 'payment',
+  timestamp: 1,
+  url: 'http://x/y',
+  host: 'x',
+  resource: 'GET /y',
+  network: NETWORK,
+  asset: TOKEN,
+  amount: '5',
+  payer: payerAccount.address,
+  payee: strangerAddress,
+  walletContract: WALLET,
+  intentMandateId: 'im_1',
+  mandate: {
+    owner: payerAccount.address,
+    token: TOKEN,
+    payee: strangerAddress,
+    amount: '5',
+    nonce: '1',
+    deadline: 2,
+    ref: resourceRef('GET /y'),
+  },
+  payerSig: '0x' as Hex,
+  mandateDigest: ('0x' + digest.repeat(32)) as Hex,
+  httpStatus: 200,
+  status: 'enqueued',
+  ...over,
+});
+
 describe('Ledger', () => {
   it('appends, reads back, and patches status by digest', () => {
     const ledger = new Ledger(join(root, 'ledger-unit', 'ledger.jsonl'));
-    const entry = {
-      kind: 'payment',
-      timestamp: 1,
-      url: 'http://x/y',
-      host: 'x',
-      resource: 'GET /y',
-      network: NETWORK,
-      asset: TOKEN,
-      amount: '5',
-      payer: payerAccount.address,
-      payee: strangerAddress,
-      walletContract: WALLET,
-      intentMandateId: 'im_1',
-      mandate: {
-        owner: payerAccount.address,
-        token: TOKEN,
-        payee: strangerAddress,
-        amount: '5',
-        nonce: '1',
-        deadline: 2,
-        ref: resourceRef('GET /y'),
-      },
-      payerSig: '0x' as Hex,
-      mandateDigest: ('0x' + 'ab'.repeat(32)) as Hex,
-      httpStatus: 200,
-      status: 'enqueued',
-    } satisfies LedgerEntry;
+    const entry = ledgerEntry('ab');
     expect(ledger.read()).toEqual([]);
     ledger.append(entry);
-    ledger.append({ ...entry, mandateDigest: ('0x' + 'cd'.repeat(32)) as Hex });
+    ledger.append(ledgerEntry('cd'));
     expect(ledger.read()).toHaveLength(2);
     ledger.updateStatus(entry.mandateDigest, 'settled', { settledTx: ('0x' + '01'.repeat(32)) as Hex });
     const [a, b] = ledger.read();
@@ -182,6 +185,69 @@ describe('Ledger', () => {
     expect(a.settledTx).toBe('0x' + '01'.repeat(32));
     expect(b.status).toBe('enqueued');
     expect(() => ledger.updateStatus(('0x' + 'ee'.repeat(32)) as Hex, 'settled')).toThrow(/no ledger entry/);
+  });
+
+  it('updateStatus rewrites through a temp file and leaves no .tmp behind', () => {
+    const dir = join(root, 'ledger-atomic');
+    const ledger = new Ledger(join(dir, 'ledger.jsonl'));
+    const entry = ledgerEntry('ab');
+    ledger.append(entry);
+    ledger.updateStatus(entry.mandateDigest, 'settled');
+    ledger.updateStatus(entry.mandateDigest, 'expired-unused');
+    expect(readdirSync(dir)).toEqual(['ledger.jsonl']);
+    expect(ledger.read().map((e) => e.status)).toEqual(['expired-unused']);
+  });
+
+  it('drops a truncated last line, repairs the file and keeps appending cleanly', () => {
+    const path = join(root, 'ledger-truncated', 'ledger.jsonl');
+    const w = new Ledger(path);
+    const a = ledgerEntry('ab');
+    w.append(a);
+    const good = readFileSync(path, 'utf8');
+    appendFileSync(path, '{"kind":"payment","mandateDigest":"0x00","status":"enq', 'utf8'); // crash mid-append
+
+    const warnings: string[] = [];
+    const r = new Ledger(path, (line) => warnings.push(line));
+    expect(r.read()).toEqual([a]);
+    expect(warnings.join('\n')).toMatch(/truncated last line/);
+    expect(readFileSync(path, 'utf8')).toBe(good);
+
+    // fetch() appends before it ever read: the torn tail must not swallow the new line
+    appendFileSync(path, '{"kind":"payment","mandateDigest":"0x00","status":"enq', 'utf8');
+    const b = ledgerEntry('cd');
+    new Ledger(path).append(b);
+    expect(new Ledger(path).read()).toEqual([a, b]);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3); // 2 lines + trailing newline
+
+    r.updateStatus(a.mandateDigest, 'settled');
+    expect(new Ledger(path).read().map((e) => e.status)).toEqual(['settled', 'enqueued']);
+  });
+
+  it('keeps a complete but unterminated last line', () => {
+    const path = join(root, 'ledger-unterminated', 'ledger.jsonl');
+    const a = ledgerEntry('ab');
+    new Ledger(path).append(a); // creates the directory
+    writeFileSync(path, JSON.stringify(a), 'utf8'); // no trailing newline
+    const warnings: string[] = [];
+    expect(new Ledger(path, (line) => warnings.push(line)).read()).toEqual([a]);
+    expect(warnings).toEqual([]);
+    expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(true);
+    // and append() on its own terminates it instead of gluing the next line on
+    writeFileSync(path, JSON.stringify(a), 'utf8');
+    const b = ledgerEntry('cd');
+    new Ledger(path).append(b);
+    expect(new Ledger(path).read()).toEqual([a, b]);
+  });
+
+  it('refuses a corrupt line that is not the last one', () => {
+    const path = join(root, 'ledger-corrupt', 'ledger.jsonl');
+    const a = ledgerEntry('ab');
+    new Ledger(path).append(a);
+    writeFileSync(path, `${JSON.stringify(a)}\n{"kind":"pay\n${JSON.stringify(ledgerEntry('cd'))}\n`, 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 2/);
+    expect(() => new Ledger(path).updateStatus(a.mandateDigest, 'settled')).toThrow(/malformed ledger line 2/);
+    writeFileSync(path, '42\n', 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 1 .*not an object/);
   });
 });
 
