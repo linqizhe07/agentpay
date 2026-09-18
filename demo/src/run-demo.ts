@@ -384,6 +384,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log('ALL SCENARIO ASSERTIONS PASSED');
+  // Exit explicitly once stdout has drained: the failure paths already do, and a
+  // handle left open by a stopped child must not keep a passed run hanging
+  // (the e2e test waits for this process to close, not for the line above).
+  process.stdout.write('', () => process.exit(0));
 }
 
 main().catch((err) => {

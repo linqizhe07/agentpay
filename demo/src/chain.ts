@@ -70,11 +70,27 @@ export async function startChain(opts: ChainOptions = {}): Promise<ChainHandle> 
     );
   }
 
+  // Own process group: `npx` wraps the real node process, and on Linux a
+  // signal to the wrapper alone can leave the node running with our pipes
+  // open, which keeps this process alive after the demo has finished.
   const child: ChildProcess = spawn('npx', ['hardhat', 'node', '--port', String(port)], {
     cwd,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
+    detached: true,
   });
+  const killTree = (signal: NodeJS.Signals): void => {
+    if (!child.pid) return;
+    try {
+      process.kill(-child.pid, signal); // whole group (npx -> node hardhat)
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
 
   const tail: string[] = [];
   const capture = (chunk: Buffer): void => {
@@ -107,7 +123,7 @@ export async function startChain(opts: ChainOptions = {}): Promise<ChainHandle> 
     }
     if (await rpcAlive(rpcUrl)) break;
     if (Date.now() > deadline) {
-      child.kill('SIGKILL');
+      killTree('SIGKILL');
       throw new Error(
         `hardhat node did not become ready within ${opts.readyTimeoutMs ?? 60_000}ms.\n--- last output ---\n${tail.join('\n')}`,
       );
@@ -117,9 +133,9 @@ export async function startChain(opts: ChainOptions = {}): Promise<ChainHandle> 
 
   const stop = async (): Promise<void> => {
     if (exited) return;
-    child.kill('SIGTERM');
+    killTree('SIGTERM');
     const escalate = setTimeout(() => {
-      if (!exited) child.kill('SIGKILL');
+      if (!exited) killTree('SIGKILL');
     }, 5_000);
     await exitPromise;
     clearTimeout(escalate);
