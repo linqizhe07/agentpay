@@ -9,7 +9,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
 import { AEP2_DEBIT_WALLET_ABI, MOCK_USDC_ABI } from '@agentpay/contracts';
 import { mandateToTuple } from '@agentpay/core';
-import { MandateWallet, type LedgerEntry } from '../src/index.js';
+import { Ledger, MandateWallet, type LedgerEntry } from '../src/index.js';
 import type { ChainFixture } from './global-setup.js';
 import { KEYS, startStubPayee, type StubPayee } from './stub-payee.js';
 
@@ -330,5 +330,52 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
     expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '0' });
     expect(w.report().totals).toMatchObject({ expiredUnused: 2, spDefaults: 1 });
     await w.cancelRevokeSP(sp.address); // leave the SP authorized (the chain never reached revokeAt)
+  });
+
+  it('a crash between the spend commit and the ledger update: the next load counts X once, and so does reconcile() once the SP settled it', async () => {
+    let t = await chainNow();
+    const paths = { mandatesPath: join(dir, 'mandates-crash.json'), ledgerPath: join(dir, 'ledger-crash.jsonl') };
+    const make = () =>
+      new MandateWallet({ key: KEYS.payer, rpcUrl: fx.rpcUrl, walletContract: fx.wallet, token: fx.usdc, network: NETWORK, ...paths, now: () => t });
+    const w = make();
+    const im = await w.createIntentMandate(
+      { naturalLanguage: 'crash test', limitAmount: '$1', validForSeconds: 86_400, hostAllowlist: ['127.0.0.1'] },
+      { approve: true },
+    );
+    const payee = await startStubPayee({
+      payeeKey: KEYS.payee,
+      spKey: KEYS.sp,
+      wallet: fx.wallet,
+      token: fx.usdc,
+      network: NETWORK,
+      price: PRICE,
+      settleWindowSeconds: 3600,
+      now: () => t,
+    });
+    servers.push(payee);
+    expect((await w.fetch(`${payee.url}/predict`)).status).toBe(200);
+    expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
+
+    // The wallet "crashed" right after committing the spend: mandates.json says
+    // spent X, the ledger still says in_flight. Meanwhile the SP settles X.
+    const [X] = new Ledger(paths.ledgerPath).read();
+    new Ledger(paths.ledgerPath).updateStatus(X.mandateDigest, 'unknown', { httpStatus: 0, error: 'in_flight', spReceipt: undefined });
+    const hash = await spClient.writeContract({
+      address: fx.wallet,
+      abi: AEP2_DEBIT_WALLET_ABI,
+      functionName: 'settle',
+      args: [mandateToTuple(X.mandate), X.payerSig],
+      chain: hardhat,
+      account: sp,
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+
+    const again = make();
+    expect(again.getMandate(im.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' }); // X once, as pending
+    expect(await again.reconcile()).toEqual({ settled: [X.mandateDigest], expiredUnused: [], stillPending: [] });
+    expect(again.getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' }); // X once, as spent
+    expect(again.remaining(im.id)).toBe(999_000n);
+    expect(new Ledger(paths.ledgerPath).read()[0]).toMatchObject({ status: 'settled', settledTx: hash, signedAt: X.signedAt });
+    expect(make().getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' }); // and the rebuild agrees
   });
 });

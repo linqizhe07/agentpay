@@ -23,6 +23,12 @@ export interface LedgerEntry {
   kind: 'payment';
   /** Unix seconds, written by the wallet at record time. */
   timestamp: number;
+  /**
+   * Unix seconds at which the wallet signed the mandate. Written with the
+   * in_flight line and never patched afterwards (`timestamp` moves with every
+   * status update). Absent on lines written before the field existed.
+   */
+  signedAt?: number;
   /** Full URL actually called. */
   url: string;
   /** `url.host` (hostname plus port when non-default). */
@@ -53,6 +59,8 @@ export interface LedgerEntry {
     | 'expired-unused'; // reconcile(): deadline passed without any on-chain use
   settledTx?: Hex;
   error?: string;
+  /** reconcile(): the SP receipted this mandate and let it expire unused (an SP default). */
+  spDefault?: true;
 }
 
 function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {

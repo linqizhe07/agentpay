@@ -24,7 +24,8 @@ export interface IntentMandateInput {
  * agent may spend against without further prompts. `spentAmount` counts
  * committed mandates (enqueued or settled); `pendingSpentAmount` is reserved for
  * signed mandates whose fate is not known yet. Both are persisted so every
- * process sharing the store sees the same remaining budget.
+ * process sharing the store sees the same remaining budget, but the ledger is
+ * the source of truth: MandateWallet recomputes them from it on construction.
  */
 export interface IntentMandate {
   /** 'im_…' */
@@ -192,6 +193,9 @@ export class IntentMandateStore {
       const raw = readFileSync(path, 'utf8');
       if (raw.trim().length > 0) {
         const parsed = JSON.parse(raw) as Partial<StoreFile>;
+        if (parsed.version !== undefined && parsed.version !== 1) {
+          throw new Error(`unsupported mandate store version ${JSON.stringify(parsed.version)} at ${path} (expected 1)`);
+        }
         if (!Array.isArray(parsed.mandates)) throw new Error(`malformed mandate store at ${path}`);
         for (const m of parsed.mandates) this.byId.set(m.id, m);
       }

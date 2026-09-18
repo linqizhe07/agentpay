@@ -88,6 +88,8 @@ export interface MandateWalletOptions {
   now?: () => number;
   /** Injectable fetch. */
   fetch?: typeof fetch;
+  /** Receives one line per repair the wallet makes to its files on load (counters rebuilt, torn ledger tail dropped). Default: discard. */
+  log?: (line: string) => void;
 }
 
 export interface FetchOptions {
@@ -183,6 +185,7 @@ export class MandateWallet {
     MandateWalletCaps;
   private readonly now: () => number;
   private readonly fetchImpl: typeof fetch;
+  private readonly log: (line: string) => void;
 
   /** Cached 402 offers keyed by 'METHOD origin/path' (Intent Mode source). */
   private readonly offers = new Map<string, PaymentRequirements>();
@@ -202,8 +205,10 @@ export class MandateWallet {
     this.network = opts.network;
     this.chainId = chainIdFromNetwork(opts.network);
     this.trustedSps = opts.trustedSps && opts.trustedSps.length > 0 ? opts.trustedSps : undefined;
+    this.log = opts.log ?? (() => {});
     this.store = new IntentMandateStore(opts.mandatesPath);
-    this.ledger = new Ledger(opts.ledgerPath);
+    this.ledger = new Ledger(opts.ledgerPath, this.log);
+    this.rebuildBudgets();
     this.caps = {
       ...opts.caps,
       maxMandateValiditySeconds: opts.caps?.maxMandateValiditySeconds ?? DEFAULT_MAX_MANDATE_VALIDITY,
@@ -447,8 +452,9 @@ export class MandateWallet {
     // The ledger line exists from the moment a signature exists: a crash between
     // here and the response leaves an 'in_flight' unknown that reconcile() can
     // settle or expire, instead of a reservation nothing remembers.
-    this.ledger.append({ ...base, timestamp: this.now(), httpStatus: 0, status: 'unknown', error: 'in_flight' });
-    const record = (fields: Pick<LedgerEntry, 'httpStatus' | 'status'> & Partial<LedgerEntry>): void =>
+    const signedAt = this.now();
+    this.ledger.append({ ...base, timestamp: signedAt, signedAt, httpStatus: 0, status: 'unknown', error: 'in_flight' });
+    const record = (fields: Pick<LedgerEntry, 'httpStatus' | 'status'> & Partial<Omit<LedgerEntry, 'signedAt'>>): void =>
       this.ledger.updateStatus(digest, fields.status, { error: undefined, spReceipt: undefined, ...fields, timestamp: this.now() });
 
     // ---- 6. retry with the mandate attached ----
@@ -582,6 +588,7 @@ export class MandateWallet {
           // The SP promised (receipt) and did not deliver: give the budget back.
           this.adjustBudget(e.intentMandateId, { spent: -amount });
           this.ledger.updateStatus(e.mandateDigest, 'expired-unused', {
+            ...(revoked ? {} : { spDefault: true }),
             error: revoked
               ? `${PAYER_REVOKED_MARK}: the payer revoked the settlement processor before its settlement deadline`
               : `${SP_DEFAULT_MARK}: settlement processor did not settle before the mandate deadline`,
@@ -637,7 +644,8 @@ export class MandateWallet {
           break;
         case 'expired-unused':
           totals.expiredUnused++;
-          if (e.error?.startsWith(SP_DEFAULT_MARK)) totals.spDefaults++;
+          // lines written before the flag existed only carry the error prefix
+          if (e.spDefault || e.error?.startsWith(SP_DEFAULT_MARK)) totals.spDefaults++;
           break;
       }
       if (isSpendStatus(e.status)) {
@@ -695,6 +703,37 @@ export class MandateWallet {
       pendingSpentAmount: clamp(BigInt(m.pendingSpentAmount) + (delta.pending ?? 0n)).toString(),
       spentAmount: clamp(BigInt(m.spentAmount) + (delta.spent ?? 0n)).toString(),
     });
+  }
+
+  /**
+   * The counters in mandates.json are a cache of the ledger: on load they are
+   * recomputed from it (pending = reservations still held, spent = committed
+   * mandates) so the two crash windows of fetch() heal themselves — a
+   * reservation saved before its ledger line existed, or a spend saved before
+   * the line left in_flight. Ledger lines for mandates the store no longer has
+   * are ignored; a drift is logged and saved once.
+   */
+  private rebuildBudgets(): void {
+    const pending = new Map<string, bigint>();
+    const spent = new Map<string, bigint>();
+    for (const e of this.ledger.read()) {
+      const amount = BigInt(e.amount);
+      if (reservationHeld(e)) pending.set(e.intentMandateId, (pending.get(e.intentMandateId) ?? 0n) + amount);
+      else if (isSpendStatus(e.status)) spent.set(e.intentMandateId, (spent.get(e.intentMandateId) ?? 0n) + amount);
+    }
+    let dirty = false;
+    for (const m of this.store.list()) {
+      const pendingSpentAmount = (pending.get(m.id) ?? 0n).toString();
+      const spentAmount = (spent.get(m.id) ?? 0n).toString();
+      if (m.pendingSpentAmount === pendingSpentAmount && m.spentAmount === spentAmount) continue;
+      this.log(
+        `wallet: mandate ${m.id}: counters rebuilt from the ledger ` +
+          `(spent ${m.spentAmount} -> ${spentAmount}, pending ${m.pendingSpentAmount} -> ${pendingSpentAmount})`,
+      );
+      this.store.upsert({ ...m, pendingSpentAmount, spentAmount });
+      dirty = true;
+    }
+    if (dirty) this.store.save();
   }
 
   private policyQuery(hosts: readonly string[], amount: bigint, now: number): PolicyQuery {

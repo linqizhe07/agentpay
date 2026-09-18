@@ -262,7 +262,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
               uint64 validFrom, uint64 validUntil, string hostAllowlist, string category)
 ```
 
-记录字段：`limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`（最长一年）、`status: draft | signed`、`isEnabled`、`signature?`。agent 只能 `createIntentMandate` 生成 draft；`approveIntentMandate`（签名）、启用、加额都是人的操作。
+记录字段：`limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`（最长一年）、`status: draft | signed`、`isEnabled`、`signature?`。agent 只能 `createIntentMandate` 生成 draft；`approveIntentMandate`（签名）、启用、加额都是人的操作。两个计数器是账本的缓存：钱包构造时读一次账本，按 `intentMandateId` 重算（`pending` = 仍持有预留的行，`spent` = 已提交的行），与文件不一致就记日志并写回一次；`mandates.json` 的 `version` 不是 1 拒绝加载。
 
 ### 8.2 策略闸
 
@@ -272,11 +272,11 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 
 1. Order Mode：先请求，拿 402 报价；`prepay: true` 且有缓存报价时走 Intent Mode，第一次请求就带 mandate。
 2. 策略闸 + 预算预留，**一个同步块**内完成，并发调用不会超支。
-3. 构造并签 mandate；签完立刻在账本追加一行 `in_flight`。
+3. 构造并签 mandate；签完立刻在账本追加一行 in_flight（`status: 'unknown', error: 'in_flight', httpStatus: 0`，带签名时刻 `signedAt`，之后的状态更新不改它）。
 4. 带 `PAYMENT-SIGNATURE` 重试；解析 `PAYMENT-RESPONSE`，验收据（默认 `requireReceipt: true`，无有效收据记 `unknown`）。
 5. 账本更新为 `enqueued` / `rejected` / `unknown`；返回可读的 Response。
 
-账本（JSONL）状态：`in_flight`（签完未回）、`enqueued`、`settled`、`rejected`（收款方非 2xx，签名已出，预算保持预留）、`unknown`、`expired-unused`；对账时还会记 `sp_default` / `payer_revoked` 标记。
+账本（JSONL）状态：`enqueued`、`settled`、`rejected`（收款方非 2xx，签名已出，预算保持预留）、`unknown`（签完未回的 in_flight 也是它，靠 `error: 'in_flight'` 区分）、`expired-unused`；对账时还会记 `sp_default`（`spDefault: true`，error 也带前缀）/ `payer_revoked` 标记。
 
 ### 8.4 对账与报告
 
@@ -316,7 +316,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 4. `NonceUsed` 只在有指向该摘要的 `Settled` 事件时判 settled。
 5. `/enqueue` 返回 `created` / `enqueuedAt`，收款方据此把跨进程重放判 409（60s 宽限）。
 6. `PAYMENT-RESPONSE` 在 `onEnqueued` 之后设置，避免处理器改写响应时丢头。
-7. 钱包签完立即写 `in_flight` 账本行，崩溃后对账能找回。
+7. 钱包签完立即写 in_flight 账本行（`status: 'unknown', error: 'in_flight'`），崩溃后对账能找回；预算计数器每次加载从账本重算。
 
 未覆盖：合约未经外部审计；SP HTTP API 没有鉴权和限流；私钥以环境变量形式存在。
 
@@ -324,7 +324,9 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 
 | 进程在这里崩溃 | 结果 |
 |---|---|
-| 钱包：签名后、发请求前 | 账本有 `in_flight`，预算已预留；对账后按链上状态收敛 |
+| 钱包：预留后、账本行写入前 | `mandates.json` 多了一笔 pending 而账本没有对应行；下次加载从账本重算，预留释放 |
+| 钱包：签名后、发请求前 | 账本有 in_flight 行（`status: 'unknown', error: 'in_flight'`），预算已预留；对账后按链上状态收敛 |
+| 钱包：提交后、账本更新前 | `mandates.json` 已记 spent 而账本还是 in_flight；下次加载重算为 pending（只算一次），对账后按链上状态收敛 |
 | 收款方：入队后、交付前 | SP 已有收据会结算；付款人未拿到数据（协议不保证） |
 | SP：入队后、落盘前 | 无记录、无收据：`enq` 事件先 append + fsync 再进内存，写失败则内存不变、请求返回 500；收款方收到错误不交付，可重试 |
 | SP：收据发出后、`kill -9` | 记录已在盘上，重启后 pending 继续结算；丢的最多是一条未 fsync 的 `upd` 事件，启动对账从链上补回 |
