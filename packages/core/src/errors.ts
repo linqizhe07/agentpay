@@ -65,6 +65,7 @@ export type SpErrorCode =
   | 'mandate_terminal'
   | 'nonce_used'
   | 'sp_not_authorized'
+  | 'sp_revocation_pending'
   | 'rpc_error'
   | 'insufficient_balance';
 

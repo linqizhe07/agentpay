@@ -44,6 +44,7 @@ export const SP_ERROR_CODES = [
   'mandate_terminal',
   'nonce_used',
   'sp_not_authorized',
+  'sp_revocation_pending',
   'rpc_error',
   'insufficient_balance',
 ] as const satisfies readonly SpErrorCode[];
@@ -172,7 +173,7 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
   settlement_unavailable: (d) => ({
     summary: `The settlement processor refused or was unreachable: ${fmt(d, 'spReason', 'unknown')}.`,
     remediation: [
-      'If the reason is insufficient_balance or sp_not_authorized, fix the wallet state (deposit, or `agentpay sp-authorize <sp>`).',
+      'If the reason is insufficient_balance, sp_not_authorized or sp_revocation_pending, fix the wallet state (deposit, or `agentpay sp-authorize <sp>`).',
       'Otherwise retry shortly with a new mandate.',
     ],
     commands: ['agentpay balance', 'agentpay sp-authorize <sp>'],
@@ -214,6 +215,13 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
   sp_not_authorized: (d) => ({
     summary: `The payer has not authorized settlement processor ${fmt(d, 'sp')} on the debit wallet.`,
     remediation: ['Authorize it once from the payer account: `agentpay sp-authorize <sp>`.'],
+    commands: ['agentpay sp-authorize <sp>'],
+  }),
+  sp_revocation_pending: (d) => ({
+    summary: `The payer is revoking settlement processor ${fmt(d, 'sp')} at ${fmt(d, 'revokeAt')} (unix seconds), before this mandate could be settled (${fmt(d, 'enqueueDeadline')}).`,
+    remediation: [
+      'Do not retry: the processor refuses new mandates until the payer re-authorizes it (`agentpay sp-authorize <sp>`, which also cancels the revocation).',
+    ],
     commands: ['agentpay sp-authorize <sp>'],
   }),
   rpc_error: () => ({

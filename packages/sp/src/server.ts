@@ -10,7 +10,7 @@ import {
   type MandateDomain,
   type SpReceipt,
 } from '@agentpay/core';
-import { errorMessage, type ChainClient, type TokenInfo } from './chain.js';
+import { authorizedAt, errorMessage, type ChainClient, type SpAuthorization, type TokenInfo } from './chain.js';
 import type { ResolvedSPConfig } from './config.js';
 import type { Queue } from './queue.js';
 import { enqueueDeadlineFor, issueReceipt } from './receipt.js';
@@ -193,7 +193,7 @@ async function handleEnqueue(d: ServerDeps, req: IncomingMessage, res: ServerRes
 
   // (7) chain state, all read at one block that is not behind our last settlement
   // (a lagging replica would report balances a settlement already consumed).
-  let authorized: boolean;
+  let authorization: SpAuthorization;
   let used: boolean;
   let debitable: bigint;
   try {
@@ -205,19 +205,34 @@ async function handleEnqueue(d: ServerDeps, req: IncomingMessage, res: ServerRes
       });
     }
     const at = BigInt(block);
-    [authorized, used, debitable] = await Promise.all([
-      chain.isAuthorized(mandate.owner, at),
+    [authorization, used, debitable] = await Promise.all([
+      chain.authorizationOf(mandate.owner, at),
       chain.nonceUsed(mandate.owner, mandate.nonce, at),
       chain.debitable(mandate.owner, mandate.token, at),
     ]);
   } catch (err) {
     return sendError(res, 503, 'rpc_error', `chain read failed: ${errorMessage(err)}`, { mandateDigest: digest });
   }
-  if (!authorized) {
+  if (!authorizedAt(authorization, now)) {
     return sendError(res, 403, 'sp_not_authorized', `${mandate.owner} has not authorized settlement processor ${account.address}`, {
       mandateDigest: digest,
       detail: { sp: account.address, owner: mandate.owner },
     });
+  }
+  // A receipt promises settlement by enqueueDeadline (inclusive); the contract
+  // stops honouring this SP at revokeAt, so a pending revocation must land later.
+  const enqueueDeadline = enqueueDeadlineFor(mandate.deadline, now, cfg.settleWindowSeconds);
+  if (authorization.revokeAt !== 0 && authorization.revokeAt <= enqueueDeadline) {
+    return sendError(
+      res,
+      403,
+      'sp_revocation_pending',
+      `${mandate.owner} is revoking settlement processor ${account.address} at ${authorization.revokeAt}, before the settlement deadline ${enqueueDeadline}`,
+      {
+        mandateDigest: digest,
+        detail: { sp: account.address, owner: mandate.owner, revokeAt: authorization.revokeAt, enqueueDeadline },
+      },
+    );
   }
   if (used) {
     return sendError(res, 409, 'nonce_used', `nonce ${mandate.nonce} is already used on-chain for ${mandate.owner}`, {
@@ -228,7 +243,6 @@ async function handleEnqueue(d: ServerDeps, req: IncomingMessage, res: ServerRes
 
   // The receipt is pure local computation, so sign it before the admission
   // block: nothing may be awaited between the funds check and the insert.
-  const enqueueDeadline = enqueueDeadlineFor(mandate.deadline, now, cfg.settleWindowSeconds);
   const receipt = await issueReceipt(account, domain, digest, enqueueDeadline);
 
   // (8) synchronous admission (re-checks 5/6 and the reservation arithmetic)

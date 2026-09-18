@@ -32,6 +32,17 @@ export interface TokenInfo {
   decimals: number;
 }
 
+/** The wallet's authorization record for (payer, this SP): `revokeAt` is 0 or the unix second the SP loses the right to settle. */
+export interface SpAuthorization {
+  enabled: boolean;
+  revokeAt: number;
+}
+
+/** The contract's `authorizedSP` predicate evaluated at `now` (unix seconds). */
+export function authorizedAt(a: SpAuthorization, now: number): boolean {
+  return a.enabled && (a.revokeAt === 0 || now < a.revokeAt);
+}
+
 const ERC20_META_ABI = parseAbi([
   'function decimals() view returns (uint8)',
   'function symbol() view returns (string)',
@@ -151,14 +162,15 @@ export class ChainClient {
    * Admission reads accept an explicit block so all three facts come from the
    * same chain view, and so a lagging RPC replica can be refused (see server.ts).
    */
-  isAuthorized(owner: Address, at?: bigint): Promise<boolean> {
-    return this.publicClient.readContract({
+  async authorizationOf(owner: Address, at?: bigint): Promise<SpAuthorization> {
+    const [enabled, revokeAt] = await this.publicClient.readContract({
       address: this.cfg.wallet,
       abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'authorizedSP',
+      functionName: 'authorizationOf',
       args: [owner, this.account.address],
       ...(at !== undefined ? { blockNumber: at } : {}),
     });
+    return { enabled, revokeAt: Number(revokeAt) };
   }
 
   nonceUsed(owner: Address, nonce: string, at?: bigint): Promise<boolean> {

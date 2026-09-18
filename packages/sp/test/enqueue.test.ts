@@ -17,6 +17,7 @@ import {
   mkSP,
   nowSec,
   post,
+  revoke,
   rpcProxy,
   settleDirect,
   signed,
@@ -195,6 +196,37 @@ describe('POST /enqueue', () => {
     expect(r.json.detail.sp).toBe(sp.address);
     expect(r.json.payment_model_context.commands).toEqual(['agentpay sp-authorize <sp>']);
     expect(sp.store.get(s.digest)).toBeUndefined();
+  });
+
+  it('403 sp_revocation_pending while a revocation would land inside the receipt window; sp_not_authorized once it has', async () => {
+    const payer = extraAccount(9);
+    await fund(payer, USDC('1'), sp.address);
+    let spNow = nowSec();
+    const revoking = mkSP({ clock: () => spNow });
+    await revoking.start();
+    try {
+      const revokeAt = await revoke(payer, sp.address); // = revoke block + withdrawDelay (== SETTLE_WINDOW here)
+      // A receipt issued now would promise settlement by revokeAt itself, which the
+      // contract already refuses: no receipt, nothing reserved.
+      spNow = revokeAt - SETTLE_WINDOW;
+      const r = await enqueue(revoking, await signed({}, payer));
+      expectError(r, 403, 'sp_revocation_pending');
+      expect(r.json.detail).toEqual({ sp: revoking.address, owner: payer.address, revokeAt, enqueueDeadline: revokeAt });
+      expect(r.json.payment_model_context.commands).toEqual(['agentpay sp-authorize <sp>']);
+      expect(revoking.store.get(r.json.mandateDigest)).toBeUndefined();
+      // One second earlier the promise ends before the revocation: admitted.
+      spNow = revokeAt - SETTLE_WINDOW - 1;
+      const ok = await enqueue(revoking, await signed({}, payer));
+      expect(ok.status).toBe(200);
+      expect(ok.json.receipt.enqueueDeadline).toBe(revokeAt - 1);
+      // From revokeAt on the SP is simply not authorized.
+      spNow = revokeAt;
+      const late = await enqueue(revoking, await signed({}, payer));
+      expectError(late, 403, 'sp_not_authorized');
+      expect(revoking.store.get(late.json.mandateDigest)).toBeUndefined();
+    } finally {
+      await revoking.stop();
+    }
   });
 
   it('402 insufficient_balance: reservations count against the debitable balance', async () => {
