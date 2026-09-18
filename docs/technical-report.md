@@ -155,7 +155,7 @@ enqueueDeadline = min(mandate.deadline, now + settleWindowSeconds)
 |---|---|
 | 钱包策略拒绝（签名前） | `mandate_required` `mandate_not_found` `no_eligible_mandate` `mandate_insufficient_budget` `mandate_expired` `mandate_disabled` `host_not_allowed` `per_call_max` `rate_limited` `sp_not_trusted` `unsupported_offer` |
 | 收款方拒绝（402/409） | `invalid_payment` `offer_mismatch` `invalid_payee` `invalid_token` `invalid_amount` `mandate_expired` `mandate_deadline_too_short` `invalid_ref` `invalid_signature` `replay`(409) `insufficient_balance` `nonce_used` `chain_unavailable` `settlement_unavailable` `invalid_sp_receipt` |
-| SP 拒绝 | `invalid_body` `unsupported_chain` `unsupported_token` `bad_params` `deadline_too_soon` `deadline_too_far` `invalid_signature` `mandate_terminal` `nonce_used` `sp_not_authorized` `rpc_error`(503) |
+| SP 拒绝 | `invalid_body` `unsupported_chain` `unsupported_token` `bad_params` `deadline_too_soon` `deadline_too_far` `invalid_signature` `mandate_terminal` `nonce_used` `sp_not_authorized` `sp_revocation_pending` `rpc_error`(503) |
 | 合约 `settleBatch` 状态 | `0 Ok` `1 SPNotAuthorized` `2 Expired` `3 NonceUsed` `4 InsufficientBalance` `5 BadSignature` `6 BadParams` |
 
 ## 5. 链上合约 `AEP2DebitWallet`
@@ -169,7 +169,7 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 | `balances[payer][token]` | 总托管额，含待提现部分 |
 | `withdrawals[payer][token]` | 待提现 `{amount, unlockAt}`，每对 (payer, token) 最多一笔 |
 | `usedNonces[payer][nonce]` | nonce 已消耗 |
-| `authorizedSP[payer][sp]` | 该 payer 允许这个 SP 扣款 |
+| `_authorizations[payer][sp]` | `{enabled, revokeAt}`：该 payer 是否允许这个 SP 扣款，以及已排定的撤销生效时刻（0 = 未排定）。视图 `authorizedSP(owner, sp)` = `enabled && (revokeAt == 0 \|\| now < revokeAt)`，`authorizationOf(owner, sp)` 返回原始记录 |
 | `withdrawDelay`（immutable） | 提现锁定秒数，必须 ≥ 所有 SP 的结算窗口 |
 
 ### 5.2 函数
@@ -177,7 +177,9 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 | 函数 | 说明 |
 |---|---|
 | `deposit(token, amount)` | 预存（需先 approve） |
-| `authorizeSP(sp, enabled)` | 授权 / 撤销某个 SP |
+| `authorizeSP(sp)` | 授权某个 SP，并清除已排定的撤销 |
+| `revokeSP(sp)` | 排定撤销：`revokeAt = now + withdrawDelay`，发 `SPRevocationScheduled`；未授权则 revert `BadParams`，已排定则不动（重复调用不会提前） |
+| `cancelRevoke(sp)` | 取消尚未生效的撤销（生效后只能 `authorizeSP` 重新授权） |
 | `requestWithdraw(token, amount)` | 开始提现计时，`unlockAt = now + withdrawDelay` |
 | `cancelWithdraw(token)` | 取消待提现 |
 | `executeWithdraw(token, to)` | 到期付出 `min(申请额, 剩余余额)`，锁定期内的结算优先 |
@@ -186,11 +188,13 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 | `settle(m, sig)` | 结算一张，失败 revert 具体错误 |
 | `settleBatch(ms, sigs)` | 结算多张，单张失败**跳过并发事件** `SettleSkipped(digest, owner, nonce, status)`，只有代币转账失败才整批 revert |
 
-`_settle` 的检查顺序：参数 → `authorizedSP[owner][msg.sender]` → deadline → nonce 未用 → **全部**余额 ≥ amount → ECDSA 恢复 == owner → 标 nonce、扣款、`Settled` 事件、`safeTransfer` 给 payee。任何人都能调用 `settleBatch`，但只对授权了调用者的 payer 生效。
+`_settle` 的检查顺序：参数 → `authorizedSP(owner, msg.sender)` → deadline → nonce 未用 → **全部**余额 ≥ amount → ECDSA 恢复 == owner → 标 nonce、扣款、`Settled` 事件、`safeTransfer` 给 payee。任何人都能调用 `settleBatch`，但只对授权了调用者的 payer 生效。
 
 ### 5.3 提现安全
 
 提现要等 `withdrawDelay`；期间已排队的 mandate 仍按**全部**余额结算，`executeWithdraw` 只付剩下的。SP 用 `debitableBalance` 接纳新 mandate，所以永远不会针对已在路上的钱接单。这与 FluxA「自动延长的提现计时器」等价，但不需要计时器。
+
+撤销 SP 同样延迟：`revokeSP` 在 `withdrawDelay` 后生效，期间 SP 仍有授权，撤销前 SP 已签收的 mandate（都在其 ≤ `withdrawDelay` 的结算窗口内到期）仍可结算；否则付款人可以拿到数据后下一块撤销授权，绕过提现延迟。SP 拒绝收据窗口会跨过待生效撤销的新 mandate（`sp_revocation_pending`）；钱包对账把撤销导致的过期记 `payer_revoked` 而非 `sp_default`。
 
 ### 5.4 Gas
 
@@ -212,7 +216,7 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 
 ### 6.2 接纳检查（`/enqueue`）
 
-schema → 链与代币受支持 → 金额和 payee 非零 → deadline 窗口 → 规范签名并恢复为 owner → 已知摘要则幂等返回原收据（`created: false` + 原 `enqueuedAt`）→ 本地 nonce 索引 → 链上 `authorizedSP`、`usedNonces`、`debitableBalance`，三者**钉在同一区块号**读取（`cacheTime: 0`），且该区块不得早于本进程上次结算的区块，否则 503 `chain view is stale` → `debitable ≥ amount + 该 (owner, token) 已预留` → 预留、落盘、签收据。
+schema → 链与代币受支持 → 金额和 payee 非零 → deadline 窗口 → 规范签名并恢复为 owner → 已知摘要则幂等返回原收据（`created: false` + 原 `enqueuedAt`）→ 本地 nonce 索引 → 链上 `authorizationOf`、`usedNonces`、`debitableBalance`，三者**钉在同一区块号**读取（`cacheTime: 0`），且该区块不得早于本进程上次结算的区块，否则 503 `chain view is stale` → 已授权且没有在收据 `enqueueDeadline` 或之前生效的撤销（403 `sp_not_authorized` / `sp_revocation_pending`）→ `debitable ≥ amount + 该 (owner, token) 已预留` → 预留、落盘、签收据。
 
 ### 6.3 队列状态机
 
@@ -272,15 +276,15 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 4. 带 `PAYMENT-SIGNATURE` 重试；解析 `PAYMENT-RESPONSE`，验收据（默认 `requireReceipt: true`，无有效收据记 `unknown`）。
 5. 账本更新为 `enqueued` / `rejected` / `unknown`；返回可读的 Response。
 
-账本（JSONL）状态：`in_flight`（签完未回）、`enqueued`、`settled`、`rejected`（收款方非 2xx，签名已出，预算保持预留）、`unknown`、`expired-unused`；对账时还会记 `sp_default` 标记。
+账本（JSONL）状态：`in_flight`（签完未回）、`enqueued`、`settled`、`rejected`（收款方非 2xx，签名已出，预算保持预留）、`unknown`、`expired-unused`；对账时还会记 `sp_default` / `payer_revoked` 标记。
 
 ### 8.4 对账与报告
 
-`reconcile()`：对每条未终态记录查链，nonce 已用且找到指向该摘要的 `Settled` 事件 → `settled`（带 tx）；deadline 过 60s 且 nonce 未用 → `expired-unused`，预算释放；有收据但没结算 → `sp_default`，预算释放。`report()` 输出 `SpendReport`：按状态计数、`byHost`、`byResource`、`policyDenials`（签名前被拒的记录，它们不进账本）。
+`reconcile()`：对每条未终态记录查链，nonce 已用且找到指向该摘要的 `Settled` 事件 → `settled`（带 tx）；deadline 过 60s 且 nonce 未用 → `expired-unused`，预算释放；有收据但没结算 → `sp_default`，预算释放；若付款人排定的撤销在收据 `enqueueDeadline` 或之前生效（SP 本来就无法履约）→ 记 `payer_revoked`，不算 SP 失约。`report()` 输出 `SpendReport`：按状态计数、`byHost`、`byResource`、`policyDenials`（签名前被拒的记录，它们不进账本）。
 
 ### 8.5 链上操作
 
-`deposit`、`balance`、`debitable`、`authorizeSP` / `isSpAuthorized`、`requestWithdraw` / `cancelWithdraw` / `executeWithdraw` / `pendingWithdrawal`。
+`deposit`、`balance`、`debitable`、`authorizeSP` / `revokeSP` / `cancelRevokeSP` / `isSpAuthorized` / `authorizationOf`、`requestWithdraw` / `cancelWithdraw` / `executeWithdraw` / `pendingWithdrawal`。
 
 ## 9. CLI 与 agent 接入
 
@@ -288,7 +292,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 
 | 组 | 命令 |
 |---|---|
-| 链上 | `balance` `deposit` `withdraw-request` `withdraw-cancel` `withdraw` `sp-authorize` `sp-revoke` |
+| 链上 | `balance` `deposit` `withdraw-request` `withdraw-cancel` `withdraw` `sp-authorize` `sp-revoke`（输出 `revokeAt`：撤销在 `withdrawDelay` 后生效） |
 | 预算 | `mandate-request`（agent 起草）`mandate-create`（人一步建好）`mandate-approve` `mandate-enable` `mandate-disable` `mandate-list` `mandate-status` |
 | 付款 | `offer <url>`（只看报价）`pay <url> [--method --body --header --mandate --prepay --legacy]` `ledger` `reconcile` `report` |
 | 设置 | `init [--from-deployment localhost\|base-sepolia\|path.json]` |
@@ -301,7 +305,7 @@ IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
 |---|---|---|
 | 收款方 → SP | 收据是签名承诺，链上没有强制 | SP 不结算：收款方拿不到钱；钱包对账记 `sp_default` 并释放预算 |
 | 付款方 → 收款方 | 入队后会交付 | 协议不给「没拿到数据就退款」，无追索 |
-| SP / 收款方 → 付款方 | 余额与授权在链上可查 | 余额不足或撤销授权的 mandate 会被跳过；提现延迟保护在途 mandate |
+| SP / 收款方 → 付款方 | 余额与授权在链上可查 | 余额不足的 mandate 会被跳过；提现和撤销 SP 都在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 仍可结算 |
 | 用户 → 钱包程序 | 预算只在链下由钱包自己遵守 | 预算凭证合约不校验 |
 
 评审后已合入的修复：
@@ -357,12 +361,13 @@ demo 的 7 个场景：正常付款；无头 402 报价；预算 $0.003 付三�
 1. `deadline` 用 `uint64`，`usedNonces` 按 `(owner, nonce)` 而非 `(owner, token, nonce)`；签名与 FluxA 已部署合约不互通。
 2. SP 收据是 EIP-712 typed data，FluxA 是 `personal_sign` 打包字节。
 3. 安全修复：`settle` 按**全部**余额检查，FluxA 参考合约的 `requestWithdraw` 立即扣减，付款人可先被服务再申请全额提现饿死结算。
-4. 安全修复：SP 由每个付款人 `authorizeSP` 授权，而非部署者的全局 `setSP`；合约没有 admin。
+4. 安全修复：SP 由每个付款人 `authorizeSP` 授权，而非部署者的全局 `setSP`；撤销（`revokeSP`）在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 仍可结算；合约没有 admin。
 5. 没有 ZK 批量证明：`settleBatch` 逐张链上验签；批量只摊薄交易开销。
 
 ## 15. 已知限制
 
 - MVP，未审计；`MockUSDC` 可随意 mint；合约无手续费、无升级、无暂停。
+- 一个付款人授权多个 SP 时，每个 SP 各自按同一个 `debitableBalance` 预留，合计接纳额可能超出余额，后结算的一方会 `InsufficientBalance`；一次只授权一个 SP。
 - SP 单进程 + JSONL；收款方幂等存储在内存；跨收款方重启的重放只在 60s 宽限期外被 SP 的 `created:false` 抓住。
 - 钱包预算文件单写者，两个进程共用一个 `AGENTPAY_HOME` 会互相覆盖计数。
 - 没有 KYC/KYB/KYA、争议处理、支付链接、卡、市场、UI。
