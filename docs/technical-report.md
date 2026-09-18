@@ -160,7 +160,7 @@ enqueueDeadline = min(mandate.deadline, now + settleWindowSeconds)
 
 ## 5. 链上合约 `AEP2DebitWallet`
 
-Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`ReentrancyGuard`）。没有 owner、没有 admin、没有升级和暂停。
+Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`ReentrancyGuardTransient`——重入锁用 EIP-1153 瞬态存储，目标链须支持 Cancun；Base 支持）。没有 owner、没有 admin、没有升级和暂停。
 
 ### 5.1 存储
 

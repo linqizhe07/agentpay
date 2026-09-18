@@ -5,7 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /**
  * @title AEP2DebitWallet
@@ -33,7 +33,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *         No owner, admin, pause or proxy; withdrawDelay is the only deployment
  *         parameter. mandateDigest byte-matches the core package's mandateDigest().
  */
-contract AEP2DebitWallet is EIP712, ReentrancyGuard {
+contract AEP2DebitWallet is EIP712, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     struct Mandate {
