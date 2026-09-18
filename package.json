@@ -6,8 +6,8 @@
   "description": "Authorize-first, settle-later payments for AI agents: an AEP2-style debit wallet, settlement processor, payee middleware, agent wallet SDK and CLI.",
   "workspaces": [
     "packages/core",
-    "contracts",
-    "services/sp",
+    "packages/contracts",
+    "packages/sp",
     "packages/payee",
     "packages/wallet",
     "packages/cli",

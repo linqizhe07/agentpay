@@ -1,5 +1,5 @@
 {
-  "extends": "../tsconfig.base.json",
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     // This workspace runs via tsx/vitest and never emits; declaration emit would
     // trip TS2742/TS7056 on viem's deeply-generic client types.

@@ -133,7 +133,7 @@ function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
  * Reads SP_PK, RPC_URL, CHAIN_ID, WALLET_ADDRESS, SUPPORTED_TOKENS, SP_PORT, STORE_PATH,
  * SETTLE_WINDOW, MIN_DEADLINE_MARGIN, MAX_DEADLINE_HORIZON, BATCH_INTERVAL_MS, BATCH_MAX,
  * SEND_MARGIN, MAX_ATTEMPTS. When CHAIN_ID / WALLET_ADDRESS / SUPPORTED_TOKENS are unset the
- * missing ones come from contracts/deployments/<DEPLOYMENT ?? 'localhost'>.json.
+ * missing ones come from packages/contracts/deployments/<DEPLOYMENT ?? 'localhost'>.json.
  */
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): SPConfig {
   const key = env.SP_PK;

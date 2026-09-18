@@ -14,7 +14,7 @@ import { MOCK_USDC_ABI, deployAll } from '@agentpay/contracts';
 
 const RPC_PORT = 8547;
 const RPC_URL = `http://127.0.0.1:${RPC_PORT}`;
-const CONTRACTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'contracts');
+const CONTRACTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'contracts');
 const WITHDRAW_DELAY = 600;
 
 // Hardhat's PUBLIC dev-mnemonic accounts — never real funds.

@@ -60,7 +60,7 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     return async () => {};
   }
 
-  const contractsDir = fileURLToPath(new URL('../../../contracts', import.meta.url));
+  const contractsDir = fileURLToPath(new URL('../../contracts', import.meta.url));
   let child: ChildProcess | undefined;
 
   if (!(await rpcUp())) {

@@ -36,12 +36,24 @@ The demo prints, among other things: a paid call with the on-chain balance **unc
 | workspace | what it is |
 |---|---|
 | `packages/core` | Types, x402-shaped wire format, EIP-712 mandate + SP-receipt helpers, money parsing, error taxonomy, `payment_model_context` hints for LLM agents |
-| `contracts` | `AEP2DebitWallet.sol` (deposit, per-payer SP authorization, delayed withdrawals, `settle` / `settleBatch`), `MockUSDC.sol`, deploy scripts, generated ABI |
-| `services/sp` | Settlement processor: `POST /enqueue` validation + reservation + signed receipt, JSONL queue, batching worker (`node:http`, zero deps) |
+| `packages/contracts` | `AEP2DebitWallet.sol` (deposit, per-payer SP authorization, delayed withdrawals, `settle` / `settleBatch`), `MockUSDC.sol`, deploy scripts, generated ABI |
+| `packages/sp` | Settlement processor: `POST /enqueue` validation + reservation + signed receipt, JSONL queue, batching worker (`node:http`, zero deps) |
 | `packages/payee` | `createMandatePaywall()` express-style middleware: 402 offers, mandate verification, replay protection, SP enqueue, `PAYMENT-RESPONSE` |
 | `packages/wallet` | `MandateWallet`: intent mandates (user-approved budgets), policy gate before signing, `fetch()` that answers 402s, ledger, `reconcile()`, `report()` |
 | `packages/cli` | `agentpay` CLI (JSON out, exit codes) + `SKILL.md` for LLM agents |
 | `demo` | One-command end-to-end scenario runner and its test |
+
+## Using it as a submodule (e.g. inside Kairos)
+
+This repository is a component, not a host: the product that pays (Kairos) keeps its own repository and pulls this one in as a git submodule.
+
+```bash
+git submodule add https://github.com/linqizhe07/agentpay modules/payment   # in the host repo
+git submodule update --init
+(cd modules/payment && npm install)
+```
+
+The host then imports the SDK packages by path or workspace: `@agentpay/wallet` for the paying agent, `@agentpay/payee` for services that charge, `@agentpay/sp` to run a settlement processor, `@agentpay/contracts` for the ABI and deploy helpers. Nothing product-specific lives here; UI, product pages and integration glue belong to the host.
 
 ## Wire format
 
@@ -109,8 +121,8 @@ Agents use `mandate-request` (creates a draft) and stop until the human runs `ma
 ## Running the pieces yourself (local)
 
 ```bash
-(cd contracts && npx hardhat node --port 8545)        # terminal 1
-npm run deploy:local                                   # writes contracts/deployments/localhost.json
+(cd packages/contracts && npx hardhat node --port 8545)  # terminal 1
+npm run deploy:local                                   # writes packages/contracts/deployments/localhost.json
 SP_PK=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 npm run sp        # terminal 2 (hardhat #3)
 PAYEE_PK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a npm run payee  # terminal 3 (hardhat #2)
 curl -i http://127.0.0.1:4021/predict                  # 402 + PAYMENT-REQUIRED

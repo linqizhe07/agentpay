@@ -62,7 +62,7 @@ export interface SpEnqueueResult {
   enqueuedAt?: number;
 }
 
-/** Thin HTTP client for the Settlement Processor API (services/sp). */
+/** Thin HTTP client for the Settlement Processor API (packages/sp). */
 export class SpClient {
   readonly url: string;
   readonly timeoutMs: number;

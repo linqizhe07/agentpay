@@ -6,7 +6,7 @@ import { sleep } from './util.js';
 const __dir = dirname(fileURLToPath(import.meta.url));
 
 /** Absolute path of the contracts workspace (where hardhat.config lives). */
-export const CONTRACTS_DIR = resolve(__dir, '..', '..', 'contracts');
+export const CONTRACTS_DIR = resolve(__dir, '..', '..', 'packages', 'contracts');
 
 export interface ChainOptions {
   /** JSON-RPC port; default 8545. */
