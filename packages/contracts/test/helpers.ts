@@ -1,9 +1,12 @@
+import { readFileSync } from 'node:fs';
 import {
   createPublicClient,
   createTestClient,
   createWalletClient,
+  getAddress,
   http,
   parseUnits,
+  type Abi,
   type Address,
   type Hex,
 } from 'viem';
@@ -82,6 +85,20 @@ export async function deployFixture(): Promise<Fixture> {
     await publicClient.waitForTransactionReceipt({ hash });
   }
   return { usdc, wallet };
+}
+
+/**
+ * Deploys the test-only FeeOnTransferERC20(feeBps) from its Hardhat artifact.
+ * The token is kept out of scripts/gen-abi.mjs on purpose, so nothing but this
+ * suite can reach it; `npm test` compiles before vitest runs, so the artifact exists.
+ */
+export async function deployFeeToken(feeBps: bigint): Promise<{ address: Address; abi: Abi }> {
+  const artifact = new URL('../artifacts/contracts/test/FeeOnTransferERC20.sol/FeeOnTransferERC20.json', import.meta.url);
+  const { abi, bytecode } = JSON.parse(readFileSync(artifact, 'utf8')) as { abi: Abi; bytecode: Hex };
+  const hash = await wallets.deployer.deployContract({ abi, bytecode, args: [feeBps] });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (!receipt.contractAddress) throw new Error('FeeOnTransferERC20 deployment yielded no address');
+  return { address: getAddress(receipt.contractAddress), abi }; // checksummed, as event logs decode it
 }
 
 export async function now(): Promise<number> {

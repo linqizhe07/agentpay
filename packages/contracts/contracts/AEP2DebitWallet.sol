@@ -119,12 +119,20 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
 
     // ------------------------------------------------------------ payer side
 
-    /// @notice Pre-fund the wallet. Caller must have approved this contract for `amount`.
+    /**
+     * @notice Pre-fund the wallet. Caller must have approved this contract for `amount`.
+     *         Credits what actually arrived, not `amount`: a fee-on-transfer token
+     *         delivers less, and crediting the request would let the payer spend
+     *         custody the contract never held.
+     */
     function deposit(address token, uint256 amount) external nonReentrant {
         if (token == address(0) || amount == 0) revert BadParams();
+        uint256 before = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        balances[msg.sender][token] += amount;
-        emit Deposited(msg.sender, token, amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - before;
+        if (received == 0) revert BadParams();
+        balances[msg.sender][token] += received;
+        emit Deposited(msg.sender, token, received);
     }
 
     /// @notice Allow a settlement processor to debit the caller's balance with valid mandates. Clears any scheduled revocation.

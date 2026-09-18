@@ -176,7 +176,7 @@ Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`Reentranc
 
 | 函数 | 说明 |
 |---|---|
-| `deposit(token, amount)` | 预存（需先 approve） |
+| `deposit(token, amount)` | 预存（需先 approve）。按**实际到账额**记账并发 `Deposited`：扣手续费的代币只记到账的部分，到账为 0 则 revert `BadParams` |
 | `authorizeSP(sp)` | 授权某个 SP，并清除已排定的撤销 |
 | `revokeSP(sp)` | 排定撤销：`revokeAt = now + withdrawDelay`，发 `SPRevocationScheduled`；未授权则 revert `BadParams`，已排定则不动（重复调用不会提前） |
 | `cancelRevoke(sp)` | 取消尚未生效的撤销（生效后只能 `authorizeSP` 重新授权） |

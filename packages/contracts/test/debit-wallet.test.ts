@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { parseEventLogs, parseUnits } from 'viem';
+import { parseEventLogs, parseUnits, type Abi, type Address } from 'viem';
 import { mandateDigest } from '@agentpay/core';
 import { AEP2_DEBIT_WALLET_ABI } from '../src/index.js';
 import {
@@ -10,6 +10,7 @@ import {
   authorizeSpFor,
   balanceOf,
   debitable,
+  deployFeeToken,
   deployFixture,
   depositFor,
   domainFor,
@@ -69,6 +70,41 @@ describe('AEP2DebitWallet', () => {
       }),
     ).rejects.toThrow(/BadParams/);
     await assertSolvent();
+  });
+
+  it('deposit credits what arrived: a fee-on-transfer token credits less, a transfer of nothing reverts', async () => {
+    const payer = accounts.payer.address;
+    const custody = (token: Address) =>
+      publicClient.readContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'balances', args: [payer, token] });
+    /** mint + approve + deposit `amount` of `token` as the payer; resolves to the deposit receipt. */
+    async function fundAndDeposit(token: { address: Address; abi: Abi }, amount: bigint) {
+      for (const [functionName, args] of [['mint', [payer, amount]], ['approve', [f.wallet, amount]]] as const) {
+        const hash = await wallets.payer.writeContract({ address: token.address, abi: token.abi, functionName, args });
+        await publicClient.waitForTransactionReceipt({ hash });
+      }
+      const hash = await wallets.payer.writeContract({
+        address: f.wallet,
+        abi: AEP2_DEBIT_WALLET_ABI,
+        functionName: 'deposit',
+        args: [token.address, amount],
+      });
+      return publicClient.waitForTransactionReceipt({ hash });
+    }
+
+    // 1% is burned on the way in: the payer is credited 990_000, never the 1_000_000 it asked for.
+    const fee = await deployFeeToken(100n);
+    const receipt = await fundAndDeposit(fee, 1_000_000n);
+    const [ev] = parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'Deposited' });
+    expect(ev.args).toEqual({ owner: payer, token: fee.address, amount: 990_000n });
+    expect(await custody(fee.address)).toBe(990_000n);
+    // I1 holds for this token as well: the contract holds at least what it owes.
+    const held = (await publicClient.readContract({ address: fee.address, abi: fee.abi, functionName: 'balanceOf', args: [f.wallet] })) as bigint;
+    expect(held).toBeGreaterThanOrEqual(990_000n);
+
+    // transferFrom succeeds but nothing arrives: refuse rather than credit custody the contract does not hold.
+    const burn = await deployFeeToken(10_000n);
+    await expect(fundAndDeposit(burn, 1_000_000n)).rejects.toThrow(/BadParams/);
+    expect(await custody(burn.address)).toBe(0n);
   });
 
   it('settle pays the payee, marks the nonce, debits the payer and emits Settled', async () => {
