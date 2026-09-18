@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { Hex } from '@agentpay/core';
 import { JsonlStore, type QueueRecord, type RecordStatus } from '../src/index.js';
@@ -156,6 +156,50 @@ describe('JsonlStore', () => {
     expect(() => new JsonlStore(path)).toThrow(/corrupt store line 2/);
     writeFileSync(path, `${JSON.stringify({ t: 'bogus' })}\n`, 'utf8');
     expect(() => new JsonlStore(path)).toThrow(/unknown event type/);
+  });
+
+  it('a failed append leaves memory untouched and surfaces the error', () => {
+    const path = tmpStorePath('unwritable');
+    const store = new JsonlStore(path);
+    const a = rec({ mandate: { amount: '700' } });
+    store.insert(a);
+    // Turn the file into a directory: every append from here on fails with EISDIR.
+    rmSync(path);
+    mkdirSync(path);
+
+    const b = rec({ mandate: { amount: '300' } });
+    expect(() => store.insert(b)).toThrow(/EISDIR/);
+    expect(store.size).toBe(1);
+    expect(store.has(b.mandateDigest)).toBe(false);
+    expect(store.digestForNonce(OWNER_A, b.mandate.nonce)).toBeUndefined();
+    expect(store.reserved(OWNER_A, TOKEN)).toBe(700n);
+    expect(store.pending).toBe(1);
+
+    expect(() => store.update(a.mandateDigest, { status: 'settled', txHash: `0x${'cc'.repeat(32)}` }, 5)).toThrow(/EISDIR/);
+    expect(store.get(a.mandateDigest)).toMatchObject({ status: 'pending', updatedAt: a.enqueuedAt });
+    expect(store.get(a.mandateDigest)?.txHash).toBeUndefined();
+    expect(store.reserved(OWNER_A, TOKEN)).toBe(700n);
+    expect(store.pending).toBe(1);
+  });
+
+  it('pending counts records in status pending across inserts, updates and replay', () => {
+    const path = tmpStorePath('pending');
+    const w = new JsonlStore(path);
+    expect(w.pending).toBe(0);
+    const a = rec();
+    const b = rec();
+    const c = rec({ status: 'settled' });
+    for (const r of [a, b, c]) w.insert(r);
+    expect(w.pending).toBe(2);
+    w.update(a.mandateDigest, { status: 'settling' }, 1);
+    expect(w.pending).toBe(1);
+    w.update(a.mandateDigest, { status: 'pending', nextAttemptAt: 9 }, 2); // requeued after a transport failure
+    expect(w.pending).toBe(2);
+    w.update(b.mandateDigest, { status: 'expired' }, 3);
+    w.update(a.mandateDigest, { attempts: 1 }, 4); // status untouched
+    expect(w.pending).toBe(1);
+    expect(w.pending).toBe(w.counts().pending);
+    expect(new JsonlStore(path).pending).toBe(1);
   });
 
   it('tolerates replayed duplicates and updates for unknown digests', () => {

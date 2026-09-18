@@ -10,6 +10,9 @@ import { describe, expect, it } from 'vitest';
 
 const DEMO_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+/** Well inside the test timeout, so a hung demo is killed and its output shown instead of a bare "timed out". */
+const DEMO_TIMEOUT_MS = 200_000;
+
 function runDemo(args: string[] = []): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolvePromise) => {
     const child = spawn('npx', ['tsx', 'src/run-demo.ts', ...args], { cwd: DEMO_DIR, env: process.env });
@@ -17,7 +20,14 @@ function runDemo(args: string[] = []): Promise<{ code: number | null; stdout: st
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
     child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
-    child.on('close', (code) => resolvePromise({ code, stdout, stderr }));
+    const timer = setTimeout(() => {
+      stderr += `\n[e2e] demo still running after ${DEMO_TIMEOUT_MS}ms; killing it\n`;
+      child.kill('SIGKILL');
+    }, DEMO_TIMEOUT_MS);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolvePromise({ code, stdout, stderr });
+    });
   });
 }
 

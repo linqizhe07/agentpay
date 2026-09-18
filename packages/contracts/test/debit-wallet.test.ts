@@ -1,22 +1,26 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { parseEventLogs, parseUnits } from 'viem';
+import { parseEventLogs, parseUnits, type Abi, type Address } from 'viem';
 import { mandateDigest } from '@agentpay/core';
 import { AEP2_DEBIT_WALLET_ABI } from '../src/index.js';
 import {
   AMOUNT,
   WITHDRAW_DELAY,
   accounts,
+  authorizationOf,
   authorizeSpFor,
   balanceOf,
   debitable,
+  deployFeeToken,
   deployFixture,
   depositFor,
   domainFor,
   nonceUsed,
   now,
   publicClient,
+  setSpAuthorization,
   settleAs,
   signedMandate,
+  spAuthorized,
   timeTravel,
   tuple,
   walletBalance,
@@ -68,6 +72,41 @@ describe('AEP2DebitWallet', () => {
     await assertSolvent();
   });
 
+  it('deposit credits what arrived: a fee-on-transfer token credits less, a transfer of nothing reverts', async () => {
+    const payer = accounts.payer.address;
+    const custody = (token: Address) =>
+      publicClient.readContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'balances', args: [payer, token] });
+    /** mint + approve + deposit `amount` of `token` as the payer; resolves to the deposit receipt. */
+    async function fundAndDeposit(token: { address: Address; abi: Abi }, amount: bigint) {
+      for (const [functionName, args] of [['mint', [payer, amount]], ['approve', [f.wallet, amount]]] as const) {
+        const hash = await wallets.payer.writeContract({ address: token.address, abi: token.abi, functionName, args });
+        await publicClient.waitForTransactionReceipt({ hash });
+      }
+      const hash = await wallets.payer.writeContract({
+        address: f.wallet,
+        abi: AEP2_DEBIT_WALLET_ABI,
+        functionName: 'deposit',
+        args: [token.address, amount],
+      });
+      return publicClient.waitForTransactionReceipt({ hash });
+    }
+
+    // 1% is burned on the way in: the payer is credited 990_000, never the 1_000_000 it asked for.
+    const fee = await deployFeeToken(100n);
+    const receipt = await fundAndDeposit(fee, 1_000_000n);
+    const [ev] = parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'Deposited' });
+    expect(ev.args).toEqual({ owner: payer, token: fee.address, amount: 990_000n });
+    expect(await custody(fee.address)).toBe(990_000n);
+    // I1 holds for this token as well: the contract holds at least what it owes.
+    const held = (await publicClient.readContract({ address: fee.address, abi: fee.abi, functionName: 'balanceOf', args: [f.wallet] })) as bigint;
+    expect(held).toBeGreaterThanOrEqual(990_000n);
+
+    // transferFrom succeeds but nothing arrives: refuse rather than credit custody the contract does not hold.
+    const burn = await deployFeeToken(10_000n);
+    await expect(fundAndDeposit(burn, 1_000_000n)).rejects.toThrow(/BadParams/);
+    expect(await custody(burn.address)).toBe(0n);
+  });
+
   it('settle pays the payee, marks the nonce, debits the payer and emits Settled', async () => {
     const s = await signedMandate(f);
     const payeeBefore = await balanceOf(f.usdc, accounts.payee.address);
@@ -92,20 +131,75 @@ describe('AEP2DebitWallet', () => {
     const s = await signedMandate(f);
     await expect(settleAs(f, 'stranger', s)).rejects.toThrow(/SPNotAuthorized/);
     await expect(settleAs(f, 'payee', s)).rejects.toThrow(/SPNotAuthorized/);
-
-    await authorizeSpFor(f, 'payer', accounts.sp.address, false);
-    await expect(settleAs(f, 'sp', s)).rejects.toThrow(/SPNotAuthorized/);
-    await authorizeSpFor(f, 'payer', accounts.sp.address, true);
-    await settleAs(f, 'sp', s); // authorized again -> settles
+    expect(await spAuthorized(f, accounts.payer.address, accounts.stranger.address)).toBe(false);
+    expect(await spAuthorized(f, accounts.payer.address, accounts.sp.address)).toBe(true);
+    await settleAs(f, 'sp', s);
 
     await expect(
       wallets.payer.writeContract({
         address: f.wallet,
         abi: AEP2_DEBIT_WALLET_ABI,
         functionName: 'authorizeSP',
-        args: ['0x0000000000000000000000000000000000000000', true],
+        args: ['0x0000000000000000000000000000000000000000'],
       }),
     ).rejects.toThrow(/BadParams/);
+  });
+
+  it('revokeSP takes effect after withdrawDelay: mandates receipted before it still settle', async () => {
+    const payer = accounts.payer.address;
+    const sp = accounts.sp.address;
+    // (4) nothing to revoke for an SP that was never authorized
+    await expect(setSpAuthorization(f, 'payer', 'revokeSP', accounts.stranger.address)).rejects.toThrow(/BadParams/);
+
+    const receipted = await signedMandate(f); // in the SP's queue when the payer revokes
+    const receipt = await setSpAuthorization(f, 'payer', 'revokeSP', sp);
+    const [ev] = parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'SPRevocationScheduled' });
+    const revokeAt = (await now()) + WITHDRAW_DELAY;
+    expect(ev.args).toEqual({ owner: payer, sp, revokeAt: BigInt(revokeAt) });
+    expect(await authorizationOf(f, payer, sp)).toEqual({ enabled: true, revokeAt });
+
+    // (1) during the delay: still authorized, the receipted mandate settles, a repeat keeps the date
+    expect(await spAuthorized(f, payer, sp)).toBe(true);
+    await timeTravel(10);
+    const again = await setSpAuthorization(f, 'payer', 'revokeSP', sp);
+    expect(parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: again.logs, eventName: 'SPRevocationScheduled' })).toEqual([]);
+    expect(await authorizationOf(f, payer, sp)).toEqual({ enabled: true, revokeAt });
+    await settleAs(f, 'sp', receipted);
+
+    // after the delay: SPNotAuthorized, and the record shows why
+    await timeTravel(WITHDRAW_DELAY);
+    expect(await spAuthorized(f, payer, sp)).toBe(false);
+    expect(await authorizationOf(f, payer, sp)).toEqual({ enabled: true, revokeAt });
+    const late = await signedMandate(f);
+    await expect(settleAs(f, 'sp', late)).rejects.toThrow(/SPNotAuthorized/);
+    // an effective revocation is not cancellable; re-authorizing is the way back
+    await expect(setSpAuthorization(f, 'payer', 'cancelRevoke', sp)).rejects.toThrow(/BadParams/);
+
+    // (3) authorizeSP re-enables and clears revokeAt
+    const back = await setSpAuthorization(f, 'payer', 'authorizeSP', sp);
+    const [auth] = parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: back.logs, eventName: 'SPAuthorized' });
+    expect(auth.args).toEqual({ owner: payer, sp, enabled: true });
+    expect(await authorizationOf(f, payer, sp)).toEqual({ enabled: true, revokeAt: 0 });
+    await settleAs(f, 'sp', late);
+    await assertSolvent();
+  });
+
+  it('cancelRevoke restores the authorization; there must be a pending revocation to cancel', async () => {
+    const payer = accounts.payer.address;
+    const sp = accounts.sp.address;
+    await expect(setSpAuthorization(f, 'payer', 'cancelRevoke', sp)).rejects.toThrow(/BadParams/);
+
+    await setSpAuthorization(f, 'payer', 'revokeSP', sp);
+    expect((await authorizationOf(f, payer, sp)).revokeAt).toBeGreaterThan(await now());
+    const receipt = await setSpAuthorization(f, 'payer', 'cancelRevoke', sp);
+    const [ev] = parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'SPAuthorized' });
+    expect(ev.args).toEqual({ owner: payer, sp, enabled: true });
+    expect(await authorizationOf(f, payer, sp)).toEqual({ enabled: true, revokeAt: 0 });
+
+    // (2) the cancelled revocation never takes effect
+    await timeTravel(WITHDRAW_DELAY + 1);
+    expect(await spAuthorized(f, payer, sp)).toBe(true);
+    await settleAs(f, 'sp', await signedMandate(f));
   });
 
   it('rejects a signature from the wrong signer and any tampered field', async () => {

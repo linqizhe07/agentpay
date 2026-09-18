@@ -16,8 +16,13 @@ export interface DeployPublicClient {
   waitForTransactionReceipt: (args: { hash: Hex }) => Promise<{ contractAddress?: Address | null }>;
 }
 
-/** 3 hours: the default settlement window and, therefore, the minimum withdrawal delay. */
-export const DEFAULT_WITHDRAW_DELAY = 10_800;
+/**
+ * 6 hours: twice the SP's default settle window (10_800). The SP refuses to
+ * start unless the wallet's withdrawDelay exceeds its window by
+ * WITHDRAW_DELAY_MARGIN_SECONDS, so a wallet deployed with this default and an
+ * SP started with its defaults fit together.
+ */
+export const DEFAULT_WITHDRAW_DELAY = 21_600;
 
 async function deployed(publicClient: DeployPublicClient, hash: Hex, what: string): Promise<Address> {
   const receipt = await publicClient.waitForTransactionReceipt({ hash });

@@ -1,6 +1,10 @@
+import { fileURLToPath } from 'node:url';
 import { getAddress, isAddress } from 'viem';
 import { readDeployment } from '@agentpay/contracts';
 import type { Address, Hex } from '@agentpay/core';
+
+/** `storePath` value that keeps the queue in memory only: receipts do not survive a restart. */
+export const MEMORY_STORE_PATH = ':memory:';
 
 /** Everything a Settlement Processor instance needs; see SP_DEFAULTS for the optional knobs. */
 export interface SPConfig {
@@ -14,7 +18,11 @@ export interface SPConfig {
   tokens: Address[];
   /** 0 = ephemeral port. */
   port: number;
-  /** Omit for memory only; else an append-only JSONL file replayed on open. */
+  /**
+   * Append-only JSONL file the queue is persisted to and replayed from on open.
+   * Default (unset or empty): `packages/sp/data/sp-queue.jsonl` next to this package.
+   * MEMORY_STORE_PATH (':memory:') opts out of persistence: receipts are then lost on restart.
+   */
   storePath?: string;
   /** The SP promises to settle within this many seconds of enqueueing (default 10800). */
   settleWindowSeconds?: number;
@@ -40,7 +48,7 @@ export interface SPConfig {
   pollingIntervalMs?: number;
 }
 
-export type ResolvedSPConfig = Required<Omit<SPConfig, 'storePath'>> & { storePath?: string };
+export type ResolvedSPConfig = Required<SPConfig>;
 
 export const SP_DEFAULTS = {
   settleWindowSeconds: 10_800,
@@ -54,6 +62,7 @@ export const SP_DEFAULTS = {
   pollingIntervalMs: 1_000,
   port: 3001,
   rpcUrl: 'http://127.0.0.1:8545',
+  storePath: fileURLToPath(new URL('../data/sp-queue.jsonl', import.meta.url)),
 } as const;
 
 const PRIVATE_KEY_RE = /^0x[0-9a-fA-F]{64}$/;
@@ -74,6 +83,12 @@ function checkAddress(name: string, value: string): Address {
     throw new Error(`config.${name} is not an address: ${String(value)}`);
   }
   return getAddress(value);
+}
+
+/** Unset/blank -> the package-anchored default file; ':memory:' and explicit paths pass through. */
+function storePathOf(raw: string | undefined): string {
+  const trimmed = raw?.trim() ?? '';
+  return trimmed === '' ? SP_DEFAULTS.storePath : trimmed;
 }
 
 /** Applies defaults and validates; throws Error with a clear message. */
@@ -113,8 +128,8 @@ export function resolveConfig(cfg: SPConfig): ResolvedSPConfig {
     log: cfg.log ?? ((line: string) => console.error(line)),
     host: cfg.host ?? SP_DEFAULTS.host,
     pollingIntervalMs: checkNumber('pollingIntervalMs', cfg.pollingIntervalMs ?? SP_DEFAULTS.pollingIntervalMs, { min: 1 }),
+    storePath: storePathOf(cfg.storePath),
   };
-  if (cfg.storePath) resolved.storePath = cfg.storePath;
   if (resolved.minDeadlineMarginSeconds > resolved.maxDeadlineHorizonSeconds) {
     throw new Error('config.minDeadlineMarginSeconds must not exceed config.maxDeadlineHorizonSeconds');
   }
@@ -156,7 +171,7 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): SPConfi
     wallet: checkAddress('wallet', wallet),
     tokens: tokens.map((t, i) => checkAddress(`tokens[${i}]`, t)),
     port: envInt(env, 'SP_PORT') ?? SP_DEFAULTS.port,
-    storePath: env.STORE_PATH?.trim() || undefined,
+    storePath: storePathOf(env.STORE_PATH),
     settleWindowSeconds: envInt(env, 'SETTLE_WINDOW'),
     minDeadlineMarginSeconds: envInt(env, 'MIN_DEADLINE_MARGIN'),
     maxDeadlineHorizonSeconds: envInt(env, 'MAX_DEADLINE_HORIZON'),

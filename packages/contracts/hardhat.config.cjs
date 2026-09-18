@@ -1,5 +1,5 @@
 /**
- * Bare Hardhat v2 config — no plugins (DESIGN.md §4).
+ * Bare Hardhat v2 config — no plugins.
  * Compilation and `hardhat node` only; tests run via vitest + viem.
  */
 module.exports = {
@@ -12,6 +12,8 @@ module.exports = {
       // codegen to avoid stack-too-deep.
       viaIR: true,
       // OpenZeppelin 5.x uses the mcopy opcode; 0.8.24 defaults to shanghai.
+      // ReentrancyGuardTransient also needs EIP-1153 (tload/tstore), so the
+      // target chain must be Cancun-capable: Base (mainnet and Sepolia) is.
       evmVersion: 'cancun',
     },
   },

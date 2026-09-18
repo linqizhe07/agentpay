@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SP_ERROR_CODES, verifySpReceipt, type Hex, type SpReceipt } from '@agentpay/core';
-import { MAX_BODY_BYTES, type SPHandle } from '../src/index.js';
+import { MAX_BODY_BYTES, WITHDRAW_DELAY_MARGIN_SECONDS, type SPHandle } from '../src/index.js';
 import {
   AMOUNT,
   SETTLE_WINDOW,
@@ -17,6 +17,7 @@ import {
   mkSP,
   nowSec,
   post,
+  revoke,
   rpcProxy,
   settleDirect,
   signed,
@@ -75,6 +76,19 @@ describe('POST /enqueue', () => {
     expect(rec).toMatchObject({ status: 'pending', attempts: 0, chainId: fixture().chainId, wallet: fixture().wallet, payerSig: s.payerSig });
     expect(rec?.receipt).toEqual(receipt);
     expect(sp.store.reserved(accounts.payer.address, fixture().usdc)).toBeGreaterThanOrEqual(AMOUNT);
+    expect(sp.store.path).toBeUndefined(); // storePath ':memory:' reaches the store as "no file", not as a file named ':memory:'
+  });
+
+  it("storePath ':memory:' is announced as MEMORY-ONLY at start-up", async () => {
+    const lines: string[] = [];
+    const m = mkSP({ log: (l) => lines.push(l) });
+    await m.start();
+    try {
+      expect(m.store.path).toBeUndefined();
+      expect(lines.some((l) => l.includes('MEMORY-ONLY'))).toBe(true);
+    } finally {
+      await m.stop();
+    }
   });
 
   it('receipt enqueueDeadline is capped by the mandate deadline', async () => {
@@ -197,6 +211,37 @@ describe('POST /enqueue', () => {
     expect(sp.store.get(s.digest)).toBeUndefined();
   });
 
+  it('403 sp_revocation_pending while a revocation would land inside the receipt window; sp_not_authorized once it has', async () => {
+    const payer = extraAccount(9);
+    await fund(payer, USDC('1'), sp.address);
+    let spNow = nowSec();
+    const revoking = mkSP({ clock: () => spNow });
+    await revoking.start();
+    try {
+      const revokeAt = await revoke(payer, sp.address); // = revoke block + withdrawDelay (> SETTLE_WINDOW)
+      // A receipt issued now would promise settlement by revokeAt itself, which the
+      // contract already refuses: no receipt, nothing reserved.
+      spNow = revokeAt - SETTLE_WINDOW;
+      const r = await enqueue(revoking, await signed({}, payer));
+      expectError(r, 403, 'sp_revocation_pending');
+      expect(r.json.detail).toEqual({ sp: revoking.address, owner: payer.address, revokeAt, enqueueDeadline: revokeAt });
+      expect(r.json.payment_model_context.commands).toEqual(['agentpay sp-authorize <sp>']);
+      expect(revoking.store.get(r.json.mandateDigest)).toBeUndefined();
+      // One second earlier the promise ends before the revocation: admitted.
+      spNow = revokeAt - SETTLE_WINDOW - 1;
+      const ok = await enqueue(revoking, await signed({}, payer));
+      expect(ok.status).toBe(200);
+      expect(ok.json.receipt.enqueueDeadline).toBe(revokeAt - 1);
+      // From revokeAt on the SP is simply not authorized.
+      spNow = revokeAt;
+      const late = await enqueue(revoking, await signed({}, payer));
+      expectError(late, 403, 'sp_not_authorized');
+      expect(revoking.store.get(late.json.mandateDigest)).toBeUndefined();
+    } finally {
+      await revoking.stop();
+    }
+  });
+
   it('402 insufficient_balance: reservations count against the debitable balance', async () => {
     const payer = extraAccount(5);
     await fund(payer, USDC('1'), sp.address);
@@ -239,6 +284,33 @@ describe('POST /enqueue', () => {
     expect(await debitable(payer.address)).toBe(USDC('0.2'));
     expectError(await enqueue(sp, await signed({ amount: USDC('0.3').toString() }, payer)), 402, 'insufficient_balance');
     expect((await enqueue(sp, await signed({ amount: USDC('0.2').toString() }, payer))).status).toBe(200);
+  });
+
+  it('admits exactly what the balance covers when enqueues race: 6 x $0.3 against $1 is 3 receipts + 3 x 402', async () => {
+    const payer = extraAccount(10);
+    await fund(payer, USDC('1'), sp.address);
+    const mandates = await Promise.all(Array.from({ length: 6 }, () => signed({ amount: USDC('0.3').toString() }, payer)));
+    // All six read the same debitable balance ($1) before any of them is admitted;
+    // only the synchronous claim keeps the fourth from also passing the funds check.
+    const replies = await Promise.all(mandates.map((s) => enqueue(sp, s)));
+    const admitted = replies.filter((r) => r.status === 200);
+    const refused = replies.filter((r) => r.status !== 200);
+    expect(admitted).toHaveLength(3);
+    expect(refused).toHaveLength(3);
+    for (const r of refused) expectError(r, 402, 'insufficient_balance');
+    expect(sp.store.reserved(payer.address, fixture().usdc)).toBe(USDC('0.9'));
+    expect(mandates.filter((s) => sp.store.has(s.digest))).toHaveLength(3);
+  });
+
+  it('answers concurrent enqueues of one mandate with a single record and the same receipt', async () => {
+    const s = await signed();
+    const size = sp.store.size;
+    const replies = await Promise.all([enqueue(sp, s), enqueue(sp, s), enqueue(sp, s)]);
+    for (const r of replies) expect(r.status).toBe(200);
+    expect(replies.filter((r) => r.json.created === true)).toHaveLength(1);
+    expect(new Set(replies.map((r) => r.json.receipt.spEnqueueSig)).size).toBe(1);
+    expect(new Set(replies.map((r) => r.json.enqueuedAt)).size).toBe(1);
+    expect(sp.store.size).toBe(size + 1);
   });
 
   it('409 mandate_terminal once a record reached a terminal state', async () => {
@@ -412,9 +484,14 @@ describe('startup assertions', () => {
     await expect(sp.start()).rejects.toThrow(/serves chain 31337 but the configuration says 1/);
   });
 
-  it('refuses a settlement window longer than the withdrawal delay', async () => {
-    const sp = mkSP({ settleWindowSeconds: fixture().withdrawDelay + 1 });
-    await expect(sp.start()).rejects.toThrow(/withdrawDelay is 600s but settleWindowSeconds is 601s/);
+  it('refuses a settlement window that ends within the skew margin of the withdrawal delay', async () => {
+    // withdrawDelay == window + margin is the last accepted configuration; one second more is refused.
+    const widest = fixture().withdrawDelay - WITHDRAW_DELAY_MARGIN_SECONDS;
+    const sp = mkSP({ settleWindowSeconds: widest + 1 });
+    await expect(sp.start()).rejects.toThrow(/withdrawDelay is 900s but settleWindowSeconds is 841s \(needs at least 60s more/);
+    const ok = mkSP({ settleWindowSeconds: widest });
+    await ok.start();
+    await ok.stop();
   });
 
   it('refuses a token that does not answer decimals() and a wallet that is not a debit wallet', async () => {

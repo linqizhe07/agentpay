@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, truncateSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, truncateSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Address, Hex, Mandate, SpReceipt } from '@agentpay/core';
 
@@ -86,12 +86,19 @@ function parseEvent(line: string, lineNo: number, path: string): StoreEvent {
  * Without a path the store is memory-only. Only a truncated LAST line (a write cut
  * short by a crash) is tolerated: it is dropped and the file repaired; any other
  * malformed line throws.
+ *
+ * Every mutation is appended before it is applied, so a failed write leaves
+ * memory untouched and the caller sees the error. An enq event is also fsynced:
+ * once insert() returns, the record a receipt is about to promise is on disk.
+ * upd events are appended without fsync; one lost to a crash is recovered from
+ * the chain by the worker's start-up reconcile.
  */
 export class JsonlStore {
   readonly path: string | undefined;
   private readonly records = new Map<string, QueueRecord>();
   private readonly byOwnerNonce = new Map<string, Hex>();
   private readonly reservedByOwnerToken = new Map<string, bigint>();
+  private pendingCount = 0;
 
   constructor(path?: string, private readonly log: (line: string) => void = () => {}) {
     this.path = path;
@@ -100,6 +107,11 @@ export class JsonlStore {
 
   get size(): number {
     return this.records.size;
+  }
+
+  /** Records in status 'pending', maintained in apply() (the batchMax trigger reads it per enqueue). */
+  get pending(): number {
+    return this.pendingCount;
   }
 
   get(digest: string): QueueRecord | undefined {
@@ -147,14 +159,14 @@ export class JsonlStore {
       .map((r) => r.mandateDigest);
   }
 
-  /** Inserts a new record; throws if the digest is already known. Synchronous. */
+  /** Inserts a new record, durably (append + fsync) before it is visible; throws if the digest is already known. Synchronous. */
   insert(rec: QueueRecord): void {
     if (this.records.has(rec.mandateDigest.toLowerCase())) {
       throw new Error(`store: duplicate record ${rec.mandateDigest}`);
     }
     const event: StoreEvent = { t: 'enq', rec };
-    this.apply(event);
     this.append(event);
+    this.apply(event);
   }
 
   /** Patches a record (updatedAt = at); throws for unknown digests. Synchronous. */
@@ -162,8 +174,8 @@ export class JsonlStore {
     const rec = this.records.get(digest.toLowerCase());
     if (!rec) throw new Error(`store: unknown record ${digest}`);
     const event: StoreEvent = { t: 'upd', digest: rec.mandateDigest, patch, at };
-    this.apply(event);
     this.append(event);
+    this.apply(event);
     return rec;
   }
 
@@ -175,16 +187,21 @@ export class JsonlStore {
       this.records.set(key, rec);
       this.byOwnerNonce.set(nonceKey(rec.mandate.owner, rec.mandate.nonce), rec.mandateDigest);
       if (isReservedStatus(rec.status)) this.addReserved(rec, 1n);
+      if (rec.status === 'pending') this.pendingCount += 1;
       return;
     }
     const rec = this.records.get(event.digest.toLowerCase());
     if (!rec) return; // update for a record we never saw (tolerated on replay)
     const before = isReservedStatus(rec.status);
+    const pendingBefore = rec.status === 'pending';
     Object.assign(rec, event.patch);
     rec.updatedAt = event.at;
     const after = isReservedStatus(rec.status);
     if (before && !after) this.addReserved(rec, -1n);
     if (!before && after) this.addReserved(rec, 1n);
+    const pendingAfter = rec.status === 'pending';
+    if (pendingBefore && !pendingAfter) this.pendingCount -= 1;
+    if (!pendingBefore && pendingAfter) this.pendingCount += 1;
   }
 
   private addReserved(rec: QueueRecord, sign: bigint): void {
@@ -196,7 +213,21 @@ export class JsonlStore {
 
   private append(event: StoreEvent): void {
     if (!this.path) return;
-    appendFileSync(this.path, `${JSON.stringify(event)}\n`, 'utf8');
+    const line = `${JSON.stringify(event)}\n`;
+    if (event.t !== 'enq') {
+      appendFileSync(this.path, line, 'utf8');
+      return;
+    }
+    // One fsync per enqueue: the receipt this record backs must not outlive a power cut.
+    const fd = openSync(this.path, 'a');
+    try {
+      const buf = Buffer.from(line, 'utf8');
+      let written = 0;
+      while (written < buf.length) written += writeSync(fd, buf, written, buf.length - written);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   private open(path: string): void {

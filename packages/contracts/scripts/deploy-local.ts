@@ -6,7 +6,8 @@
  *   npm run deploy:local
  *
  * Env: RPC_URL (default http://127.0.0.1:8545), DEPLOYER_PK (default Hardhat #0),
- *      WITHDRAW_DELAY seconds (default 10800).
+ *      WITHDRAW_DELAY seconds (default 21600: the SP's default SETTLE_WINDOW is 10800
+ *      and its startup check wants the delay at least 60 s longer than the window).
  */
 import { createPublicClient, createWalletClient, http, parseUnits, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -24,7 +25,7 @@ const FUNDED: Address[] = [
 async function main(): Promise<void> {
   const rpcUrl = process.env.RPC_URL ?? 'http://127.0.0.1:8545';
   const key = (process.env.DEPLOYER_PK ?? HARDHAT_KEY_0) as Hex;
-  const withdrawDelay = Number(process.env.WITHDRAW_DELAY ?? 10_800);
+  const withdrawDelay = Number(process.env.WITHDRAW_DELAY ?? 21_600);
 
   const account = privateKeyToAccount(key);
   const publicClient = createPublicClient({ chain: hardhat, transport: http(rpcUrl) });

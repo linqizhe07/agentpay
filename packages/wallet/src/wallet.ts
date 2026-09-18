@@ -88,6 +88,8 @@ export interface MandateWalletOptions {
   now?: () => number;
   /** Injectable fetch. */
   fetch?: typeof fetch;
+  /** Receives one line per repair the wallet makes to its files on load (counters rebuilt, torn ledger tail dropped). Default: discard. */
+  log?: (line: string) => void;
 }
 
 export interface FetchOptions {
@@ -131,7 +133,7 @@ export interface SpendReport {
     rejected: number;
     unknown: number;
     expiredUnused: number;
-    /** Mandates the SP receipted but never settled before the deadline. */
+    /** Mandates the SP receipted but never settled before the deadline (not counting those the payer pre-empted by revoking the SP). */
     spDefaults: number;
   };
   byHost: Record<string, string>;
@@ -149,6 +151,8 @@ const DEFAULT_MAX_MANDATE_VALIDITY = 86_400;
 /** SP statuses meaning "your mandate is in the queue (or already settled)". */
 const SP_ENQUEUED_STATUSES = new Set(['pending', 'settling', 'settled']);
 const SP_DEFAULT_MARK = 'sp_default';
+/** An enqueued mandate that expired because the payer's revocation of the SP landed inside the receipt's window. */
+const PAYER_REVOKED_MARK = 'payer_revoked';
 
 const eqAddr = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
 const isSpendStatus = (s: LedgerEntry['status']): boolean =>
@@ -181,6 +185,7 @@ export class MandateWallet {
     MandateWalletCaps;
   private readonly now: () => number;
   private readonly fetchImpl: typeof fetch;
+  private readonly log: (line: string) => void;
 
   /** Cached 402 offers keyed by 'METHOD origin/path' (Intent Mode source). */
   private readonly offers = new Map<string, PaymentRequirements>();
@@ -200,8 +205,10 @@ export class MandateWallet {
     this.network = opts.network;
     this.chainId = chainIdFromNetwork(opts.network);
     this.trustedSps = opts.trustedSps && opts.trustedSps.length > 0 ? opts.trustedSps : undefined;
+    this.log = opts.log ?? (() => {});
     this.store = new IntentMandateStore(opts.mandatesPath);
-    this.ledger = new Ledger(opts.ledgerPath);
+    this.ledger = new Ledger(opts.ledgerPath, this.log);
+    this.rebuildBudgets();
     this.caps = {
       ...opts.caps,
       maxMandateValiditySeconds: opts.caps?.maxMandateValiditySeconds ?? DEFAULT_MAX_MANDATE_VALIDITY,
@@ -267,10 +274,26 @@ export class MandateWallet {
     });
   }
 
-  async authorizeSP(sp: Address, enabled = true): Promise<Hex> {
-    return this.walletTx('authorizeSP', [sp, enabled]);
+  /** Lets `sp` settle this payer's mandates; also clears a scheduled revocation. */
+  async authorizeSP(sp: Address): Promise<Hex> {
+    return this.walletTx('authorizeSP', [sp]);
   }
 
+  /**
+   * Schedules the revocation: `sp` keeps settling for the contract's
+   * withdrawDelay (see `authorizationOf().revokeAt`), so mandates it already
+   * receipted are honoured. Reverts (BadParams) when `sp` is not authorized.
+   */
+  async revokeSP(sp: Address): Promise<Hex> {
+    return this.walletTx('revokeSP', [sp]);
+  }
+
+  /** Cancels a revocation that has not taken effect yet (BadParams otherwise). */
+  async cancelRevokeSP(sp: Address): Promise<Hex> {
+    return this.walletTx('cancelRevoke', [sp]);
+  }
+
+  /** The contract's verdict right now: enabled and no revocation in effect. */
   isSpAuthorized(sp: Address): Promise<boolean> {
     return this.publicClient.readContract({
       address: this.walletContract,
@@ -278,6 +301,17 @@ export class MandateWallet {
       functionName: 'authorizedSP',
       args: [this.address, sp],
     });
+  }
+
+  /** `revokeAt` is 0 or the unix second at which `sp` loses the right to settle. */
+  async authorizationOf(sp: Address): Promise<{ enabled: boolean; revokeAt: number }> {
+    const [enabled, revokeAt] = await this.publicClient.readContract({
+      address: this.walletContract,
+      abi: AEP2_DEBIT_WALLET_ABI,
+      functionName: 'authorizationOf',
+      args: [this.address, sp],
+    });
+    return { enabled, revokeAt: Number(revokeAt) };
   }
 
   async requestWithdraw(amount: bigint): Promise<Hex> {
@@ -418,8 +452,9 @@ export class MandateWallet {
     // The ledger line exists from the moment a signature exists: a crash between
     // here and the response leaves an 'in_flight' unknown that reconcile() can
     // settle or expire, instead of a reservation nothing remembers.
-    this.ledger.append({ ...base, timestamp: this.now(), httpStatus: 0, status: 'unknown', error: 'in_flight' });
-    const record = (fields: Pick<LedgerEntry, 'httpStatus' | 'status'> & Partial<LedgerEntry>): void =>
+    const signedAt = this.now();
+    this.ledger.append({ ...base, timestamp: signedAt, signedAt, httpStatus: 0, status: 'unknown', error: 'in_flight' });
+    const record = (fields: Pick<LedgerEntry, 'httpStatus' | 'status'> & Partial<Omit<LedgerEntry, 'signedAt'>>): void =>
       this.ledger.updateStatus(digest, fields.status, { error: undefined, spReceipt: undefined, ...fields, timestamp: this.now() });
 
     // ---- 6. retry with the mandate attached ----
@@ -505,8 +540,10 @@ export class MandateWallet {
    * Settles the fate of ledger entries against the chain: a consumed nonce
    * means 'settled' (tx hash from the Settled event when found); a deadline
    * passed without use means 'expired-unused' (budget released; for a mandate
-   * the SP had receipted this is an SP default). Entries still inside their
-   * window stay pending, as does everything when the RPC is unreachable.
+   * the SP had receipted this is an SP default, unless the payer revoked the
+   * SP before the receipt could be kept: `payer_revoked`). Entries still
+   * inside their window stay pending, as does everything when the RPC is
+   * unreachable.
    */
   async reconcile(): Promise<{ settled: Hex[]; expiredUnused: Hex[]; stillPending: Hex[] }> {
     const settled: Hex[] = [];
@@ -519,7 +556,9 @@ export class MandateWallet {
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       const amount = BigInt(e.amount);
+      const expired = this.now() > e.mandate.deadline + 60; // grace for clock skew
       let used: boolean;
+      let revoked = false;
       try {
         used = await this.publicClient.readContract({
           address: e.walletContract,
@@ -527,6 +566,12 @@ export class MandateWallet {
           functionName: 'usedNonces',
           args: [e.payer, BigInt(e.mandate.nonce)],
         });
+        // A receipted mandate that expired unused is the SP's default only if the
+        // SP stayed authorized through its promise (`enqueueDeadline`): a payer
+        // revocation that takes effect at or before it made the receipt unkeepable.
+        if (!used && expired && e.status === 'enqueued' && e.spReceipt) {
+          revoked = await this.revokedBy(e, e.spReceipt.sp, e.spReceipt.enqueueDeadline);
+        }
       } catch {
         // RPC unreachable: keep this and every remaining entry as-is.
         for (const rest of entries.slice(i)) stillPending.push(rest.mandateDigest);
@@ -538,13 +583,15 @@ export class MandateWallet {
         if (reservationHeld(e)) this.adjustBudget(e.intentMandateId, { pending: -amount, spent: amount });
         this.ledger.updateStatus(e.mandateDigest, 'settled', settledTx ? { settledTx } : undefined);
         settled.push(e.mandateDigest);
-      } else if (this.now() > e.mandate.deadline + 60) {
-        // grace for clock skew
+      } else if (expired) {
         if (e.status === 'enqueued') {
           // The SP promised (receipt) and did not deliver: give the budget back.
           this.adjustBudget(e.intentMandateId, { spent: -amount });
           this.ledger.updateStatus(e.mandateDigest, 'expired-unused', {
-            error: `${SP_DEFAULT_MARK}: settlement processor did not settle before the mandate deadline`,
+            ...(revoked ? {} : { spDefault: true }),
+            error: revoked
+              ? `${PAYER_REVOKED_MARK}: the payer revoked the settlement processor before its settlement deadline`
+              : `${SP_DEFAULT_MARK}: settlement processor did not settle before the mandate deadline`,
           });
         } else if (reservationHeld(e)) {
           this.adjustBudget(e.intentMandateId, { pending: -amount });
@@ -597,7 +644,8 @@ export class MandateWallet {
           break;
         case 'expired-unused':
           totals.expiredUnused++;
-          if (e.error?.startsWith(SP_DEFAULT_MARK)) totals.spDefaults++;
+          // lines written before the flag existed only carry the error prefix
+          if (e.spDefault || e.error?.startsWith(SP_DEFAULT_MARK)) totals.spDefaults++;
           break;
       }
       if (isSpendStatus(e.status)) {
@@ -620,7 +668,7 @@ export class MandateWallet {
   // ------------------------------------------------------------- internals
 
   private async walletTx(
-    functionName: 'authorizeSP' | 'requestWithdraw' | 'cancelWithdraw' | 'executeWithdraw',
+    functionName: 'authorizeSP' | 'revokeSP' | 'cancelRevoke' | 'requestWithdraw' | 'cancelWithdraw' | 'executeWithdraw',
     args: readonly unknown[],
   ): Promise<Hex> {
     const hash = await this.walletClient.writeContract({
@@ -655,6 +703,37 @@ export class MandateWallet {
       pendingSpentAmount: clamp(BigInt(m.pendingSpentAmount) + (delta.pending ?? 0n)).toString(),
       spentAmount: clamp(BigInt(m.spentAmount) + (delta.spent ?? 0n)).toString(),
     });
+  }
+
+  /**
+   * The counters in mandates.json are a cache of the ledger: on load they are
+   * recomputed from it (pending = reservations still held, spent = committed
+   * mandates) so the two crash windows of fetch() heal themselves — a
+   * reservation saved before its ledger line existed, or a spend saved before
+   * the line left in_flight. Ledger lines for mandates the store no longer has
+   * are ignored; a drift is logged and saved once.
+   */
+  private rebuildBudgets(): void {
+    const pending = new Map<string, bigint>();
+    const spent = new Map<string, bigint>();
+    for (const e of this.ledger.read()) {
+      const amount = BigInt(e.amount);
+      if (reservationHeld(e)) pending.set(e.intentMandateId, (pending.get(e.intentMandateId) ?? 0n) + amount);
+      else if (isSpendStatus(e.status)) spent.set(e.intentMandateId, (spent.get(e.intentMandateId) ?? 0n) + amount);
+    }
+    let dirty = false;
+    for (const m of this.store.list()) {
+      const pendingSpentAmount = (pending.get(m.id) ?? 0n).toString();
+      const spentAmount = (spent.get(m.id) ?? 0n).toString();
+      if (m.pendingSpentAmount === pendingSpentAmount && m.spentAmount === spentAmount) continue;
+      this.log(
+        `wallet: mandate ${m.id}: counters rebuilt from the ledger ` +
+          `(spent ${m.spentAmount} -> ${spentAmount}, pending ${m.pendingSpentAmount} -> ${pendingSpentAmount})`,
+      );
+      this.store.upsert({ ...m, pendingSpentAmount, spentAmount });
+      dirty = true;
+    }
+    if (dirty) this.store.save();
   }
 
   private policyQuery(hosts: readonly string[], amount: bigint, now: number): PolicyQuery {
@@ -795,6 +874,17 @@ export class MandateWallet {
     } catch {
       return undefined;
     }
+  }
+
+  /** Whether a revocation of `sp` by the entry's payer takes effect at or before `deadline` (unix seconds). */
+  private async revokedBy(e: LedgerEntry, sp: Address, deadline: number): Promise<boolean> {
+    const [, revokeAt] = await this.publicClient.readContract({
+      address: e.walletContract,
+      abi: AEP2_DEBIT_WALLET_ABI,
+      functionName: 'authorizationOf',
+      args: [e.payer, sp],
+    });
+    return revokeAt !== 0n && Number(revokeAt) <= deadline;
   }
 
   /** Best effort: the Settled event for this mandate's nonce, filtered by owner. */

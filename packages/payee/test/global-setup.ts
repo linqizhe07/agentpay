@@ -125,7 +125,7 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
         address: wallet,
         abi: contracts.AEP2_DEBIT_WALLET_ABI,
         functionName: 'authorizeSP',
-        args: [SP_ADDRESS, true],
+        args: [SP_ADDRESS],
       }),
     );
 

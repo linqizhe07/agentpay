@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hashTypedData, recoverTypedDataAddress } from 'viem';
 import { newId, parseAmount, type Address, type Hex, type TypedDataSigner } from '@agentpay/core';
+import { replaceDurableSync } from './durable.js';
 
 /** What a human (or an agent drafting on their behalf) supplies to create an intent mandate. */
 export interface IntentMandateInput {
@@ -24,7 +25,8 @@ export interface IntentMandateInput {
  * agent may spend against without further prompts. `spentAmount` counts
  * committed mandates (enqueued or settled); `pendingSpentAmount` is reserved for
  * signed mandates whose fate is not known yet. Both are persisted so every
- * process sharing the store sees the same remaining budget.
+ * process sharing the store sees the same remaining budget, but the ledger is
+ * the source of truth: MandateWallet recomputes them from it on construction.
  */
 export interface IntentMandate {
   /** 'im_…' */
@@ -181,7 +183,8 @@ interface StoreFile {
 /**
  * Intent mandates plus their budget counters. Memory-only when constructed
  * without a path; otherwise loaded from `path` on construction and written
- * back by `save()` (temp file + rename, so readers never see a torn file).
+ * back by `save()` (fsynced temp file + rename, so readers never see a torn
+ * file and a power cut cannot leave it emptier than the ledger).
  */
 export class IntentMandateStore {
   private readonly byId = new Map<string, IntentMandate>();
@@ -192,6 +195,9 @@ export class IntentMandateStore {
       const raw = readFileSync(path, 'utf8');
       if (raw.trim().length > 0) {
         const parsed = JSON.parse(raw) as Partial<StoreFile>;
+        if (parsed.version !== undefined && parsed.version !== 1) {
+          throw new Error(`unsupported mandate store version ${JSON.stringify(parsed.version)} at ${path} (expected 1)`);
+        }
         if (!Array.isArray(parsed.mandates)) throw new Error(`malformed mandate store at ${path}`);
         for (const m of parsed.mandates) this.byId.set(m.id, m);
       }
@@ -217,7 +223,6 @@ export class IntentMandateStore {
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
     const file: StoreFile = { version: 1, mandates: this.list() };
     const tmp = `${this.path}.${process.pid}.${++this.saveSeq}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, 'utf8');
-    renameSync(tmp, this.path);
+    replaceDurableSync(this.path, tmp, `${JSON.stringify(file, null, 2)}\n`);
   }
 }

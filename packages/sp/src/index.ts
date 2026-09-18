@@ -3,14 +3,14 @@ import type { AddressInfo } from 'node:net';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from '@agentpay/core';
 import { ChainClient, assertStartup, type TokenInfo } from './chain.js';
-import { resolveConfig, type SPConfig } from './config.js';
+import { MEMORY_STORE_PATH, resolveConfig, type SPConfig } from './config.js';
 import { Queue } from './queue.js';
 import { createHttpServer, type ServerRuntime } from './server.js';
 import { JsonlStore } from './store.js';
 import { Worker, type TickResult } from './worker.js';
 
 export type { SPConfig, ResolvedSPConfig } from './config.js';
-export { SP_DEFAULTS, loadConfigFromEnv, resolveConfig } from './config.js';
+export { MEMORY_STORE_PATH, SP_DEFAULTS, loadConfigFromEnv, resolveConfig } from './config.js';
 export type { TickResult, ReconcileResult } from './worker.js';
 export { JsonlStore, RECORD_STATUSES, isReservedStatus, isTerminalStatus } from './store.js';
 export type { QueueRecord, RecordPatch, RecordStatus, StoreEvent } from './store.js';
@@ -19,7 +19,7 @@ export type { ClaimResult, Precheck } from './queue.js';
 export { checkTerms, parseEnqueueBody } from './validate.js';
 export type { EnqueueRequest, Failure, TermsOptions } from './validate.js';
 export { enqueueDeadlineFor, issueReceipt } from './receipt.js';
-export { ChainClient, assertStartup, classifyError, parseSettleLogs } from './chain.js';
+export { ChainClient, WITHDRAW_DELAY_MARGIN_SECONDS, assertStartup, classifyError, parseSettleLogs } from './chain.js';
 export type { TokenInfo, SettleItem } from './chain.js';
 export { MAX_BODY_BYTES } from './server.js';
 
@@ -63,7 +63,7 @@ export function createSP(config: SPConfig): SPHandle {
   const cfg = resolveConfig(config);
   const account = privateKeyToAccount(cfg.key);
   const chain = new ChainClient(cfg, account);
-  const store = new JsonlStore(cfg.storePath, cfg.log);
+  const store = new JsonlStore(cfg.storePath === MEMORY_STORE_PATH ? undefined : cfg.storePath, cfg.log);
   const queue = new Queue(store);
   const worker = new Worker({ store, chain, cfg, log: cfg.log, clock: cfg.clock });
 
@@ -93,6 +93,8 @@ export function createSP(config: SPConfig): SPHandle {
       `sp: ${account.address} listening on ${runtime.url} (chain ${cfg.chainId}, wallet ${cfg.wallet}, ` +
         `${store.size} record(s), window ${cfg.settleWindowSeconds}s, withdrawDelay ${info.withdrawDelay}s)`,
     );
+    if (store.path) cfg.log(`sp: store ${store.path}`);
+    else cfg.log('sp: store is MEMORY-ONLY - receipts will not survive a restart');
     return { url: runtime.url, port: runtime.port };
   }
 

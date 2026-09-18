@@ -11,15 +11,15 @@
     "build": "tsc -p tsconfig.json --noEmit",
     "test": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat compile && node scripts/gen-abi.mjs && vitest run",
     "node": "HARDHAT_DISABLE_TELEMETRY_PROMPT=true hardhat node",
-    "deploy:local": "tsx scripts/deploy-local.ts",
-    "deploy:base-sepolia": "tsx scripts/deploy-base-sepolia.ts"
+    "deploy:local": "npm run gen:abi && tsx scripts/deploy-local.ts",
+    "deploy:base-sepolia": "npm run gen:abi && tsx scripts/deploy-base-sepolia.ts"
   },
   "dependencies": {
     "@agentpay/core": "*",
     "viem": "^2.21.0"
   },
   "devDependencies": {
-    "@openzeppelin/contracts": "^5.0.0",
+    "@openzeppelin/contracts": "^5.1.0",
     "hardhat": "^2.22.0"
   }
 }

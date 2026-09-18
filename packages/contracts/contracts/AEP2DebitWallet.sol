@@ -5,7 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /**
  * @title AEP2DebitWallet
@@ -24,9 +24,16 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *         is the admission figure SPs use for NEW mandates, so a mandate is
  *         never accepted against money already on its way out.
  *
- *         mandateDigest byte-matches the core package's mandateDigest().
+ *         Revoking an SP is delayed the same way: `revokeSP` schedules the
+ *         revocation `withdrawDelay` seconds out, so every mandate the SP
+ *         receipted before the call (all due within its settle window, which
+ *         is <= withdrawDelay) can still be settled. Otherwise a payer could
+ *         take delivery and revoke in the next block.
+ *
+ *         No owner, admin, pause or proxy; withdrawDelay is the only deployment
+ *         parameter. mandateDigest byte-matches the core package's mandateDigest().
  */
-contract AEP2DebitWallet is EIP712, ReentrancyGuard {
+contract AEP2DebitWallet is EIP712, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     struct Mandate {
@@ -42,6 +49,12 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
     struct Withdrawal {
         uint256 amount;
         uint64 unlockAt;
+    }
+
+    /// @dev One slot. `revokeAt == 0` means no revocation is scheduled.
+    struct Authorization {
+        bool enabled;
+        uint64 revokeAt;
     }
 
     /// @dev Per-item outcome of `_settle`; `settleBatch` reports these instead of reverting.
@@ -68,11 +81,13 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
     mapping(address => mapping(address => Withdrawal)) public withdrawals;
     /// @notice payer => nonce => consumed. Nonces are payer-chosen random uint256s.
     mapping(address => mapping(uint256 => bool)) public usedNonces;
-    /// @notice payer => settlement processor => may settle this payer's mandates.
-    mapping(address => mapping(address => bool)) public authorizedSP;
+    /// @dev payer => settlement processor => authorization; read through `authorizedSP` / `authorizationOf`.
+    mapping(address => mapping(address => Authorization)) private _authorizations;
 
     event Deposited(address indexed owner, address indexed token, uint256 amount);
+    /// @dev Emitted with `enabled = true` by `authorizeSP` and `cancelRevoke`; revocations emit `SPRevocationScheduled`.
     event SPAuthorized(address indexed owner, address indexed sp, bool enabled);
+    event SPRevocationScheduled(address indexed owner, address indexed sp, uint64 revokeAt);
     event WithdrawalRequested(address indexed owner, address indexed token, uint256 amount, uint64 unlockAt);
     event WithdrawalCancelled(address indexed owner, address indexed token, uint256 amount);
     event WithdrawalExecuted(address indexed owner, address indexed token, address to, uint256 amount);
@@ -105,19 +120,50 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
 
     // ------------------------------------------------------------ payer side
 
-    /// @notice Pre-fund the wallet. Caller must have approved this contract for `amount`.
+    /**
+     * @notice Pre-fund the wallet. Caller must have approved this contract for `amount`.
+     *         Credits what actually arrived, not `amount`: a fee-on-transfer token
+     *         delivers less, and crediting the request would let the payer spend
+     *         custody the contract never held.
+     */
     function deposit(address token, uint256 amount) external nonReentrant {
         if (token == address(0) || amount == 0) revert BadParams();
+        uint256 before = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        balances[msg.sender][token] += amount;
-        emit Deposited(msg.sender, token, amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - before;
+        if (received == 0) revert BadParams();
+        balances[msg.sender][token] += received;
+        emit Deposited(msg.sender, token, received);
     }
 
-    /// @notice Allow (or revoke) a settlement processor to debit the caller's balance with valid mandates.
-    function authorizeSP(address sp, bool enabled) external {
+    /// @notice Allow a settlement processor to debit the caller's balance with valid mandates. Clears any scheduled revocation.
+    function authorizeSP(address sp) external {
         if (sp == address(0)) revert BadParams();
-        authorizedSP[msg.sender][sp] = enabled;
-        emit SPAuthorized(msg.sender, sp, enabled);
+        _authorizations[msg.sender][sp] = Authorization({enabled: true, revokeAt: 0});
+        emit SPAuthorized(msg.sender, sp, true);
+    }
+
+    /**
+     * @notice Schedule the revocation of a settlement processor: it may still settle
+     *         until `block.timestamp + withdrawDelay`, which covers every mandate it
+     *         receipted before this call. Idempotent: an already scheduled revocation
+     *         keeps its date (a repeat call can never move it earlier).
+     */
+    function revokeSP(address sp) external {
+        Authorization storage a = _authorizations[msg.sender][sp];
+        if (!a.enabled) revert BadParams();
+        if (a.revokeAt != 0) return;
+        uint64 revokeAt = uint64(block.timestamp) + withdrawDelay;
+        a.revokeAt = revokeAt;
+        emit SPRevocationScheduled(msg.sender, sp, revokeAt);
+    }
+
+    /// @notice Cancel a revocation that has not taken effect yet (afterwards, use `authorizeSP` to re-enable).
+    function cancelRevoke(address sp) external {
+        Authorization storage a = _authorizations[msg.sender][sp];
+        if (!a.enabled || a.revokeAt == 0 || block.timestamp >= a.revokeAt) revert BadParams();
+        a.revokeAt = 0;
+        emit SPAuthorized(msg.sender, sp, true);
     }
 
     /// @notice Start the withdrawal timer. Only one pending withdrawal per (payer, token); cancel to change it.
@@ -166,6 +212,18 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
         return bal > locked ? bal - locked : 0;
     }
 
+    /// @notice Whether `sp` may settle `owner`'s mandates right now: enabled and no revocation in effect.
+    function authorizedSP(address owner, address sp) public view returns (bool) {
+        Authorization storage a = _authorizations[owner][sp];
+        return a.enabled && (a.revokeAt == 0 || block.timestamp < a.revokeAt);
+    }
+
+    /// @notice The raw authorization record: `revokeAt` is 0 or the unix second the SP loses the right to settle.
+    function authorizationOf(address owner, address sp) external view returns (bool enabled, uint64 revokeAt) {
+        Authorization storage a = _authorizations[owner][sp];
+        return (a.enabled, a.revokeAt);
+    }
+
     /// @notice EIP-712 digest of a mandate; byte-matches the core package's mandateDigest().
     function mandateDigest(Mandate calldata m) public view returns (bytes32) {
         return _hashTypedDataV4(
@@ -211,7 +269,7 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
     function _settle(Mandate calldata m, bytes calldata payerSig) internal returns (SettleStatus, bytes32) {
         bytes32 digest = mandateDigest(m);
         if (m.owner == address(0) || m.payee == address(0) || m.amount == 0) return (SettleStatus.BadParams, digest);
-        if (!authorizedSP[m.owner][msg.sender]) return (SettleStatus.SPNotAuthorized, digest);
+        if (!authorizedSP(m.owner, msg.sender)) return (SettleStatus.SPNotAuthorized, digest);
         if (block.timestamp > m.deadline) return (SettleStatus.Expired, digest);
         if (usedNonces[m.owner][m.nonce]) return (SettleStatus.NonceUsed, digest);
         uint256 bal = balances[m.owner][m.token];
@@ -222,7 +280,7 @@ contract AEP2DebitWallet is EIP712, ReentrancyGuard {
         usedNonces[m.owner][m.nonce] = true;
         balances[m.owner][m.token] = bal - m.amount;
         emit Settled(m.owner, m.token, m.payee, m.amount, m.nonce, m.ref, digest);
-        // A protocol fee (feeBps split to a collector) would be taken here, before the payout.
+        // Extension point for a protocol fee; none is implemented (see README "Honest limitations").
         IERC20(m.token).safeTransfer(m.payee, m.amount);
         return (SettleStatus.Ok, digest);
     }

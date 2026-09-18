@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { hashTypedData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -142,39 +142,42 @@ describe('matchHost', () => {
   });
 });
 
+const ledgerEntry = (digest: string, over: Partial<LedgerEntry> = {}): LedgerEntry => ({
+  kind: 'payment',
+  timestamp: 1,
+  url: 'http://x/y',
+  host: 'x',
+  resource: 'GET /y',
+  network: NETWORK,
+  asset: TOKEN,
+  amount: '5',
+  payer: payerAccount.address,
+  payee: strangerAddress,
+  walletContract: WALLET,
+  intentMandateId: 'im_1',
+  mandate: {
+    owner: payerAccount.address,
+    token: TOKEN,
+    payee: strangerAddress,
+    amount: '5',
+    nonce: '1',
+    deadline: 2,
+    ref: resourceRef('GET /y'),
+  },
+  payerSig: '0x' as Hex,
+  mandateDigest: ('0x' + digest.repeat(32)) as Hex,
+  httpStatus: 200,
+  status: 'enqueued',
+  ...over,
+});
+
 describe('Ledger', () => {
   it('appends, reads back, and patches status by digest', () => {
     const ledger = new Ledger(join(root, 'ledger-unit', 'ledger.jsonl'));
-    const entry = {
-      kind: 'payment',
-      timestamp: 1,
-      url: 'http://x/y',
-      host: 'x',
-      resource: 'GET /y',
-      network: NETWORK,
-      asset: TOKEN,
-      amount: '5',
-      payer: payerAccount.address,
-      payee: strangerAddress,
-      walletContract: WALLET,
-      intentMandateId: 'im_1',
-      mandate: {
-        owner: payerAccount.address,
-        token: TOKEN,
-        payee: strangerAddress,
-        amount: '5',
-        nonce: '1',
-        deadline: 2,
-        ref: resourceRef('GET /y'),
-      },
-      payerSig: '0x' as Hex,
-      mandateDigest: ('0x' + 'ab'.repeat(32)) as Hex,
-      httpStatus: 200,
-      status: 'enqueued',
-    } satisfies LedgerEntry;
+    const entry = ledgerEntry('ab');
     expect(ledger.read()).toEqual([]);
     ledger.append(entry);
-    ledger.append({ ...entry, mandateDigest: ('0x' + 'cd'.repeat(32)) as Hex });
+    ledger.append(ledgerEntry('cd'));
     expect(ledger.read()).toHaveLength(2);
     ledger.updateStatus(entry.mandateDigest, 'settled', { settledTx: ('0x' + '01'.repeat(32)) as Hex });
     const [a, b] = ledger.read();
@@ -182,6 +185,77 @@ describe('Ledger', () => {
     expect(a.settledTx).toBe('0x' + '01'.repeat(32));
     expect(b.status).toBe('enqueued');
     expect(() => ledger.updateStatus(('0x' + 'ee'.repeat(32)) as Hex, 'settled')).toThrow(/no ledger entry/);
+  });
+
+  it('updateStatus leaves no .tmp behind (the tmp+fsync+rename sequence itself is pinned in ledger-durable.test.ts)', () => {
+    const dir = join(root, 'ledger-atomic');
+    const ledger = new Ledger(join(dir, 'ledger.jsonl'));
+    const entry = ledgerEntry('ab');
+    ledger.append(entry);
+    ledger.updateStatus(entry.mandateDigest, 'settled');
+    ledger.updateStatus(entry.mandateDigest, 'expired-unused');
+    expect(readdirSync(dir)).toEqual(['ledger.jsonl']);
+    expect(ledger.read().map((e) => e.status)).toEqual(['expired-unused']);
+  });
+
+  it('ignores a truncated last line on read; append() drops it and keeps appending cleanly', () => {
+    const path = join(root, 'ledger-truncated', 'ledger.jsonl');
+    const w = new Ledger(path);
+    const a = ledgerEntry('ab');
+    w.append(a);
+    const torn = '{"kind":"payment","mandateDigest":"0x00","status":"enq';
+    appendFileSync(path, torn, 'utf8'); // crash mid-append
+    const asLeft = readFileSync(path, 'utf8');
+
+    // A plain reader (report(), reconcile(), the constructor's rebuild) sees the
+    // complete lines and leaves the file alone: it could be another process's
+    // append still in progress.
+    const warnings: string[] = [];
+    const r = new Ledger(path, (line) => warnings.push(line));
+    expect(r.read()).toEqual([a]);
+    expect(warnings.join('\n')).toMatch(/ignoring truncated last line/);
+    expect(readFileSync(path, 'utf8')).toBe(asLeft);
+
+    // fetch() appends before it ever read: the torn tail must not swallow the new line
+    const b = ledgerEntry('cd');
+    const repairs: string[] = [];
+    new Ledger(path, (line) => repairs.push(line)).append(b);
+    expect(repairs.join('\n')).toMatch(/dropped truncated last line/);
+    expect(new Ledger(path).read()).toEqual([a, b]);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3); // 2 lines + trailing newline
+
+    // updateStatus() rewrites only what parsed, so a torn tail goes away with it
+    appendFileSync(path, torn, 'utf8');
+    r.updateStatus(a.mandateDigest, 'settled');
+    expect(new Ledger(path).read().map((e) => e.status)).toEqual(['settled', 'enqueued']);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3);
+  });
+
+  it('keeps a complete but unterminated last line', () => {
+    const path = join(root, 'ledger-unterminated', 'ledger.jsonl');
+    const a = ledgerEntry('ab');
+    new Ledger(path).append(a); // creates the directory
+    writeFileSync(path, JSON.stringify(a), 'utf8'); // no trailing newline
+    const warnings: string[] = [];
+    expect(new Ledger(path, (line) => warnings.push(line)).read()).toEqual([a]);
+    expect(warnings).toEqual([]);
+    expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(false); // a reader leaves the file alone
+    // append() terminates it instead of gluing the next line on
+    const b = ledgerEntry('cd');
+    new Ledger(path).append(b);
+    expect(new Ledger(path).read()).toEqual([a, b]);
+    expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3);
+  });
+
+  it('refuses a corrupt line that is not the last one', () => {
+    const path = join(root, 'ledger-corrupt', 'ledger.jsonl');
+    const a = ledgerEntry('ab');
+    new Ledger(path).append(a);
+    writeFileSync(path, `${JSON.stringify(a)}\n{"kind":"pay\n${JSON.stringify(ledgerEntry('cd'))}\n`, 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 2/);
+    expect(() => new Ledger(path).updateStatus(a.mandateDigest, 'settled')).toThrow(/malformed ledger line 2/);
+    writeFileSync(path, '42\n', 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 1 .*not an object/);
   });
 });
 
@@ -212,6 +286,15 @@ describe('IntentMandateStore', () => {
     expect(readdirSync(join(root, 'store-unit')).filter((f) => f.endsWith('.tmp'))).toEqual([]);
     expect(new IntentMandateStore(path).get('im_test')).toEqual(m);
     expect(new IntentMandateStore().list()).toEqual([]); // memory store
+  });
+
+  it('refuses a store file written by another version', () => {
+    const path = join(root, 'store-version', 'mandates.json');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 2, mandates: [] }), 'utf8');
+    expect(() => new IntentMandateStore(path)).toThrow(/unsupported mandate store version 2/);
+    writeFileSync(path, JSON.stringify({ mandates: [] }), 'utf8'); // no version at all is still version 1
+    expect(new IntentMandateStore(path).list()).toEqual([]);
   });
 });
 
@@ -572,6 +655,7 @@ describe('payment happy path + budget accounting', () => {
     expect(e).toMatchObject({
       kind: 'payment',
       timestamp: t,
+      signedAt: t,
       url: `${s.url}/predict?symbol=ETH`,
       host: new URL(s.url).host,
       resource: 'GET /predict',
@@ -664,6 +748,24 @@ describe('payment happy path + budget accounting', () => {
     await approved(wallet);
     expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
     expect(s.mandates[0].mandate.deadline).toBe(t + 150); // min(120 + 60, 150)
+  });
+
+  it('signedAt is the signing time and survives the status update; timestamp moves with it', async () => {
+    const s = await serve();
+    let t = nowSec();
+    const { wallet, ledgerPath } = makeWallet({
+      now: () => t,
+      fetch: async (input, init) => {
+        const res = await globalThis.fetch(input, init);
+        if (new Headers(init?.headers).has(HEADER.signature)) t += 5; // the paid round trip took a while
+        return res;
+      },
+    });
+    await approved(wallet);
+    const signed = t;
+    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
+    const [e] = readLedger(ledgerPath);
+    expect(e).toMatchObject({ status: 'enqueued', signedAt: signed, timestamp: signed + 5 });
   });
 });
 
@@ -832,6 +934,79 @@ describe('concurrency', () => {
     expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: String(1000 * (N - 1)), pendingSpentAmount: '0' });
     expect(wallet.remaining(m.id)).toBe(0n);
     expect(s.served).toBe(N - 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('budget counters are rebuilt from the ledger on load', () => {
+  it('A: crash after the spend was committed, before the ledger left in_flight -> X counted once, as pending', async () => {
+    const s = await serve();
+    const { wallet, mandatesPath, ledgerPath } = makeWallet();
+    const m = await approved(wallet);
+    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
+    // Put the ledger line back to what fetch() wrote right after signing: the
+    // state a crash between adjustBudget() and record() leaves behind.
+    const [e] = readLedger(ledgerPath);
+    new Ledger(ledgerPath).updateStatus(e.mandateDigest, 'unknown', { httpStatus: 0, error: 'in_flight', spReceipt: undefined });
+
+    const lines: string[] = [];
+    const again = makeWallet({ mandatesPath, ledgerPath, log: (l) => lines.push(l) }).wallet;
+    expect(again.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
+    expect(again.remaining(m.id)).toBe(999_000n);
+    expect(lines).toEqual([expect.stringContaining(`${m.id}: counters rebuilt from the ledger (spent 1000 -> 0, pending 0 -> 1000)`)]);
+    expect(new IntentMandateStore(mandatesPath).get(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' }); // saved
+    expect(again.report().totals).toMatchObject({ spent: '0', pending: '1000', unknown: 1 });
+  });
+
+  it('B: crash after the reservation, before the ledger line -> the phantom reservation is released', async () => {
+    const { wallet, mandatesPath, ledgerPath } = makeWallet();
+    const m = await approved(wallet);
+    const store = new IntentMandateStore(mandatesPath);
+    store.upsert({ ...store.get(m.id)!, pendingSpentAmount: '1000' });
+    store.save();
+    expect(existsSync(ledgerPath)).toBe(false);
+
+    const lines: string[] = [];
+    const again = makeWallet({ mandatesPath, ledgerPath, log: (l) => lines.push(l) }).wallet;
+    expect(again.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '0' });
+    expect(again.remaining(m.id)).toBe(1_000_000n);
+    expect(lines).toEqual([expect.stringContaining('pending 1000 -> 0')]);
+  });
+
+  it('classifies every status: rejected and in-flight hold the reservation, enqueued/settled/unknown-2xx are spent, expired-unused is neither', async () => {
+    const { wallet, mandatesPath, ledgerPath } = makeWallet();
+    const m = await approved(wallet);
+    const l = new Ledger(ledgerPath);
+    l.append(ledgerEntry('01', { intentMandateId: m.id, amount: '1', status: 'rejected', httpStatus: 402 }));
+    l.append(ledgerEntry('02', { intentMandateId: m.id, amount: '2', status: 'unknown', httpStatus: 0, error: 'in_flight' }));
+    l.append(ledgerEntry('03', { intentMandateId: m.id, amount: '4', status: 'enqueued', httpStatus: 200 }));
+    l.append(ledgerEntry('04', { intentMandateId: m.id, amount: '8', status: 'settled', httpStatus: 200 }));
+    l.append(ledgerEntry('05', { intentMandateId: m.id, amount: '16', status: 'unknown', httpStatus: 200, error: 'missing sp receipt' }));
+    l.append(ledgerEntry('06', { intentMandateId: m.id, amount: '32', status: 'expired-unused', httpStatus: 200 }));
+    l.append(ledgerEntry('07', { intentMandateId: m.id, amount: '64', status: 'enqueued', httpStatus: 409, error: 'replay; sp status pending' }));
+    l.append(ledgerEntry('08', { intentMandateId: 'im_gone', amount: '128', status: 'enqueued', httpStatus: 200 })); // not in the store: ignored
+    // SP defaults: a line written before the flag existed (legacy error prefix only) and a flagged one
+    l.append(ledgerEntry('09', { intentMandateId: m.id, amount: '256', status: 'expired-unused', httpStatus: 200, error: 'sp_default: legacy line' }));
+    l.append(ledgerEntry('0a', { intentMandateId: m.id, amount: '512', status: 'expired-unused', httpStatus: 200, spDefault: true, error: 'anything' }));
+    const again = makeWallet({ mandatesPath, ledgerPath }).wallet;
+    expect(again.getMandate(m.id)).toMatchObject({ pendingSpentAmount: '3', spentAmount: '92' });
+    expect(again.listMandates().map((x) => x.id)).toEqual([m.id]);
+    expect(again.report().totals).toMatchObject({ expiredUnused: 3, spDefaults: 2 });
+  });
+
+  it('counters that already agree are left alone: nothing logged, nothing rewritten', async () => {
+    const s = await serve();
+    const { wallet, mandatesPath, ledgerPath } = makeWallet();
+    const m = await approved(wallet);
+    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
+    const file = readFileSync(mandatesPath, 'utf8');
+    const lines: string[] = [];
+    const again = makeWallet({ mandatesPath, ledgerPath, log: (l) => lines.push(l) }).wallet;
+    expect(lines).toEqual([]);
+    expect(readFileSync(mandatesPath, 'utf8')).toBe(file);
+    expect(again.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
   });
 });
 

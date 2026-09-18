@@ -13,6 +13,7 @@ export interface DemoSpOptions {
   wallet: Address;
   usdc: Address;
   port: number;
+  /** Queue file; ':memory:' for none. Omitted, @agentpay/sp falls back to its own packages/sp/data/ file. */
   storePath?: string;
   settleWindowSeconds: number;
   /** 0 = only settle when tick() is called (deterministic demo); production uses an interval. */

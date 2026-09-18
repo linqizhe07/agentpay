@@ -1,6 +1,6 @@
 // vitest globalSetup: spawns a dedicated hardhat node on port 8547 (cwd =
 // contracts/, so its hardhat.config.cjs applies), deploys MockUSDC +
-// AEP2DebitWallet(withdrawDelay 600) from the committed bytecode, mints test
+// AEP2DebitWallet(withdrawDelay 900) from the committed bytecode, mints test
 // USDC to the payer and stranger accounts and provides the addresses to the
 // test workers. A node already answering on the port is reused and left alone.
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -15,7 +15,7 @@ import { MOCK_USDC_ABI, deployAll } from '@agentpay/contracts';
 const RPC_PORT = 8547;
 const RPC_URL = `http://127.0.0.1:${RPC_PORT}`;
 const CONTRACTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'contracts');
-const WITHDRAW_DELAY = 600;
+const WITHDRAW_DELAY = 900; // SETTLE_WINDOW (600) + more than the startup margin
 
 // Hardhat's PUBLIC dev-mnemonic accounts — never real funds.
 const DEPLOYER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';

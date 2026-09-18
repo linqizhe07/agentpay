@@ -135,7 +135,7 @@ async function setup(): Promise<Env> {
     ledgerPath: resolve(OUT_DIR, 'ledger.jsonl'),
   });
   await agent.deposit(parseUnits('10', 6));
-  await agent.authorizeSP(DEV.sp.address, true);
+  await agent.authorizeSP(DEV.sp.address);
   log(`agent ${short(agent.address)} deposited $10 and authorized the SP; debitable ${formatUsdc(await agent.debitable())}`);
 
   const budget = await agent.createIntentMandate(
@@ -267,7 +267,7 @@ async function scenarioSpReject(env: Env): Promise<void> {
   let body = (await res.json()) as { error?: string };
   check(res.status === 402 && (body.error ?? '').startsWith('settlement_unavailable') && (body.error ?? '').includes('sp_not_authorized'), `stranger never authorized the SP -> ${res.status} ${body.error}`);
 
-  await stranger.authorizeSP(DEV.sp.address, true);
+  await stranger.authorizeSP(DEV.sp.address);
   res = await analyze(stranger);
   body = (await res.json()) as { error?: string };
   check(res.status === 402 && (body.error ?? '').includes('insufficient_balance'), `authorized but never deposited -> ${res.status} ${body.error}`);
@@ -384,6 +384,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log('ALL SCENARIO ASSERTIONS PASSED');
+  // Exit explicitly once stdout has drained: the failure paths already do, and a
+  // handle left open by a stopped child must not keep a passed run hanging
+  // (the e2e test waits for this process to close, not for the line above).
+  process.stdout.write('', () => process.exit(0));
 }
 
 main().catch((err) => {

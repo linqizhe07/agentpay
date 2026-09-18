@@ -1,6 +1,7 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Address, Hex, Mandate, SpReceipt } from '@agentpay/core';
+import { appendDurableSync, replaceDurableSync } from './durable.js';
 
 /**
  * One payer-side record of a signed mandate that left the wallet: the full
@@ -11,6 +12,12 @@ export interface LedgerEntry {
   kind: 'payment';
   /** Unix seconds, written by the wallet at record time. */
   timestamp: number;
+  /**
+   * Unix seconds at which the wallet signed the mandate. Written with the
+   * in_flight line and never patched afterwards (`timestamp` moves with every
+   * status update). Absent on lines written before the field existed.
+   */
+  signedAt?: number;
   /** Full URL actually called. */
   url: string;
   /** `url.host` (hostname plus port when non-default). */
@@ -41,39 +48,94 @@ export interface LedgerEntry {
     | 'expired-unused'; // reconcile(): deadline passed without any on-chain use
   settledTx?: Hex;
   error?: string;
+  /** reconcile(): the SP receipted this mandate and let it expire unused (an SP default). */
+  spDefault?: true;
+}
+
+function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (err) {
+    throw new Error(`malformed ledger line ${lineNo} in ${path}: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null) throw new Error(`malformed ledger line ${lineNo} in ${path}: not an object`);
+  return parsed as LedgerEntry;
 }
 
 /**
  * Append-only JSONL ledger (one JSON object per line). `updateStatus` is the
- * single sanctioned mutation and rewrites the file in place.
+ * single sanctioned mutation and rewrites the file through a temp file plus
+ * rename, so a crash mid-rewrite leaves the old ledger or the new one, never a
+ * torn one. Only a truncated LAST line (an append cut short by a crash) is
+ * tolerated: `read()` ignores it, and the write paths get rid of it (`append()`
+ * truncates it away before writing so it never glues a new line onto it;
+ * `updateStatus()` rewrites the file without it). A reader never modifies the
+ * file, so `report()` in a second process cannot destroy an append the wallet
+ * process is in the middle of. Any other malformed line throws.
+ *
+ * Every write is fsynced: since the budget counters are rebuilt from this file
+ * on load, a line lost to a power cut is not a stale report but a mandate that
+ * no longer counts against its limit.
  */
 export class Ledger {
-  constructor(public readonly path: string) {}
+  private writeSeq = 0;
+
+  constructor(
+    public readonly path: string,
+    private readonly log: (line: string) => void = () => {},
+  ) {}
 
   append(entry: LedgerEntry): void {
     const dir = dirname(this.path);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
-    appendFileSync(this.path, `${JSON.stringify(entry)}\n`, 'utf8');
+    this.repairTail();
+    appendDurableSync(this.path, `${JSON.stringify(entry)}\n`);
   }
 
-  /** Returns [] when the file does not exist yet. Throws on malformed lines. */
-  read(): LedgerEntry[] {
+  /**
+   * Returns [] when the file does not exist yet. Throws on malformed lines,
+   * except for a line without its newline at the very end: a complete one (a
+   * foreign writer forgot to terminate it) is kept, a torn one is ignored.
+   * Only with `repair` (the append path) is the file touched: the complete
+   * line is terminated, the torn one truncated back to the last newline.
+   */
+  read(opts: { repair?: boolean } = {}): LedgerEntry[] {
     if (!existsSync(this.path)) return [];
-    const lines = readFileSync(this.path, 'utf8').split('\n');
+    const text = readFileSync(this.path, 'utf8');
+    const lastNewline = text.lastIndexOf('\n');
+    const complete = lastNewline === -1 ? '' : text.slice(0, lastNewline + 1);
+    const tail = text.slice(lastNewline + 1);
+
+    const lines = complete.split('\n');
     const entries: LedgerEntry[] = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
+      entries.push(parseEntry(line, i + 1, this.path));
+    }
+
+    if (tail.trim()) {
+      let entry: LedgerEntry | undefined;
       try {
-        entries.push(JSON.parse(line) as LedgerEntry);
-      } catch (err) {
-        throw new Error(`malformed ledger line ${i + 1} in ${this.path}: ${(err as Error).message}`);
+        entry = parseEntry(tail.trim(), lines.length, this.path);
+      } catch {
+        entry = undefined;
+      }
+      if (entry) {
+        entries.push(entry);
+        if (opts.repair) appendFileSync(this.path, '\n', 'utf8');
+      } else if (opts.repair) {
+        truncateSync(this.path, Buffer.byteLength(complete, 'utf8'));
+        this.log(`wallet: ledger ${this.path}: dropped truncated last line (${tail.length} chars)`);
+      } else {
+        this.log(`wallet: ledger ${this.path}: ignoring truncated last line (${tail.length} chars; dropped on the next append)`);
       }
     }
     return entries;
   }
 
-  /** Updates every entry with this mandate digest (status plus optional extra fields); rewrites the file. */
+  /** Updates every entry with this mandate digest (status plus optional extra fields); rewrites the file atomically. */
   updateStatus(digest: Hex, status: LedgerEntry['status'], patch?: Partial<LedgerEntry>): void {
     const entries = this.read();
     let hit = false;
@@ -84,6 +146,29 @@ export class Ledger {
       }
     }
     if (!hit) throw new Error(`no ledger entry with mandateDigest ${digest} in ${this.path}`);
-    writeFileSync(this.path, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`, 'utf8');
+    const tmp = `${this.path}.${process.pid}.${++this.writeSeq}.tmp`;
+    replaceDurableSync(this.path, tmp, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  }
+
+  /**
+   * Makes sure the file is absent, empty, or newline-terminated before an
+   * append, so a torn last line never gets a new line glued onto it. The common
+   * case costs one stat and one byte; only an unterminated tail takes the full
+   * read() path (keep and terminate a complete line, drop a torn one). This is
+   * the one place a torn tail is truncated: `updateStatus()` drops it by
+   * rewriting the whole file, and plain readers leave the file alone.
+   */
+  private repairTail(): void {
+    if (!existsSync(this.path)) return;
+    const { size } = statSync(this.path);
+    if (size === 0) return;
+    const last = Buffer.alloc(1);
+    const fd = openSync(this.path, 'r');
+    try {
+      readSync(fd, last, 0, 1, size - 1);
+    } finally {
+      closeSync(fd);
+    }
+    if (last[0] !== 0x0a) this.read({ repair: true });
   }
 }

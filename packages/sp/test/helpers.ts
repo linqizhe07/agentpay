@@ -26,7 +26,7 @@ import {
   type Mandate,
   type MandateDomain,
 } from '@agentpay/core';
-import { createSP, type SPConfig, type SPHandle } from '../src/index.js';
+import { MEMORY_STORE_PATH, createSP, type SPConfig, type SPHandle } from '../src/index.js';
 
 // Hardhat's PUBLIC dev-mnemonic accounts — never real funds.
 // 0 deployer, 1 payer, 2 payee, 3 settlement processor, 4 stranger.
@@ -125,16 +125,26 @@ export async function deposit(account: Signer, amount: bigint): Promise<void> {
   );
 }
 
-export async function authorize(account: Signer, sp: Address, enabled = true): Promise<void> {
+export async function authorize(account: Signer, sp: Address): Promise<void> {
   const f = fixture();
   await mined(
-    await walletFor(account).writeContract({
-      address: f.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'authorizeSP',
-      args: [sp, enabled],
-    }),
+    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'authorizeSP', args: [sp] }),
   );
+}
+
+/** revokeSP from `account`; returns the scheduled revokeAt (unix seconds). */
+export async function revoke(account: Signer, sp: Address): Promise<number> {
+  const f = fixture();
+  await mined(
+    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'revokeSP', args: [sp] }),
+  );
+  const [, revokeAt] = await publicClient().readContract({
+    address: f.wallet,
+    abi: AEP2_DEBIT_WALLET_ABI,
+    functionName: 'authorizationOf',
+    args: [account.address, sp],
+  });
+  return Number(revokeAt);
 }
 
 /** mint + deposit + authorizeSP: a payer ready to be settled by `sp`. */
@@ -230,6 +240,7 @@ export function mkSP(over: Partial<SPConfig> = {}): SPHandle {
     wallet: f.wallet,
     tokens: [f.usdc],
     port: 0,
+    storePath: MEMORY_STORE_PATH, // the default would be the package's data/ file
     batchIntervalMs: 0,
     settleWindowSeconds: SETTLE_WINDOW,
     pollingIntervalMs: 50,
@@ -238,7 +249,6 @@ export function mkSP(over: Partial<SPConfig> = {}): SPHandle {
   });
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface Reply<T = any> {
   status: number;
   json: T;

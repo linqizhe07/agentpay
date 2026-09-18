@@ -9,7 +9,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
 import { AEP2_DEBIT_WALLET_ABI, MOCK_USDC_ABI } from '@agentpay/contracts';
 import { mandateToTuple } from '@agentpay/core';
-import { MandateWallet, type LedgerEntry } from '../src/index.js';
+import { Ledger, MandateWallet, type LedgerEntry } from '../src/index.js';
 import type { ChainFixture } from './global-setup.js';
 import { KEYS, startStubPayee, type StubPayee } from './stub-payee.js';
 
@@ -65,14 +65,33 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
     expect(await usdcBalance(fx.wallet)).toBe(5_000_000n);
   });
 
-  it('authorizeSP / isSpAuthorized round trip', async () => {
+  it('authorizeSP / revokeSP / cancelRevokeSP / authorizationOf round trip', async () => {
     expect(await wallet.isSpAuthorized(sp.address)).toBe(false);
+    expect(await wallet.authorizationOf(sp.address)).toEqual({ enabled: false, revokeAt: 0 });
+    await expect(wallet.revokeSP(sp.address)).rejects.toThrow(/BadParams/); // nothing to revoke
     await wallet.authorizeSP(sp.address);
     expect(await wallet.isSpAuthorized(sp.address)).toBe(true);
-    await wallet.authorizeSP(sp.address, false);
-    expect(await wallet.isSpAuthorized(sp.address)).toBe(false);
-    await wallet.authorizeSP(sp.address, true);
+    expect(await wallet.authorizationOf(sp.address)).toEqual({ enabled: true, revokeAt: 0 });
+
+    // A revocation is scheduled withdrawDelay out; until then the SP stays authorized.
+    await wallet.revokeSP(sp.address);
+    const revokeAt = (await chainNow()) + fx.withdrawDelay;
+    expect(await wallet.authorizationOf(sp.address)).toEqual({ enabled: true, revokeAt });
     expect(await wallet.isSpAuthorized(sp.address)).toBe(true);
+    await wallet.cancelRevokeSP(sp.address);
+    expect(await wallet.authorizationOf(sp.address)).toEqual({ enabled: true, revokeAt: 0 });
+    await expect(wallet.cancelRevokeSP(sp.address)).rejects.toThrow(/BadParams/); // nothing pending
+
+    // Once it takes effect the SP is out; authorizeSP is the way back and clears revokeAt.
+    await wallet.revokeSP(sp.address);
+    await testClient.increaseTime({ seconds: fx.withdrawDelay + 1 });
+    await testClient.mine({ blocks: 1 });
+    expect(await wallet.isSpAuthorized(sp.address)).toBe(false);
+    expect((await wallet.authorizationOf(sp.address)).revokeAt).toBeGreaterThan(0);
+    await expect(wallet.cancelRevokeSP(sp.address)).rejects.toThrow(/BadParams/); // too late to cancel
+    await wallet.authorizeSP(sp.address);
+    expect(await wallet.isSpAuthorized(sp.address)).toBe(true);
+    expect(await wallet.authorizationOf(sp.address)).toEqual({ enabled: true, revokeAt: 0 });
   });
 
   it('a wallet configured for another network refuses to transact against this RPC', async () => {
@@ -122,7 +141,10 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
   });
 
   it('reconcile(): settled out-of-band (with tx) vs expired unused (budget released) vs still pending', async () => {
-    let t = Math.floor(Date.now() / 1000);
+    // The wallet and the stub payees share one clock seeded from the chain, which
+    // the tests above moved well past the wall clock: mandates signed off the wall
+    // clock would already be expired on-chain.
+    let t = await chainNow();
     const w = new MandateWallet({
       key: KEYS.payer,
       rpcUrl: fx.rpcUrl,
@@ -137,8 +159,8 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
       { naturalLanguage: 'reconcile test', limitAmount: '$1', validForSeconds: 86_400, hostAllowlist: ['127.0.0.1'] },
       { approve: true },
     );
-    const base = { payeeKey: KEYS.payee, spKey: KEYS.sp, wallet: fx.wallet, token: fx.usdc, network: NETWORK, price: PRICE };
-    // long window: deadline t + 3660 (the chain clock is already ~20 min ahead of the wallet clock from the withdraw test)
+    const base = { payeeKey: KEYS.payee, spKey: KEYS.sp, wallet: fx.wallet, token: fx.usdc, network: NETWORK, price: PRICE, now: () => t };
+    // long window: deadline t + 3660
     const longA = await startStubPayee({ ...base, settleWindowSeconds: 3600 });
     const longC = await startStubPayee({ ...base, settleWindowSeconds: 3600 });
     // short window: deadline t + 120
@@ -244,5 +266,121 @@ describe.skipIf(SKIP)('MandateWallet on hardhat', () => {
     expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '3000', pendingSpentAmount: '0' });
     const settledHashes = third.settled as Hex[];
     expect(settledHashes).toHaveLength(1);
+  });
+
+  it('reconcile(): an expiry the payer caused by revoking the SP is payer_revoked, not sp_default', async () => {
+    let t = await chainNow();
+    const w = new MandateWallet({
+      key: KEYS.payer,
+      rpcUrl: fx.rpcUrl,
+      walletContract: fx.wallet,
+      token: fx.usdc,
+      network: NETWORK,
+      mandatesPath: join(dir, 'mandates-revoked.json'),
+      ledgerPath: join(dir, 'ledger-revoked.jsonl'),
+      now: () => t,
+    });
+    const im = await w.createIntentMandate(
+      { naturalLanguage: 'revocation test', limitAmount: '$1', validForSeconds: 86_400, hostAllowlist: ['127.0.0.1'] },
+      { approve: true },
+    );
+    const short = await startStubPayee({
+      payeeKey: KEYS.payee,
+      spKey: KEYS.sp,
+      wallet: fx.wallet,
+      token: fx.usdc,
+      network: NETWORK,
+      price: PRICE,
+      settleWindowSeconds: 60,
+      now: () => t,
+    });
+    servers.push(short);
+
+    // F: receipted (promise t + 60) while the SP is authorized for that whole window.
+    expect((await w.fetch(`${short.url}/predict`)).status).toBe(200);
+    await w.revokeSP(sp.address);
+    const { revokeAt } = await w.authorizationOf(sp.address);
+    expect(revokeAt).toBeGreaterThan(t + 60);
+    // G: receipted so that its promise ends exactly at revokeAt (enqueueDeadline =
+    // min(t + 120, t + 60) = revokeAt): the boundary case. The authorization is
+    // strict (block.timestamp < revokeAt) while the receipt covers enqueueDeadline
+    // inclusive, so at equality the promise's last second was never keepable and
+    // revokedBy() must say so with `<=`, not `<`. A compliant SP refuses this with
+    // sp_revocation_pending; the stub receipts anyway, which is exactly the
+    // receipt the SP cannot be blamed for.
+    t = revokeAt - 60;
+    expect((await w.fetch(`${short.url}/predict`)).status).toBe(200);
+    const [F, G] = readFileSync(join(dir, 'ledger-revoked.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as LedgerEntry);
+    expect([F.status, G.status]).toEqual(['enqueued', 'enqueued']);
+    expect(G.spReceipt?.enqueueDeadline).toBe(revokeAt);
+    expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '2000', pendingSpentAmount: '0' });
+
+    // Neither settles; both expire (deadline + grace).
+    t += 181;
+    expect(await w.reconcile()).toEqual({ settled: [], expiredUnused: [F.mandateDigest, G.mandateDigest], stillPending: [] });
+    const after = Object.fromEntries(
+      readFileSync(join(dir, 'ledger-revoked.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as LedgerEntry)
+        .map((e) => [e.mandateDigest, e]),
+    );
+    expect(after[F.mandateDigest]).toMatchObject({ status: 'expired-unused', spDefault: true, error: expect.stringMatching(/^sp_default/) });
+    expect(after[G.mandateDigest]).toMatchObject({ status: 'expired-unused', error: expect.stringMatching(/^payer_revoked/) });
+    expect(after[G.mandateDigest].spDefault).toBeUndefined();
+    // Both budgets come back; only F counts as an SP default.
+    expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '0' });
+    expect(w.report().totals).toMatchObject({ expiredUnused: 2, spDefaults: 1 });
+    await w.cancelRevokeSP(sp.address); // leave the SP authorized (the chain never reached revokeAt)
+  });
+
+  it('a crash between the spend commit and the ledger update: the next load counts X once, and so does reconcile() once the SP settled it', async () => {
+    let t = await chainNow();
+    const paths = { mandatesPath: join(dir, 'mandates-crash.json'), ledgerPath: join(dir, 'ledger-crash.jsonl') };
+    const make = () =>
+      new MandateWallet({ key: KEYS.payer, rpcUrl: fx.rpcUrl, walletContract: fx.wallet, token: fx.usdc, network: NETWORK, ...paths, now: () => t });
+    const w = make();
+    const im = await w.createIntentMandate(
+      { naturalLanguage: 'crash test', limitAmount: '$1', validForSeconds: 86_400, hostAllowlist: ['127.0.0.1'] },
+      { approve: true },
+    );
+    const payee = await startStubPayee({
+      payeeKey: KEYS.payee,
+      spKey: KEYS.sp,
+      wallet: fx.wallet,
+      token: fx.usdc,
+      network: NETWORK,
+      price: PRICE,
+      settleWindowSeconds: 3600,
+      now: () => t,
+    });
+    servers.push(payee);
+    expect((await w.fetch(`${payee.url}/predict`)).status).toBe(200);
+    expect(w.getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
+
+    // The wallet "crashed" right after committing the spend: mandates.json says
+    // spent X, the ledger still says in_flight. Meanwhile the SP settles X.
+    const [X] = new Ledger(paths.ledgerPath).read();
+    new Ledger(paths.ledgerPath).updateStatus(X.mandateDigest, 'unknown', { httpStatus: 0, error: 'in_flight', spReceipt: undefined });
+    const hash = await spClient.writeContract({
+      address: fx.wallet,
+      abi: AEP2_DEBIT_WALLET_ABI,
+      functionName: 'settle',
+      args: [mandateToTuple(X.mandate), X.payerSig],
+      chain: hardhat,
+      account: sp,
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+
+    const again = make();
+    expect(again.getMandate(im.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' }); // X once, as pending
+    expect(await again.reconcile()).toEqual({ settled: [X.mandateDigest], expiredUnused: [], stillPending: [] });
+    expect(again.getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' }); // X once, as spent
+    expect(again.remaining(im.id)).toBe(999_000n);
+    expect(new Ledger(paths.ledgerPath).read()[0]).toMatchObject({ status: 'settled', settledTx: hash, signedAt: X.signedAt });
+    expect(make().getMandate(im.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' }); // and the rebuild agrees
   });
 });
