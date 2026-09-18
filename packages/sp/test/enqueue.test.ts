@@ -273,6 +273,33 @@ describe('POST /enqueue', () => {
     expect((await enqueue(sp, await signed({ amount: USDC('0.2').toString() }, payer))).status).toBe(200);
   });
 
+  it('admits exactly what the balance covers when enqueues race: 6 x $0.3 against $1 is 3 receipts + 3 x 402', async () => {
+    const payer = extraAccount(10);
+    await fund(payer, USDC('1'), sp.address);
+    const mandates = await Promise.all(Array.from({ length: 6 }, () => signed({ amount: USDC('0.3').toString() }, payer)));
+    // All six read the same debitable balance ($1) before any of them is admitted;
+    // only the synchronous claim keeps the fourth from also passing the funds check.
+    const replies = await Promise.all(mandates.map((s) => enqueue(sp, s)));
+    const admitted = replies.filter((r) => r.status === 200);
+    const refused = replies.filter((r) => r.status !== 200);
+    expect(admitted).toHaveLength(3);
+    expect(refused).toHaveLength(3);
+    for (const r of refused) expectError(r, 402, 'insufficient_balance');
+    expect(sp.store.reserved(payer.address, fixture().usdc)).toBe(USDC('0.9'));
+    expect(mandates.filter((s) => sp.store.has(s.digest))).toHaveLength(3);
+  });
+
+  it('answers concurrent enqueues of one mandate with a single record and the same receipt', async () => {
+    const s = await signed();
+    const size = sp.store.size;
+    const replies = await Promise.all([enqueue(sp, s), enqueue(sp, s), enqueue(sp, s)]);
+    for (const r of replies) expect(r.status).toBe(200);
+    expect(replies.filter((r) => r.json.created === true)).toHaveLength(1);
+    expect(new Set(replies.map((r) => r.json.receipt.spEnqueueSig)).size).toBe(1);
+    expect(new Set(replies.map((r) => r.json.enqueuedAt)).size).toBe(1);
+    expect(sp.store.size).toBe(size + 1);
+  });
+
   it('409 mandate_terminal once a record reached a terminal state', async () => {
     const s = await signed();
     expect((await enqueue(sp, s)).status).toBe(200);

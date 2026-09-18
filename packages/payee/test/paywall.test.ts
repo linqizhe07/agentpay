@@ -392,6 +392,24 @@ describe('createMandatePaywall (offline, verifyOnChain: false)', () => {
     expect(stub.calls).toHaveLength(calls0);
   });
 
+  it('delivers exactly once when two requests carrying the same mandate race: one 200, one 409 replay', async () => {
+    const offer = await getOffer(base, '/predict');
+    const served0 = served.predict;
+    const calls0 = stub.calls.length;
+    const signed = await signFor(domain, offer);
+    const header = x402Header(offer, signed.payload);
+
+    const replies = await Promise.all([call(base, '/predict', { header }), call(base, '/predict', { header })]);
+    expect(replies.map((r) => r.status).sort()).toEqual([200, 409]);
+    const ok = replies.find((r) => r.status === 200)!;
+    const replay = replies.find((r) => r.status === 409)!;
+    expect(readSettlement(ok).mandateDigest).toBe(signed.digest);
+    await ok.arrayBuffer();
+    expect((await replay.json()) as { error: string; mandateDigest: string }).toMatchObject({ error: 'replay', mandateDigest: signed.digest });
+    expect(served.predict).toBe(served0 + 1);
+    expect(stub.calls).toHaveLength(calls0 + 1);
+  });
+
   // ------------------------------------------------------------- legacy header
 
   it('accepts the legacy X-Payment-Mandate header (no offer echo to check)', async () => {
