@@ -1,0 +1,12 @@
+{
+  "chainId": 84532,
+  "network": "eip155:84532",
+  "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "usdcDomain": {
+    "name": "USDC",
+    "version": "2"
+  },
+  "facilitatorUrl": "https://x402.org/facilitator",
+  "deployedAt": "2026-09-19T00:00:00.000Z",
+  "note": "Circle's Base Sepolia testnet USDC (FiatTokenV2_2). Nothing of this repo is deployed on Base Sepolia: the payer holds USDC in its EOA and the facilitator settles EIP-3009 authorizations against this token. usdcDomain was checked on 2026-09-19 against the token's DOMAIN_SEPARATOR() (0x71f17a3b2ff373b803d70a5a07c046c1a2bc8e89c09ef722fcb047abe94c9818)."
+}
