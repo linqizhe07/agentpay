@@ -6,5 +6,4 @@ cache/
 .env
 .DS_Store
 demo/out/
-packages/sp/data/
 packages/contracts/deployments/localhost.json

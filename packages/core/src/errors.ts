@@ -19,8 +19,8 @@ export type PolicyReason =
   | 'host_not_allowed'
   | 'per_call_max'
   | 'rate_limited'
-  | 'sp_not_trusted'
   | 'unsupported_offer'
+  | 'timeout_too_long'
   | (string & {});
 
 /** A spend-policy rule blocked an action before any signature was produced. */
@@ -35,39 +35,35 @@ export class PolicyViolation extends Error {
   }
 }
 
-/** Reasons a payee rejects a payment attempt (402/409 bodies). */
+/**
+ * Reasons a payee refuses a payment attempt: the `error` field of the
+ * PAYMENT-REQUIRED header it answers with. Most come straight from the
+ * facilitator (@x402/evm's vocabulary, which differs from the x402 spec
+ * document's); the first three are the payee's own.
+ */
 export type PayeeReason =
-  | 'invalid_payment'
-  | 'offer_mismatch'
-  | 'invalid_payee'
-  | 'invalid_token'
-  | 'invalid_amount'
-  | 'mandate_expired'
-  | 'mandate_deadline_too_short'
-  | 'invalid_ref'
-  | 'invalid_signature'
+  | 'payment_required'
   | 'replay'
-  | 'insufficient_balance'
-  | 'nonce_used'
-  | 'chain_unavailable'
-  | 'settlement_unavailable'
-  | 'invalid_sp_receipt';
-
-/** Error codes returned by the Settlement Processor's POST /enqueue. */
-export type SpErrorCode =
-  | 'invalid_body'
-  | 'unsupported_chain'
-  | 'unsupported_token'
-  | 'bad_params'
-  | 'deadline_too_soon'
-  | 'deadline_too_far'
-  | 'invalid_signature'
-  | 'mandate_terminal'
-  | 'nonce_used'
-  | 'sp_not_authorized'
-  | 'sp_revocation_pending'
-  | 'rpc_error'
-  | 'insufficient_balance';
+  | 'settlement_failed'
+  | 'invalid_exact_evm_scheme'
+  | 'invalid_exact_evm_network_mismatch'
+  | 'invalid_exact_evm_missing_eip712_domain'
+  | 'invalid_exact_evm_recipient_mismatch'
+  | 'invalid_exact_evm_signature'
+  | 'invalid_exact_evm_payload_authorization_valid_before'
+  | 'invalid_exact_evm_payload_authorization_valid_after'
+  | 'invalid_exact_evm_payload_authorization_value_mismatch'
+  | 'invalid_exact_evm_insufficient_balance'
+  | 'invalid_exact_evm_nonce_already_used'
+  | 'invalid_exact_evm_transaction_simulation_failed'
+  | 'invalid_exact_evm_transaction_failed'
+  | 'invalid_exact_evm_eip3009_not_supported'
+  | 'invalid_exact_evm_token_name_mismatch'
+  | 'invalid_exact_evm_token_version_mismatch'
+  | 'asset_not_deployed_contract'
+  | 'unexpected_verify_error'
+  | 'unexpected_settle_error'
+  | (string & {});
 
 /** Wallet-side: the payee answered a signed payment attempt with a non-2xx status. */
 export class PayeeRejected extends Error {

@@ -1,49 +1,40 @@
 /**
- * End-to-end demo: a fresh local chain, the debit wallet, a settlement
- * processor, a paid API, and an agent wallet with a user-approved budget.
+ * End-to-end demo: a fresh local chain, a facilitator, a paid API, and an
+ * agent wallet with a user-approved budget, all speaking x402 (`exact`,
+ * EIP-3009) — every paid call is settled on chain before it is answered.
  *
  *   npm run demo                # all scenarios
- *   npm run demo -- --only batch
+ *   npm run demo -- --only concurrency
  *
  * Exit code 0 iff every scenario's assertions pass.
  */
 import { mkdirSync, rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createPublicClient, createTestClient, createWalletClient, http, parseUnits } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, http, parseUnits, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
-import { AEP2_DEBIT_WALLET_ABI, MOCK_USDC_ABI, deployAll } from '@agentpay/contracts';
-import {
-  HEADER,
-  PolicyViolation,
-  encodeHeader,
-  formatUsdc,
-  mandateDigest,
-  randomNonce,
-  readPaymentRequired,
-  readPaymentResponse,
-  resourceRef,
-  signMandate,
-  verifySpReceipt,
-  type Hex,
-  type Mandate,
-  type PaymentRequirements,
-} from '@agentpay/core';
+import { x402Client } from '@x402/core/client';
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from '@x402/core/http';
+import type { PaymentPayload, PaymentRequired } from '@x402/core/types';
+import { registerExactEvmScheme } from '@x402/evm/exact/client';
+import { wrapFetchWithPayment } from '@x402/fetch';
+import { MOCK_USDC_ABI, MOCK_USDC_DOMAIN, deployLocalFixture } from '@agentpay/contracts';
+import { EIP3009_ABI, PolicyViolation, formatUsdc } from '@agentpay/core';
 import { Ledger, MandateWallet } from '@agentpay/wallet';
 import { DEV } from './accounts.js';
 import { startChain, type ChainHandle } from './chain.js';
+import { startFacilitator } from './facilitator.js';
 import { startPayee, type PayeeHandle } from './payee.js';
-import { startSp } from './sp.js';
 import { parseOnly, short } from './util.js';
 
 const OUT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'out');
 const CHAIN_PORT = 8545;
-const SP_PORT = 3001;
+const FACILITATOR_PORT = 3001;
 const PAYEE_PORT = 4021;
-const WITHDRAW_DELAY = 600; // seconds (demo); production: hours
-const SETTLE_WINDOW = 300; // seconds (demo); must be <= WITHDRAW_DELAY
 const NETWORK = 'eip155:31337';
+/** How long a signed authorization stays valid (the payee's maxTimeoutSeconds). */
+const AUTH_VALIDITY = 60;
 
 // ------------------------------------------------------------ narration
 
@@ -73,14 +64,14 @@ interface Env {
   chain: ChainHandle;
   rpcUrl: string;
   usdc: `0x${string}`;
-  wallet: `0x${string}`;
-  sp: Awaited<ReturnType<typeof startSp>>;
+  facilitator: Awaited<ReturnType<typeof startFacilitator>>;
   payee: PayeeHandle;
   agent: MandateWallet;
   budgetId: string;
   publicClient: ReturnType<typeof createPublicClient>;
   testClient: ReturnType<typeof createTestClient>;
-  settlementTxs: { hash: Hex; count: number; gas: bigint }[];
+  settlements: Hex[];
+  latenciesMs: number[];
 }
 
 async function setup(): Promise<Env> {
@@ -95,48 +86,44 @@ async function setup(): Promise<Env> {
   const testClient = createTestClient({ chain: hardhat, mode: 'hardhat', transport, pollingInterval: 50 });
   const deployer = createWalletClient({ account: privateKeyToAccount(DEV.deployer.key), chain: hardhat, transport, pollingInterval: 50 });
 
-  const { usdc, wallet } = await deployAll(deployer, publicClient, { withdrawDelay: WITHDRAW_DELAY });
-  log(`MockUSDC ${short(usdc)} · AEP2DebitWallet ${short(wallet)} (withdrawDelay ${WITHDRAW_DELAY}s)`);
-  for (const to of [DEV.payer.address]) {
-    const hash = await deployer.writeContract({ address: usdc, abi: MOCK_USDC_ABI, functionName: 'mint', args: [to, parseUnits('10000', 6)] });
-    await publicClient.waitForTransactionReceipt({ hash });
-  }
+  const { usdc } = await deployLocalFixture(deployer, publicClient, testClient);
+  log(`MockUSDC ${short(usdc)} (EIP-3009, domain "${MOCK_USDC_DOMAIN.name}" v${MOCK_USDC_DOMAIN.version}) + Multicall3 · no contract of ours`);
+  const hash = await deployer.writeContract({ address: usdc, abi: MOCK_USDC_ABI, functionName: 'mint', args: [DEV.payer.address, parseUnits('10000', 6)] });
+  await publicClient.waitForTransactionReceipt({ hash });
 
-  const sp = await startSp({
+  const facilitator = await startFacilitator({
     rpcUrl: chain.rpcUrl,
     chainId: hardhat.id,
-    key: DEV.sp.key,
-    wallet,
+    key: DEV.facilitator.key,
     usdc,
-    port: SP_PORT,
-    storePath: resolve(OUT_DIR, 'sp-queue.jsonl'),
-    settleWindowSeconds: SETTLE_WINDOW,
+    usdcDomain: { ...MOCK_USDC_DOMAIN },
+    port: FACILITATOR_PORT,
   });
-  log(`settlement processor ${short(DEV.sp.address)} on ${sp.url} (settle window ${SETTLE_WINDOW}s, manual batching)`);
+  log(`facilitator ${short(DEV.facilitator.address)} on ${facilitator.url} (pays gas; settles exact/eip155:31337)`);
 
+  const settlements: Hex[] = [];
   const payee = await startPayee({
     port: PAYEE_PORT,
-    rpcUrl: chain.rpcUrl,
     network: NETWORK,
     asset: usdc,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     payTo: DEV.payee.address,
-    wallet,
-    sp: { url: sp.url, address: DEV.sp.address, settleWindowSeconds: SETTLE_WINDOW },
+    facilitatorUrl: facilitator.url,
+    maxTimeoutSeconds: AUTH_VALIDITY,
+    onSettled: (r) => settlements.push(r.transaction as Hex),
   });
-  log(`payee ${short(DEV.payee.address)} on ${payee.url}: GET /predict $0.001 · POST /analyze $0.01`);
+  log(`payee ${short(DEV.payee.address)} on ${payee.url}: GET /predict $0.001 · POST /analyze $0.01 · GET /flaky $0.001`);
 
   const agent = new MandateWallet({
     key: DEV.payer.key,
     rpcUrl: chain.rpcUrl,
-    walletContract: wallet,
     token: usdc,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     network: NETWORK,
     mandatesPath: resolve(OUT_DIR, 'mandates.json'),
     ledgerPath: resolve(OUT_DIR, 'ledger.jsonl'),
   });
-  await agent.deposit(parseUnits('10', 6));
-  await agent.authorizeSP(DEV.sp.address);
-  log(`agent ${short(agent.address)} deposited $10 and authorized the SP; debitable ${formatUsdc(await agent.debitable())}`);
+  log(`agent ${short(agent.address)} holds ${formatUsdc(await agent.balance())} USDC in its own account (no ETH, no deposit, no approval)`);
 
   const budget = await agent.createIntentMandate(
     { naturalLanguage: 'Market data and text analysis for the demo', limitAmount: '$5', validForSeconds: 3600, hostAllowlist: ['127.0.0.1'] },
@@ -144,199 +131,229 @@ async function setup(): Promise<Env> {
   );
   log(`user approved intent mandate ${budget.id}: $5 for host 127.0.0.1, valid 1h (status ${budget.status})`);
 
-  return { chain, rpcUrl: chain.rpcUrl, usdc, wallet, sp, payee, agent, budgetId: budget.id, publicClient, testClient, settlementTxs: [] };
+  return { chain, rpcUrl: chain.rpcUrl, usdc, facilitator, payee, agent, budgetId: budget.id, publicClient, testClient, settlements, latenciesMs: [] };
 }
 
 async function teardown(env: Env): Promise<void> {
   await env.payee.close();
-  await env.sp.stop();
+  await env.facilitator.stop();
   await env.chain.stop();
 }
 
-async function payerBalance(env: Env): Promise<bigint> {
-  return env.publicClient.readContract({ address: env.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'balances', args: [DEV.payer.address, env.usdc] });
-}
-
 async function tokenBalance(env: Env, who: `0x${string}`): Promise<bigint> {
-  return env.publicClient.readContract({ address: env.usdc, abi: MOCK_USDC_ABI, functionName: 'balanceOf', args: [who] });
+  return env.publicClient.readContract({ address: env.usdc, abi: EIP3009_ABI, functionName: 'balanceOf', args: [who] });
 }
 
-async function fetchOffer(env: Env, path: string, init?: RequestInit): Promise<{ status: number; offer: PaymentRequirements; headerJson: unknown; bodyJson: unknown }> {
+async function fetchOffer(env: Env, path: string, init?: RequestInit): Promise<{ status: number; required: PaymentRequired; bodyJson: unknown }> {
   const res = await fetch(`${env.payee.url}${path}`, init);
   const text = await res.text();
-  const bodyJson = JSON.parse(text);
-  const headerJson = readPaymentRequired(res.headers);
-  const offer = readPaymentRequired(res.headers, text).accepts[0];
-  return { status: res.status, offer, headerJson, bodyJson };
+  const bodyJson = text ? JSON.parse(text) : undefined;
+  const required = decodePaymentRequiredHeader(res.headers.get('PAYMENT-REQUIRED') ?? '');
+  return { status: res.status, required, bodyJson };
+}
+
+function lastLedgerEntry(env: Env) {
+  const entries = new Ledger(resolve(OUT_DIR, 'ledger.jsonl')).read();
+  return entries[entries.length - 1];
+}
+
+async function timedFetch(env: Env, path: string): Promise<Response> {
+  const started = performance.now();
+  const res = await env.agent.fetch(`${env.payee.url}${path}`);
+  env.latenciesMs.push(performance.now() - started);
+  return res;
 }
 
 // ------------------------------------------------------------ scenarios
 
 async function scenarioHappy(env: Env): Promise<void> {
-  heading('Scenario 1 — happy path: GET /predict for $0.001');
-  const balanceBefore = await payerBalance(env);
-  const t0 = Date.now();
-  const res = await env.agent.fetch(`${env.payee.url}/predict`);
-  const body = (await res.json()) as { symbol: string; price: number };
-  const info = readPaymentResponse(res.headers);
-  check(res.status === 200, `200 in ${Date.now() - t0}ms: ${JSON.stringify(body)}`);
-  check(info?.status === 'enqueued' && info.spReceipt.sp.toLowerCase() === DEV.sp.address.toLowerCase(), `PAYMENT-RESPONSE: enqueued by SP ${short(info?.spReceipt.sp ?? '')}, digest ${short(info?.mandateDigest ?? '')}`);
-  if (info) {
-    const verdict = await verifySpReceipt(info.spReceipt, {
-      domain: { chainId: hardhat.id, verifyingContract: env.wallet },
-      expectedSp: DEV.sp.address,
-      mandateDigest: info.mandateDigest,
-      now: Math.floor(Date.now() / 1000),
-      maxWindowSeconds: SETTLE_WINDOW + 60,
-    });
-    check(verdict.ok, `SP receipt verifies (settle by +${info.spReceipt.enqueueDeadline - Math.floor(Date.now() / 1000)}s)`);
-    const status = (await (await fetch(`${env.sp.url}/status/${info.mandateDigest}`)).json()) as { status: string };
-    check(status.status === 'pending', `SP queue status: ${status.status}`);
-  }
-  const entry = env.agent.report();
-  const m = entry.mandates.find((x) => x.id === env.budgetId);
-  check(m?.spentAmount === '1000', `intent mandate spent ${formatUsdc(BigInt(m?.spentAmount ?? '0'))}, remaining ${formatUsdc(BigInt(m?.remainingAmount ?? '0'))}`);
-  check((await payerBalance(env)) === balanceBefore, `on-chain balance unchanged (${formatUsdc(balanceBefore)}) — settlement is deferred`);
+  heading('Scenario 1: pay for a call — settled on chain before the response arrives');
+  const payerBefore = await tokenBalance(env, DEV.payer.address);
+  const payeeBefore = await tokenBalance(env, DEV.payee.address);
+  const res = await timedFetch(env, '/predict');
+  const body = (await res.json()) as { symbol?: string };
+  check(res.status === 200 && body.symbol === 'ETH-USD', `GET /predict answered 200 with a prediction (${env.latenciesMs.at(-1)!.toFixed(0)} ms incl. settlement)`);
+  const settlement = decodePaymentResponseHeader(res.headers.get('PAYMENT-RESPONSE') ?? '');
+  check(settlement.success && /^0x[0-9a-f]{64}$/.test(settlement.transaction), `PAYMENT-RESPONSE carries the settlement tx ${short(settlement.transaction)}`);
+  const receipt = await env.publicClient.getTransactionReceipt({ hash: settlement.transaction as Hex });
+  check(receipt.status === 'success' && receipt.from.toLowerCase() === DEV.facilitator.address.toLowerCase(), 'the tx was mined and sent by the facilitator (the payer paid no gas)');
+  const payerAfter = await tokenBalance(env, DEV.payer.address);
+  const payeeAfter = await tokenBalance(env, DEV.payee.address);
+  check(payerBefore - payerAfter === 1000n && payeeAfter - payeeBefore === 1000n, `on-chain balances moved within the same call: payer -${formatUsdc(1000n)}, payee +${formatUsdc(1000n)}`);
+  const entry = lastLedgerEntry(env);
+  check(entry.status === 'settled' && entry.transaction === settlement.transaction, `ledger: settled, tx recorded (nonce ${short(entry.nonce)})`);
+  const m = env.agent.getMandate(env.budgetId)!;
+  check(m.spentAmount === '1000' && m.pendingSpentAmount === '0', `budget: spent ${formatUsdc(1000n)}, nothing pending`);
 }
 
 async function scenarioOffer(env: Env): Promise<void> {
-  heading('Scenario 2 — no payment header: the 402 offer');
-  const { status, offer, headerJson, bodyJson } = await fetchOffer(env, '/predict');
-  check(status === 402, `raw GET /predict -> ${status}`);
-  check(JSON.stringify(headerJson) === JSON.stringify(bodyJson), 'PAYMENT-REQUIRED header JSON equals the body JSON');
-  check(offer.scheme === 'aep2' && offer.network === NETWORK && offer.amount === '1000', `offer: scheme ${offer.scheme}, ${offer.network}, amount ${offer.amount} (=$0.001)`);
-  check(offer.extra.wallet.toLowerCase() === env.wallet.toLowerCase() && offer.extra.spAddress.toLowerCase() === DEV.sp.address.toLowerCase(), `offer.extra: wallet ${short(offer.extra.wallet)}, sp ${offer.extra.sp}, settle window ${offer.extra.settleWindowSeconds}s`);
-  check(typeof (bodyJson as { payment_model_context?: unknown }).payment_model_context === 'object', 'body carries payment_model_context for LLM agents');
+  heading('Scenario 2: the 402 offer is x402 V2 (header), with an LLM hint in the body');
+  const { status, required, bodyJson } = await fetchOffer(env, '/predict');
+  const offer = required.accepts[0]!;
+  check(status === 402, 'unauthenticated GET /predict -> 402');
+  check(required.x402Version === 2 && required.resource.url === `${env.payee.url}/predict`, `PAYMENT-REQUIRED: x402Version 2, resource ${required.resource.url}`);
+  check(offer.scheme === 'exact' && offer.network === NETWORK && offer.amount === '1000', `accepts[0]: scheme ${offer.scheme}, ${offer.network}, amount ${offer.amount}`);
+  check(offer.extra.name === MOCK_USDC_DOMAIN.name && offer.extra.version === MOCK_USDC_DOMAIN.version, `extra names the token EIP-712 domain "${offer.extra.name}" v${offer.extra.version}`);
+  check(offer.maxTimeoutSeconds === AUTH_VALIDITY, `maxTimeoutSeconds ${offer.maxTimeoutSeconds}: an authorization lives that long`);
+  const hint = (bodyJson as { payment_model_context?: { reason?: string; commands?: string[] } })?.payment_model_context;
+  check(hint?.reason === 'payment_required' && hint.commands?.includes('agentpay pay <url>'), 'body carries payment_model_context for an agent that reads it');
 }
 
 async function scenarioBudget(env: Env): Promise<void> {
-  heading('Scenario 3 — budget exhausted: a $0.003 mandate pays 3 calls, refuses the 4th');
+  heading('Scenario 3: the budget refuses before anything is signed');
   const tiny = await env.agent.createIntentMandate(
-    { naturalLanguage: 'Three quotes only', limitAmount: '$0.003', validForSeconds: 3600, hostAllowlist: ['127.0.0.1'] },
+    { naturalLanguage: 'three quotes only', limitAmount: '$0.003', validForSeconds: 3600, hostAllowlist: ['127.0.0.1'] },
     { approve: true },
   );
   const servedBefore = env.payee.served.predict;
   for (let i = 1; i <= 3; i++) {
     const res = await env.agent.fetch(`${env.payee.url}/predict`, undefined, { mandateId: tiny.id });
-    check(res.status === 200, `call ${i}: ${res.status}, remaining ${formatUsdc(env.agent.remaining(tiny.id))}`);
+    check(res.status === 200, `call ${i} of 3 within the $0.003 budget -> 200`);
   }
+  let refusal: unknown;
   try {
     await env.agent.fetch(`${env.payee.url}/predict`, undefined, { mandateId: tiny.id });
-    check(false, 'call 4 should have been refused');
   } catch (err) {
-    const pv = err as PolicyViolation;
-    check(err instanceof PolicyViolation && pv.reason === 'mandate_insufficient_budget', `call 4 refused before signing: ${pv.reason}`);
-    log(`hint for the agent: ${pv.payment_model_context?.summary}`);
-    log(`  -> ${pv.payment_model_context?.remediation[0]}`);
+    refusal = err;
   }
-  check(env.payee.served.predict === servedBefore + 3, 'payee served exactly 3 calls');
+  check(refusal instanceof PolicyViolation && refusal.reason === 'mandate_insufficient_budget', 'call 4 refused client-side: PolicyViolation(mandate_insufficient_budget)');
+  check((refusal as PolicyViolation).payment_model_context?.remediation.length! > 0, 'the refusal carries remediation for the agent');
+  check(env.payee.served.predict === servedBefore + 3, 'the payee served exactly 3 calls');
+  check(env.agent.remaining(tiny.id) === 0n, 'remaining budget on the tiny mandate: $0');
 }
 
 async function scenarioReplay(env: Env): Promise<void> {
-  heading('Scenario 4 — replaying an already-used mandate');
-  const last = new Ledger(resolve(OUT_DIR, 'ledger.jsonl')).read().at(-1);
-  if (!last) {
-    check(false, 'ledger has entries');
-    return;
-  }
-  const { offer } = await fetchOffer(env, '/predict');
+  heading('Scenario 4: a settled authorization cannot be reused');
+  const res = await env.agent.fetch(`${env.payee.url}/predict`);
+  check(res.status === 200, 'a fresh paid call -> 200');
+  const e = lastLedgerEntry(env);
+  const payload: PaymentPayload = {
+    x402Version: 2,
+    accepted: (await fetchOffer(env, '/predict')).required.accepts[0]!,
+    payload: { signature: e.signature, authorization: e.authorization },
+  };
   const servedBefore = env.payee.served.predict;
-  const res = await fetch(`${env.payee.url}/predict`, {
-    headers: { [HEADER.signature]: encodeHeader({ x402Version: 2, accepted: offer, payload: { mandate: last.mandate, payerSig: last.payerSig } }) },
+  const replay = await fetch(`${env.payee.url}/predict`, { headers: { 'PAYMENT-SIGNATURE': encodePaymentSignatureHeader(payload) } });
+  const reason = decodePaymentRequiredHeader(replay.headers.get('PAYMENT-REQUIRED') ?? '').error;
+  check(replay.status === 402 && reason === 'replay', `re-sending the same PAYMENT-SIGNATURE -> 402 ${reason} (refused by the payee, no facilitator call)`);
+  check(env.payee.served.predict === servedBefore, 'the handler did not run again');
+  const direct = await fetch(`${env.facilitator.url}/verify`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ x402Version: 2, paymentPayload: payload, paymentRequirements: payload.accepted }),
   });
-  const body = (await res.json()) as { error?: string };
-  check(res.status === 409 && body.error === 'replay', `re-sent mandate ${short(last.mandateDigest)} -> ${res.status} ${body.error}`);
-  check(env.payee.served.predict === servedBefore, 'handler did not run');
+  const verdict = (await direct.json()) as { isValid: boolean; invalidReason?: string };
+  check(!verdict.isValid && verdict.invalidReason === 'invalid_exact_evm_nonce_already_used', `the facilitator itself says ${verdict.invalidReason} (the chain remembers the nonce)`);
 }
 
-async function scenarioSpReject(env: Env): Promise<void> {
-  heading('Scenario 5 — the settlement processor refuses');
+async function scenarioFacilitatorReject(env: Env): Promise<void> {
+  heading('Scenario 5: the facilitator refuses what the chain would refuse');
   const stranger = new MandateWallet({
     key: DEV.stranger.key,
     rpcUrl: env.rpcUrl,
-    walletContract: env.wallet,
     token: env.usdc,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     network: NETWORK,
     ledgerPath: resolve(OUT_DIR, 'stranger-ledger.jsonl'),
   });
   await stranger.createIntentMandate({ naturalLanguage: 'stranger budget', limitAmount: '$1', validForSeconds: 3600, hostAllowlist: ['127.0.0.1'] }, { approve: true });
-  const analyze = (w: MandateWallet) =>
-    w.fetch(`${env.payee.url}/analyze`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: 'hello world!' }) });
+  const servedBefore = env.payee.served.predict;
+  const res = await stranger.fetch(`${env.payee.url}/predict`);
+  const reason = decodePaymentRequiredHeader(res.headers.get('PAYMENT-REQUIRED') ?? '').error;
+  check(res.status === 402 && reason === 'invalid_exact_evm_insufficient_balance', `an agent with no USDC -> 402 ${reason}`);
+  check(env.payee.served.predict === servedBefore, 'nothing was served');
+  const strangerEntry = new Ledger(resolve(OUT_DIR, 'stranger-ledger.jsonl')).read()[0]!;
+  check(strangerEntry.status === 'rejected', `the stranger's ledger says rejected; its budget stays reserved until the authorization expires (${AUTH_VALIDITY}s)`);
 
-  let res = await analyze(stranger);
-  let body = (await res.json()) as { error?: string };
-  check(res.status === 402 && (body.error ?? '').startsWith('settlement_unavailable') && (body.error ?? '').includes('sp_not_authorized'), `stranger never authorized the SP -> ${res.status} ${body.error}`);
-
-  await stranger.authorizeSP(DEV.sp.address);
-  res = await analyze(stranger);
-  body = (await res.json()) as { error?: string };
-  check(res.status === 402 && (body.error ?? '').includes('insufficient_balance'), `authorized but never deposited -> ${res.status} ${body.error}`);
-
-  // A mandate that leaves the SP no time to settle is refused straight at /enqueue.
-  const now = Math.floor(Date.now() / 1000);
-  const mandate: Mandate = { owner: DEV.payer.address, token: env.usdc, payee: DEV.payee.address, amount: '1000', nonce: randomNonce(), deadline: now + 10, ref: resourceRef('GET /predict') };
-  const payerSig = await signMandate(privateKeyToAccount(DEV.payer.key), { chainId: hardhat.id, verifyingContract: env.wallet }, mandate);
-  const enq = await fetch(`${env.sp.url}/enqueue`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mandate, payerSig }) });
-  const enqBody = (await enq.json()) as { error?: string };
-  check(enq.status === 400 && enqBody.error === 'deadline_too_soon', `mandate expiring in 10s straight to SP /enqueue -> ${enq.status} ${enqBody.error}`);
+  // A tampered echo: the payer accepted terms that are not the route's.
+  const { required } = await fetchOffer(env, '/predict');
+  const e = lastLedgerEntry(env);
+  const tampered: PaymentPayload = {
+    x402Version: 2,
+    accepted: { ...required.accepts[0]!, payTo: DEV.stranger.address },
+    payload: { signature: e.signature, authorization: e.authorization },
+  };
+  const res2 = await fetch(`${env.payee.url}/predict`, { headers: { 'PAYMENT-SIGNATURE': encodePaymentSignatureHeader(tampered) } });
+  check(res2.status === 402, 'a payment whose echoed terms differ from the offer (payTo) -> 402 before any facilitator call');
 }
 
-async function scenarioBatch(env: Env): Promise<void> {
-  heading('Scenario 6 — 20 calls, one settlement transaction');
-  const payerBefore = await payerBalance(env);
-  const payeeBefore = await tokenBalance(env, DEV.payee.address);
-  const pendingBefore = ((await (await fetch(`${env.sp.url}/health`)).json()) as { counts: { pending: number } }).counts.pending;
-  for (let i = 0; i < 20; i++) {
+async function scenarioHandlerFailure(env: Env): Promise<void> {
+  heading('Scenario 6: a handler that fails is never charged');
+  env.payee.flaky.fail = true;
+  const payerBefore = await tokenBalance(env, DEV.payer.address);
+  const res = await env.agent.fetch(`${env.payee.url}/flaky`);
+  check(res.status === 500, 'GET /flaky: the handler answered 500 after the payment was verified');
+  check(!res.headers.has('PAYMENT-RESPONSE'), 'no PAYMENT-RESPONSE: the settlement was cancelled');
+  check((await tokenBalance(env, DEV.payer.address)) === payerBefore, 'the payer balance is unchanged');
+  const e = lastLedgerEntry(env);
+  const m = env.agent.getMandate(env.budgetId)!;
+  check(e.status === 'rejected' && BigInt(m.pendingSpentAmount) >= 1000n, 'ledger: rejected; the budget stays reserved because the signed authorization is still valid');
+  env.payee.flaky.fail = false;
+  const again = await env.agent.fetch(`${env.payee.url}/flaky`);
+  check(again.status === 200 && again.headers.has('PAYMENT-RESPONSE'), 'once the handler works, a fresh authorization pays and settles');
+}
+
+async function scenarioConcurrency(env: Env): Promise<void> {
+  heading('Scenario 7: twenty concurrent paid calls, twenty settlement transactions');
+  const n = 20;
+  const spentBefore = BigInt(env.agent.getMandate(env.budgetId)!.spentAmount);
+  const nonceBefore = await env.publicClient.getTransactionCount({ address: DEV.facilitator.address });
+  const started = performance.now();
+  const results = await Promise.all(Array.from({ length: n }, () => env.agent.fetch(`${env.payee.url}/predict`)));
+  const elapsed = performance.now() - started;
+  const ok = results.filter((r) => r.status === 200).length;
+  const txs = new Set(results.map((r) => decodePaymentResponseHeader(r.headers.get('PAYMENT-RESPONSE') ?? '').transaction));
+  check(ok === n, `${ok}/${n} calls answered 200 in ${elapsed.toFixed(0)} ms`);
+  check(txs.size === n, `${txs.size} distinct settlement transactions`);
+  check(BigInt(env.agent.getMandate(env.budgetId)!.spentAmount) === spentBefore + 1000n * BigInt(n), `budget spent exactly ${n} × $0.001, nothing pending`);
+  const nonceAfter = await env.publicClient.getTransactionCount({ address: DEV.facilitator.address });
+  check(nonceAfter === nonceBefore + n, `the facilitator's account nonce advanced by exactly ${n} (send lock + nonce manager)`);
+}
+
+async function scenarioLatency(env: Env): Promise<void> {
+  heading('Scenario 8: per-call latency on this machine (hardhat automine; expect ~2-4 s on Base)');
+  const samples: number[] = [];
+  for (let i = 0; i < 10; i++) {
+    const started = performance.now();
     const res = await env.agent.fetch(`${env.payee.url}/predict`);
-    if (res.status !== 200) check(false, `call ${i + 1} returned ${res.status}`);
+    samples.push(performance.now() - started);
+    if (res.status !== 200) failures.push(`latency: call ${i} answered ${res.status}`);
   }
-  const health = (await (await fetch(`${env.sp.url}/health`)).json()) as { counts: { pending: number } };
-  check(health.counts.pending === pendingBefore + 20, `SP queue holds ${health.counts.pending} pending mandates`);
-
-  const tick = await env.sp.tick();
-  const receipt = tick.txHash ? await env.publicClient.getTransactionReceipt({ hash: tick.txHash }) : undefined;
-  check(tick.txHash !== undefined && tick.settled.length >= 20, `one settleBatch tx ${short(tick.txHash ?? '')} settled ${tick.settled.length} mandates, skipped ${tick.skipped.length}`);
-  if (receipt) {
-    env.settlementTxs.push({ hash: receipt.transactionHash, count: tick.settled.length, gas: receipt.gasUsed });
-    log(`gas used ${receipt.gasUsed} (${receipt.gasUsed / BigInt(Math.max(1, tick.settled.length))} per mandate)`);
-  }
-  const payerAfter = await payerBalance(env);
-  const payeeAfter = await tokenBalance(env, DEV.payee.address);
-  check(payerAfter === payerBefore - 1000n * BigInt(tick.settled.length), `payer balance ${formatUsdc(payerBefore)} -> ${formatUsdc(payerAfter)}`);
-  check(payeeAfter === payeeBefore + 1000n * BigInt(tick.settled.length), `payee received ${formatUsdc(payeeAfter - payeeBefore)} USDC on-chain`);
-
-  const rec = await env.agent.reconcile();
-  check(rec.settled.length >= 20, `agent reconcile(): ${rec.settled.length} ledger entries now settled, ${rec.stillPending.length} pending`);
+  samples.sort((a, b) => a - b);
+  const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+  check(samples.length === 10, `10 sequential paid calls: min ${samples[0]!.toFixed(0)} ms · avg ${avg.toFixed(0)} ms · max ${samples[9]!.toFixed(0)} ms (402 + verify + handler + settle + receipt)`);
 }
 
-async function scenarioWithdrawLock(env: Env): Promise<void> {
-  heading('Scenario 7 — the withdrawal delay protects an in-flight mandate');
-  const res = await env.agent.fetch(`${env.payee.url}/predict`);
-  check(res.status === 200, 'one more paid call is enqueued');
-  const balance = await payerBalance(env);
-  const tx = await env.agent.requestWithdraw(balance);
-  check(typeof tx === 'string', `agent requests withdrawal of its whole balance ${formatUsdc(balance)} (tx ${short(tx)})`);
-  check((await env.agent.debitable()) === 0n, 'debitable balance is now 0: the SP would admit no NEW mandate');
-  try {
-    await env.agent.executeWithdraw();
-    check(false, 'immediate executeWithdraw should revert');
-  } catch (err) {
-    check(/WithdrawalLocked/.test(String((err as Error).message)), 'immediate executeWithdraw reverts: WithdrawalLocked');
-  }
-  const tick = await env.sp.tick();
-  check(tick.settled.length >= 1, `SP still settles the in-flight mandate during the delay (${tick.settled.length} settled)`);
-  if (tick.txHash) {
-    const receipt = await env.publicClient.getTransactionReceipt({ hash: tick.txHash });
-    env.settlementTxs.push({ hash: receipt.transactionHash, count: tick.settled.length, gas: receipt.gasUsed });
-  }
-  await env.testClient.increaseTime({ seconds: WITHDRAW_DELAY + 1 });
+async function scenarioInterop(env: Env): Promise<void> {
+  heading('Scenario 9: the official @x402/fetch client pays this payee too');
+  const client = new x402Client().setSpendControls(false); // MockUSDC is not one of the client's default assets
+  registerExactEvmScheme(client, { signer: privateKeyToAccount(DEV.payer.key) });
+  const paidFetch = wrapFetchWithPayment(fetch, client);
+  const payerBefore = await tokenBalance(env, DEV.payer.address);
+  const res = await paidFetch(`${env.payee.url}/predict`);
+  const settlement = decodePaymentResponseHeader(res.headers.get('PAYMENT-RESPONSE') ?? '');
+  check(res.status === 200 && settlement.success, `@x402/fetch + @x402/evm (no agentpay code on the client side) -> 200, tx ${short(settlement.transaction)}`);
+  check((await tokenBalance(env, DEV.payer.address)) === payerBefore - 1000n, 'settled through our facilitator: payer -$0.001');
+}
+
+async function scenarioExpiry(env: Env): Promise<void> {
+  heading('Scenario 10 (last: time travel): an authorization that was refused expires by chain time and frees its budget');
+  env.payee.flaky.fail = true;
+  const res = await env.agent.fetch(`${env.payee.url}/flaky`);
+  env.payee.flaky.fail = false;
+  const e = lastLedgerEntry(env);
+  check(res.status === 500 && e.status === 'rejected', 'a refused call left a rejected row with its budget reserved');
+  const pendingBefore = BigInt(env.agent.getMandate(env.budgetId)!.pendingSpentAmount);
+  const early = await env.agent.reconcile();
+  check(early.stillPending.includes(e.nonce), 'reconcile() before validBefore: still pending (the payee could still settle it)');
+  await env.testClient.increaseTime({ seconds: AUTH_VALIDITY + 1 });
   await env.testClient.mine({ blocks: 1 });
-  const before = await tokenBalance(env, DEV.payer.address);
-  await env.agent.executeWithdraw();
-  const after = await tokenBalance(env, DEV.payer.address);
-  const expected = balance - 1000n * BigInt(tick.settled.length);
-  check(after - before === expected, `after the delay the withdrawal pays out only the remainder: ${formatUsdc(after - before)} (requested ${formatUsdc(balance)})`);
-  check((await payerBalance(env)) === 0n, 'debit-wallet balance is 0');
+  const late = await env.agent.reconcile();
+  check(late.expiredUnused.includes(e.nonce), `reconcile() after chain time passed validBefore: expired-unused`);
+  const pendingAfter = BigInt(env.agent.getMandate(env.budgetId)!.pendingSpentAmount);
+  // Scenario 6's first refused call expires here too: every reservation is gone.
+  check(pendingAfter === 0n && pendingBefore >= 1000n, `every held reservation is released (pending ${formatUsdc(pendingBefore)} -> ${formatUsdc(pendingAfter)})`);
+  check(late.verified.length > 0, `${late.verified.length} earlier settlements confirmed on chain (nonce used) now that their validity ended`);
 }
 
 // ------------------------------------------------------------ main
@@ -346,9 +363,12 @@ const SCENARIOS: Record<string, (env: Env) => Promise<void>> = {
   offer: scenarioOffer,
   budget: scenarioBudget,
   replay: scenarioReplay,
-  'sp-reject': scenarioSpReject,
-  batch: scenarioBatch,
-  'withdraw-lock': scenarioWithdrawLock,
+  'facilitator-reject': scenarioFacilitatorReject,
+  'handler-failure': scenarioHandlerFailure,
+  concurrency: scenarioConcurrency,
+  latency: scenarioLatency,
+  interop: scenarioInterop,
+  expiry: scenarioExpiry,
 };
 
 async function main(): Promise<void> {
@@ -367,14 +387,13 @@ async function main(): Promise<void> {
   } finally {
     heading('Summary');
     const report = env.agent.report();
-    const txs = env.settlementTxs;
-    const gas = txs.reduce((a, t) => a + t.gas, 0n);
-    const settledCount = txs.reduce((a, t) => a + t.count, 0);
-    log(`paid calls      : ${report.totals.enqueued + report.totals.settled}`);
-    log(`agent spend     : ${formatUsdc(BigInt(report.totals.spent))}`);
-    log(`settlement txs  : ${txs.length} (${settledCount} mandates, avg gas/mandate ${settledCount ? gas / BigInt(settledCount) : 0n})`);
+    const avg = env.latenciesMs.length ? env.latenciesMs.reduce((a, b) => a + b, 0) / env.latenciesMs.length : 0;
+    log(`paid calls      : ${report.totals.settled} settled · ${report.totals.rejected} rejected · ${report.totals.expiredUnused} expired unused`);
+    log(`agent spend     : ${formatUsdc(BigInt(report.totals.spent))} (pending ${formatUsdc(BigInt(report.totals.pending))})`);
+    log(`settlement txs  : ${env.settlements.length} by the facilitator, one per paid call`);
     log(`policy denials  : ${report.policyDenials.length}`);
     log(`ledger          : ${resolve(OUT_DIR, 'ledger.jsonl')}`);
+    if (avg) log(`avg latency     : ${avg.toFixed(0)} ms per timed call`);
     await teardown(env);
   }
   console.log();

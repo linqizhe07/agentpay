@@ -1,47 +1,46 @@
-# agentpay — authorize first, settle later payments for AI agents
+# agentpay — a budgeted x402 wallet for AI agents
 
-An AEP2-style payment stack (after FluxA's [Agent Embedded Payment Protocol](https://fluxapay.xyz/protocol)): a payer agent signs a one-time **mandate** and embeds it in an HTTP call; the payee verifies it off-chain and serves **immediately**; a **settlement processor** batches many mandates into one on-chain transaction later and debits the payer's pre-funded **debit wallet**. No per-call block wait, sub-cent prices, one budget approval per mission instead of one tap per payment.
-
-Everything here runs end to end on a local Hardhat chain, with deploy scripts for Base Sepolia.
+x402 payments with a budget around them: a payer agent signs a single-use **USDC authorization** (EIP-3009) for each paid HTTP call, the payee's **facilitator** settles it on chain before the response goes out, and the agent's wallet only ever signs inside an **intent mandate** — a budget the human approved once (purpose, limit, validity, allowed hosts). The protocol is [x402](https://github.com/coinbase/x402) V2, `exact` scheme, implemented with the official `@x402/*` packages; what this repository adds is the payer-side budget layer, a self-hostable facilitator, a paywall helper, a CLI with a skill file for LLM agents, and a demo that runs all of it on a local chain.
 
 ```
- payer agent            payee service              settlement processor (SP)          AEP2DebitWallet (chain)
-     │  GET /predict          │                              │                                │
-     │───────────────────────>│ 402 + offer (price, SP, …)   │                                │
-     │<───────────────────────│                              │                                │
-     │  sign Mandate (EIP-712)│                              │                                │
-     │  GET /predict + PAYMENT-SIGNATURE                     │                                │
-     │───────────────────────>│ verify fields + signature    │                                │
-     │                        │ POST /enqueue {mandate,sig}  │                                │
-     │                        │─────────────────────────────>│ check authorizedSP, nonce,     │
-     │                        │  signed SP receipt           │ debitable balance; reserve     │
-     │                        │<─────────────────────────────│                                │
-     │  200 + PAYMENT-RESPONSE (receipt)                     │                                │
-     │<───────────────────────│                              │   …later, one tx for N mandates│
-     │                        │                              │ settleBatch(ms, sigs) ─────────>│ debit payers, pay payees
+ payer agent (MandateWallet)        payee (express + @x402/express)     facilitator (@agentpay/facilitator)   USDC (EIP-3009)
+     │  GET /predict                      │                                    │                                   │
+     │────────────────────────────────────>│ 402 + PAYMENT-REQUIRED (offer)     │                                   │
+     │<────────────────────────────────────│                                    │                                   │
+     │  policy gate + reserve budget       │                                    │                                   │
+     │  sign TransferWithAuthorization     │                                    │                                   │
+     │  GET /predict + PAYMENT-SIGNATURE   │                                    │                                   │
+     │────────────────────────────────────>│ POST /verify ─────────────────────>│ signature, window, amount,        │
+     │                                     │ run the handler (response buffered)│ balance, nonce, simulation        │
+     │                                     │ POST /settle ─────────────────────>│ transferWithAuthorization ───────>│ payer −amount, payee +amount
+     │  200 + PAYMENT-RESPONSE {transaction}│<───────────────────────────────────│ (facilitator pays the gas)        │
+     │<────────────────────────────────────│                                    │                                   │
+     │  ledger: settled; reservation → spent                                    │                                   │
 ```
+
+The payer needs only USDC in its own account: no contract to deposit into, no ETH, no approval. One authorization pays for one delivery; the chain refuses a reused nonce.
 
 ## Quickstart
 
 ```bash
 npm install
-npm test            # every workspace (contract / SP / payee / wallet tests spawn their own hardhat node)
-npm run demo        # fresh chain + SP + payee + agent, 7 scenarios, exit 0 iff all pass
+npm test            # every workspace (contract / facilitator / payee / wallet tests spawn their own hardhat node)
+npm run demo        # fresh chain + facilitator + payee + agent, 10 scenarios, exit 0 iff all pass
 ```
 
-The demo prints, among other things: a paid call with the on-chain balance **unchanged** (settlement is deferred), a budget refusal *before* anything is signed, a 409 on replay, the SP refusing an unauthorized or unfunded payer, 20 calls settled by **one** `settleBatch` transaction, and a withdrawal that stays locked until the in-flight mandate has been settled.
+The demo prints, among other things: a paid call whose on-chain balances **move inside the same request** (payer −$0.001, payee +$0.001, tx hash in `PAYMENT-RESPONSE`), a budget refusal *before* anything is signed, a replay refused by the payee and by the facilitator, twenty concurrent calls settled as twenty transactions, a failed handler that is never charged, the official `@x402/fetch` client paying the same payee, and an authorization that expires by chain time and releases its budget.
 
-Node ≥ 22 (`.nvmrc`). The root `npm test` includes the demo's end-to-end test, which binds ports 8545 / 3001 / 4021, so it cannot run while a local `hardhat node`, SP or payee from "Running the pieces yourself" is up. CI (`.github/workflows/ci.yml`) runs `npm run typecheck`, `npm test`, then `npm run gen-abi` and fails if `packages/contracts/src/abi.ts` differs from what is committed — after touching a `.sol`, regenerate and commit the ABI.
+Node ≥ 22 (`.nvmrc`). The root `npm test` includes the demo's end-to-end test, which binds ports 8545 / 3001 / 4021, so it cannot run while a local `hardhat node`, facilitator or payee from "Running the pieces yourself" is up. CI (`.github/workflows/ci.yml`) runs `npm run typecheck`, `npm test`, then `npm run gen-abi` and fails if `packages/contracts/src/abi.ts` differs from what is committed — after touching `MockUSDC.sol`, regenerate and commit the ABI.
 
 ## Packages
 
 | workspace | what it is |
 |---|---|
-| `packages/core` | Types, x402-shaped wire format, EIP-712 mandate + SP-receipt helpers, money parsing, error taxonomy, `payment_model_context` hints for LLM agents |
-| `packages/contracts` | `AEP2DebitWallet.sol` (deposit, per-payer SP authorization, delayed withdrawals, `settle` / `settleBatch`), `MockUSDC.sol`, deploy scripts, generated ABI |
-| `packages/sp` | Settlement processor: `POST /enqueue` validation + reservation + signed receipt, JSONL queue, batching worker (`node:http`, zero deps) |
-| `packages/payee` | `createMandatePaywall()` express-style middleware: 402 offers, mandate verification, replay protection, SP enqueue, `PAYMENT-RESPONSE` |
-| `packages/wallet` | `MandateWallet`: intent mandates (user-approved budgets), policy gate before signing, `fetch()` that answers 402s, ledger, `reconcile()`, `report()` |
+| `packages/core` | Money parsing, CAIP helpers, the EIP-3009 ABI slice, error taxonomy, `payment_model_context` hints for LLM agents; re-exports the `@x402/core` wire types |
+| `packages/contracts` | `MockUSDC.sol` (EIP-3009 test token) for local chains, Multicall3 bytecode, deployment records (`deployments/base-sepolia.json` is static: Circle's USDC), generated ABI |
+| `packages/facilitator` | Self-hostable x402 facilitator: `@x402/core`'s `x402Facilitator` + the `@x402/evm` exact scheme behind `node:http` (`/supported`, `/verify`, `/settle`, `/health`), with asset/payee allowlists, a send lock over viem's nonce manager, and 503s for RPC outages |
+| `packages/payee` | `createPaywall()`: one x402 resource server per service, `charge(price)` for express middleware (`@x402/express`), an in-flight guard so one authorization buys one delivery, hints in the initial 402 body |
+| `packages/wallet` | `MandateWallet`: intent mandates (user-approved budgets), policy gate before signing, `fetch()` that answers 402s through the official x402 client, JSONL ledger, `reconcile()` against the chain, `report()` |
 | `packages/cli` | `agentpay` CLI (JSON out, exit codes) + `SKILL.md` for LLM agents |
 | `demo` | One-command end-to-end scenario runner and its test |
 
@@ -55,110 +54,97 @@ git submodule update --init
 (cd modules/payment && npm install)
 ```
 
-The host then imports the SDK packages by path or workspace: `@agentpay/wallet` for the paying agent, `@agentpay/payee` for services that charge, `@agentpay/sp` to run a settlement processor, `@agentpay/contracts` for the ABI and deploy helpers. Nothing product-specific lives here; UI, product pages and integration glue belong to the host.
+The host then imports the SDK packages by path or workspace: `@agentpay/wallet` for the paying agent, `@agentpay/payee` for services that charge, `@agentpay/facilitator` to run a facilitator, `@agentpay/contracts` for the token records. Nothing product-specific lives here; UI, product pages and integration glue belong to the host.
 
 ## Wire format
 
-The mandate rides in an **x402 V2-shaped envelope** with scheme `aep2`, so it is "embedded in the x402 call"; FluxA's bare `X-Payment-Mandate` header is accepted on read for compatibility.
+Exactly x402 V2 (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`, base64 JSON, everything in the headers), produced and parsed by `@x402/core`. The only additions are outside the protocol: the initial 402 body carries a `payment_model_context` (a hint for an agent that reads it), and the wallet adds `x-agentpay-nonce` / `x-agentpay-ledger-status` to the response it returns so a caller can find the ledger row.
 
-402 (header `PAYMENT-REQUIRED` = base64 of the same JSON as the body):
+402 (`PAYMENT-REQUIRED` = base64 of):
 
 ```json
 {
   "x402Version": 2,
-  "error": "mandate_required",
+  "error": "Payment required",
+  "resource": { "url": "http://127.0.0.1:4021/predict", "description": "ETH-USD prediction", "mimeType": "application/json" },
   "accepts": [{
-    "scheme": "aep2", "network": "eip155:31337",
-    "amount": "1000", "asset": "0x…usdc", "payTo": "0x…payee",
-    "resource": "GET /predict", "maxTimeoutSeconds": 60,
-    "extra": { "wallet": "0x…debitWallet", "sp": "http://127.0.0.1:3001", "spAddress": "0x…sp", "settleWindowSeconds": 10800 }
-  }],
-  "payment_model_context": { "protocol": "aep2", "reason": "mandate_required", "summary": "…", "remediation": ["…"] }
+    "scheme": "exact", "network": "eip155:31337",
+    "amount": "1000", "asset": "0x…usdc", "payTo": "0x…payee", "maxTimeoutSeconds": 60,
+    "extra": { "name": "Mock USD Coin", "version": "2", "assetTransferMethod": "eip3009" }
+  }]
 }
 ```
 
-Retry with header `PAYMENT-SIGNATURE` = base64 of:
-
-```json
-{ "x402Version": 2, "accepted": { …the offer… },
-  "payload": { "mandate": { "owner", "token", "payee", "amount": "1000", "nonce": "<uint256>", "deadline": 1760000000, "ref": "0x…" }, "payerSig": "0x…" } }
-```
-
-`Mandate(address owner,address token,address payee,uint256 amount,uint256 nonce,uint64 deadline,bytes32 ref)` is signed under the EIP-712 domain `{ name: "AEP2DebitWallet", version: "1", chainId, verifyingContract: <wallet> }`; `ref = keccak256("METHOD /path")` (or `"METHOD /path#quoteId"`). Signatures must be canonical 65-byte `(r, s, v)` with low `s` and `v ∈ {27, 28}`: the off-chain verifiers (payee, SP) reject anything else so that they accept exactly what the contract's ECDSA accepts — otherwise a payer could present a malleated copy of its own signature, get served, and never be debited.
-
-Success: 2xx + header `PAYMENT-RESPONSE` = base64 of `{ success: true, scheme: "aep2", network, payer, transaction: "", status: "enqueued", mandateDigest, spReceipt: { sp, mandateDigest, enqueueDeadline, spEnqueueSig } }`. The body is untouched (set `includeBodyPaymentField: true` to add FluxA's in-body `payment` field to JSON responses). Refusals: 402 with the offer and `error: "<reason>"`, 409 `{ error: "replay" }`.
-
-The SP receipt is EIP-712 `SPReceipt(bytes32 mandateDigest,uint64 enqueueDeadline)` under `{ name: "AEP2SettlementProcessor", version: "1", chainId, verifyingContract: <wallet> }` — a signed promise to settle by `enqueueDeadline`.
+`extra.name` / `extra.version` are the token's EIP-712 domain: the payer signs `TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)` under `{ name, version, chainId, verifyingContract: asset }` with `value = amount`, `validBefore = now + maxTimeoutSeconds`, a random 32-byte nonce, and sends it back as `PAYMENT-SIGNATURE` = base64 of `{ x402Version: 2, resource, accepted: <the offer>, payload: { signature, authorization: { from, to, value, validAfter, validBefore, nonce } } }`. Success: 2xx + `PAYMENT-RESPONSE` = base64 of `{ success: true, transaction: "0x…", network, payer }`. A refusal is a 402 whose `PAYMENT-REQUIRED.error` names the reason (the facilitator's `invalid_exact_evm_*` vocabulary, or the payee's own `replay` / `settlement_unavailable`).
 
 ## What each side checks
 
-**Payee** (`createMandatePaywall`): decode header → echoed offer matches (x402 envelope only) → `payee == payTo`, `token == asset`, `amount ≥ price`, `deadline` not expired and ≥ `now + settleWindowSeconds`, `ref` binds this resource → signature recovers to `owner` → idempotency claim on the mandate digest (409 `replay`) → optional on-chain pre-check (`debitableBalance`, `usedNonces`) → `POST <sp>/enqueue` and verify the receipt → run the handler.
+**Wallet** (`MandateWallet.fetch`): the offer must be `exact` on this wallet's network and token, under the token domain the wallet was *configured* with (the offer's claim is not trusted), with `maxTimeoutSeconds` within `caps.maxAuthorizationValiditySeconds` (default 300: that is how long a failed call's budget stays reserved) → policy gate and budget reservation in one synchronous step → sign → ledger row `in_flight` → send. The settlement report decides the row: `success` + transaction → `settled` (on any HTTP status: "paid but http 500" stays honest), 2xx without a usable report → `unknown` and counted as spent, a refusal → `rejected` with the reservation held until the authorization expires, `settlement_pending` → `unknown` with the transaction. A transport error re-presents the *same* signed header rather than signing again.
 
-**Settlement processor** (`POST /enqueue`): schema → chain/token supported → amounts → deadline window → signature → idempotent replay of a known digest returns the original receipt with `created: false` and its `enqueuedAt` → local nonce index → on-chain `authorizationOf(owner, sp)`, `usedNonces`, `debitableBalance`, all read at one block that is not behind the SP's last settlement (a lagging replica gets a 503) → the SP is authorized and no scheduled revocation lands at or before the receipt's `enqueueDeadline` (403 `sp_not_authorized` / `sp_revocation_pending`) → `debitable ≥ amount + reserved(owner, token)` → reserve, persist, sign receipt with `enqueueDeadline = min(mandate.deadline, now + settleWindow)`. The worker never lets an RPC outage turn a receipted mandate terminal: transport failures back off without counting as attempts, and only the mandate's deadline can expire it. A `NonceUsed` skip is reported as `settled` only when a `Settled` event for that exact digest exists on-chain (a nonce consumed by a *different* mandate is `failed: nonce_used`).
+**Payee** (`@x402/express` around `createPaywall`): `accepted` must match the route's terms → in-flight claim on `from:nonce` (a concurrent duplicate, on any route, is `replay`) → facilitator `/verify` → run the handler with the response buffered → a handler status ≥ 400 cancels the payment → facilitator `/settle` → `PAYMENT-RESPONSE`, or 402 with the settlement failure. After a settlement the nonce stays refused locally; the chain refuses it anyway.
 
-**Contract** (`settle` / `settleBatch`, callable by anyone but effective only for payers who `authorizeSP`'d the caller): params → `authorizedSP(owner, msg.sender)` (enabled and no revocation in effect) → deadline → nonce unused → **full** balance ≥ amount → ECDSA recovery → mark nonce, debit, pay the payee. In `settleBatch` a failing item is skipped and reported via `SettleSkipped(digest, owner, nonce, status)` instead of reverting the batch.
+**Facilitator** (`@x402/evm` exact scheme): scheme, network and `extra.name/version` present → signature recovers to `from` → `to == payTo` → `validBefore ≥ now + 6`, `validAfter ≤ now` → `value == amount` (exact means exact) → the asset is a contract → `eth_call` simulation of `transferWithAuthorization`; on failure, Multicall3 diagnostics name the precise reason (`invalid_exact_evm_insufficient_balance`, `invalid_exact_evm_nonce_already_used`, …). `/settle` simulates again, broadcasts from the facilitator's key, waits for the receipt and checks the `Transfer` event. This repository's facilitator adds an asset allowlist and an optional payee allowlist (it is a public endpoint that pays gas), an optional bearer token, and answers 503 + `Retry-After` when the chain is unreachable instead of the misleading `invalid_exact_evm_signature` the scheme reports on a dead RPC.
 
-**Withdrawal safety**: `requestWithdraw` starts a timer (`withdrawDelay`; an SP refuses to start unless it exceeds the SP's settle window by at least 60 s of clock-skew margin). During the delay the SP can still settle against the full balance; `executeWithdraw` then pays out only what is left. `debitableBalance = balance − pending withdrawal` is what SPs admit *new* mandates against, so a mandate is never accepted against money already on its way out. This gives the same guarantee as FluxA's "auto-extending" withdrawal timer without a timer.
-
-Revoking a settlement processor is delayed the same way: `revokeSP(sp)` schedules the revocation for `now + withdrawDelay` (`SPRevocationScheduled`), the SP stays authorized until then, and `cancelRevoke(sp)` or a fresh `authorizeSP(sp)` clears it. Every mandate the SP receipted before the call is due inside its settle window (shorter than `withdrawDelay`), so it can still be settled; an immediate revocation would let a payer take delivery and revoke in the next block. This closes the payer's own `revokeSP` / `requestWithdraw` path only: a second SP the payer has authorized (including one the payer controls) can still consume a receipted mandate's nonce or balance first, see "Honest limitations". The SP refuses new mandates whose receipt would outlive a pending revocation (`sp_revocation_pending`), and the wallet's `reconcile()` labels an expiry that a revocation caused `payer_revoked` rather than `sp_default`.
+**Reconcile** (`MandateWallet.reconcile`): for every `rejected` / `unknown` row, read `authorizationState(payer, nonce)` at one block: used → `settled` (transaction from the `AuthorizationUsed` log); unused at a block whose timestamp is past `validBefore` → `expired-unused`, reservation released (every later block would revert the authorization, so no grace is needed); otherwise still pending. Rows that said `settled` are confirmed once after their validity ended and refunded when the chain never saw the nonce. Judged by chain time, never the wall clock; an RPC serving another chain is refused.
 
 ## Budgets (intent mandates)
 
-A human approves an **intent mandate** once — purpose, limit, validity, host allowlist, optional per-call cap and rate — and the agent pays within it with no further prompts. The wallet keeps `spentAmount` and `pendingSpentAmount` per mandate (persisted in `mandates.json`), reserves synchronously *before* signing so concurrent calls cannot overshoot, moves a reservation to spend as soon as the SP accepts the mandate (an enqueued mandate is irrevocable for the payer), and `reconcile()` confirms settlements on-chain, releases expired reservations, and flags an SP that broke its receipt.
-
-Deadline policy: the wallet signs `deadline = now + settleWindowSeconds + max(offer.maxTimeoutSeconds, 60)` (capped by `maxMandateValiditySeconds`), the payee refuses deadlines shorter than the settle window, the SP refuses deadlines closer than `MIN_DEADLINE_MARGIN` or further than `MAX_DEADLINE_HORIZON`, and everyone verifies `enqueueDeadline ≤ mandate.deadline`.
+A human approves an **intent mandate** once — purpose, limit, validity, host allowlist, optional per-call cap and rate — and the agent pays within it with no further prompts. The wallet keeps `spentAmount` and `pendingSpentAmount` per mandate (persisted in `mandates.json`), reserves synchronously *before* signing so concurrent calls cannot overshoot, moves a reservation to spend when the payee reports a settlement, and `reconcile()` settles the rest against the chain. The counters are a cache of the ledger and are rebuilt from it on load, so a crash between the two files heals itself.
 
 ## CLI
 
 ```bash
 AGENTPAY_HOME=$TMPDIR/ap npm run cli -- init --from-deployment localhost --key 0x…
-npm run cli -- deposit 5
-npm run cli -- sp-authorize 0x…sp
+npm run cli -- address                     # where to send USDC (no ETH needed)
+npm run cli -- balance
 npm run cli -- mandate-create --purpose "market data" --limit 1 --hosts 127.0.0.1
 npm run cli -- offer http://127.0.0.1:4021/predict
-npm run cli -- pay   http://127.0.0.1:4021/predict
+npm run cli -- pay   http://127.0.0.1:4021/predict     # signs offline; the payee settles
 npm run cli -- report
+npm run cli -- reconcile
 ```
 
-Agents use `mandate-request` (creates a draft) and stop until the human runs `mandate-approve <id>`; see [packages/cli/SKILL.md](packages/cli/SKILL.md) for the decision flow an LLM agent should follow. Config precedence: flags > `AGENTPAY_*` env > `$AGENTPAY_HOME/config.json` > `contracts/deployments/<name>.json`.
+Agents use `mandate-request` (creates a draft) and stop until the human runs `mandate-approve <id>`; see [packages/cli/SKILL.md](packages/cli/SKILL.md) for the decision flow an LLM agent should follow, including "run `reconcile` before paying again when an outcome was `unknown`". Config precedence: flags > `AGENTPAY_*` env > `$AGENTPAY_HOME/config.json` > `contracts/deployments/<name>.json` (which supplies the token and its EIP-712 domain).
 
 ## Running the pieces yourself (local)
 
 ```bash
 (cd packages/contracts && npx hardhat node --port 8545)  # terminal 1
-npm run deploy:local                                   # writes packages/contracts/deployments/localhost.json
-SP_PK=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 npm run sp        # terminal 2 (hardhat #3)
-PAYEE_PK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a npm run payee  # terminal 3 (hardhat #2)
+npm run deploy:local                                   # MockUSDC + Multicall3; writes packages/contracts/deployments/localhost.json
+FACILITATOR_PK=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 npm run facilitator  # terminal 2 (hardhat #3)
+npm run payee                                          # terminal 3 (pays to hardhat #2 by default)
 curl -i http://127.0.0.1:4021/predict                  # 402 + PAYMENT-REQUIRED
 ```
 
-Then use the CLI as above with `AGENTPAY_KEY` = hardhat #1 (`0x59c6…690d`). All of these are Hardhat's public dev keys; never use them with real funds.
-
-The SP persists its queue to `STORE_PATH` (default `packages/sp/data/sp-queue.jsonl`, gitignored): every receipt it signs is fsynced to that file first, so a restart, `kill -9` included, resumes settling what it promised. `STORE_PATH=:memory:` keeps the queue in memory only; the SP says so at startup, and receipts do not survive a restart. After restarting the local hardhat node (and `deploy:local`, which lands on the same addresses), delete `packages/sp/data/sp-queue.jsonl` or start the SP with `STORE_PATH=:memory:`: the file still holds the previous chain's queue, whose reservations and settlements would otherwise be replayed against the fresh one (binding the store to a deployment is a later item).
+Then use the CLI as above with `AGENTPAY_KEY` = hardhat #1 (`0x59c6…690d`). All of these are Hardhat's public dev keys; never use them with real funds. The facilitator refuses to start without ETH, if the token is not EIP-3009, or if the configured domain does not match the token's `eip712Domain()` / `DOMAIN_SEPARATOR()`.
 
 ## Base Sepolia
 
+Nothing of this repository is deployed there: `packages/contracts/deployments/base-sepolia.json` is a static record of Circle's testnet USDC (`0x036CbD53842c5426634e7929541eC2318f3dCF7e`, domain `USDC` / `2`, checked against `DOMAIN_SEPARATOR()` on chain) and of Coinbase's hosted facilitator.
+
 ```bash
-cp .env.example .env            # fill DEPLOYER_PK (funded with Base Sepolia ETH), SP_PK
-npm run deploy:base-sepolia     # deploys AEP2DebitWallet against Circle's testnet USDC 0x036CbD53842c5426634e7929541eC2318f3dCF7e
-DEPLOYMENT=base-sepolia npm run sp                                 # STORE_PATH defaults to packages/sp/data/sp-queue.jsonl
-DEPLOYMENT=base-sepolia PAYEE_PK=… npm run payee
-DEPLOYMENT=base-sepolia AGENTPAY_KEY=… npm run cli -- deposit 1     # needs test USDC in the payer EOA
+DEPLOYMENT=base-sepolia FACILITATOR_URL=https://x402.org/facilitator PAYEE_ADDRESS=0x… npm run payee
+DEPLOYMENT=base-sepolia AGENTPAY_KEY=… npm run cli -- init --from-deployment base-sepolia
+npm run cli -- address        # send Base Sepolia test USDC here; no ETH needed
+npm run cli -- pay http://127.0.0.1:4021/predict
 ```
 
-## Differences from FluxA (deliberate)
+To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_PK=… PAYEES=0x… npm run facilitator` (the key needs Base Sepolia ETH). Expect roughly 2–4 s per paid call on Base (one block plus receipt polling), against ~50 ms on an automining hardhat node.
 
-1. `deadline` is `uint64` and `usedNonces` is keyed `(owner, nonce)` (FluxA: `uint256` and `(owner, token, nonce)`), so signatures are not interchangeable with FluxA's deployed contract.
-2. SP receipts are EIP-712 typed data (FluxA: `personal_sign` over packed bytes).
-3. **Security fix** — `settle` checks the payer's *full* balance, not the balance minus a pending withdrawal. In FluxA's reference contract `requestWithdraw` debits immediately, so a payer could get served, request a withdrawal of everything, and starve settlement.
-4. **Security fix** — settlement processors are authorized by each payer (`authorizeSP`), as FluxA's docs describe, instead of a contract-wide `setSP` by the deployer, and a revocation (`revokeSP`) takes effect only after `withdrawDelay`, so mandates the SP receipted before it can still be settled against the payer's own revoke and withdraw calls (not against a second SP the payer authorized; see "Honest limitations"). The contract has no admin.
-5. No ZK batch proof: `settleBatch` verifies each signature on-chain (the demo measures ~43k gas per mandate in a batch of 24 on Hardhat). Batching still amortizes the transaction overhead; a proof-based aggregator could replace the loop without changing the wire format.
+## Differences from the x402 reference setup (deliberate)
+
+1. **A budget in front of the client.** The official client signs whatever it is asked to; `MandateWallet` only signs inside an approved intent mandate, reserves before signing, keeps a ledger and reconciles it. The client's own spend controls are switched off because the gate replaces them.
+2. **The wallet pins the token domain.** It refuses offers whose `extra.name/version` differ from its configured domain instead of signing under whatever the offer says.
+3. **An in-flight guard on the payee.** The reference middleware lets the same authorization be served twice while its first settlement is pending (on the same or another route with equal terms); `createPaywall` claims `from:nonce` before verifying.
+4. **Facilitator hardening.** Allowlists, a bearer token, offline EOA signature checks and honest 503s on RPC outages, plus a send lock so parallel settlements never trip Hardhat's strict nonce ordering.
+5. **V2 only, `exact` only, EIP-3009 only.** No V1 headers, no `upto`, no Permit2, no smart-wallet signatures (EIP-1271/6492 are the scheme's, untested here).
 
 ## Honest limitations
 
-- MVP, unaudited. `MockUSDC` is a test token with open mint; `AEP2DebitWallet` has no fee logic, no upgradeability, no pause.
-- A payer may authorize several SPs, and each one reserves against the same `debitableBalance` on its own: their combined admissions can exceed it, and the later settlement then fails as `InsufficientBalance`. Authorize one SP at a time. The same mechanism lets a payer void a receipted mandate on purpose: `authorizeSP` accepts any address, the payer's own included, and nothing on-chain ties a consumed nonce or the balance to the mandate the SP receipted, so a payer can take delivery and, in the next block, settle a one-unit mandate with the same nonce (`NonceUsed`) or a mandate to itself for the balance (`InsufficientBalance`) through an SP it controls. The delayed revocation and withdrawal protect receipts from the payer's `revokeSP` / `requestWithdraw` only; a receipt is ultimately backed by the payer having authorized only the SP that issued it, which the contract lets nobody verify (authorizations are not enumerable) or enforce.
-- The SP is a single process with an append-only JSONL store that is never compacted (one line per enqueue and per status change, so it grows with the SP's history until you rotate it while the SP is stopped); the payee's idempotency store is in-memory (swap `IdempotencyStore` for Redis in multi-instance deployments). Across a payee restart, a replayed mandate is caught through the SP's `created: false` answer only once it is older than 60 s (`REPLAY_GRACE_SECONDS`); inside that window a re-presented mandate is treated as the payee's own retry after an SP timeout.
-- The wallet's budget store (`mandates.json`) is single-writer: it is loaded once per `MandateWallet` and rewritten whole on save, so two processes sharing one `AGENTPAY_HOME` (two concurrent `agentpay pay` runs, or an agent process plus the CLI) can overwrite each other's counters and overshoot a limit. Run one wallet process per home directory, or put a lock around it before multi-process use.
-- No KYC/KYB/KYA provider, no dispute processor, no payment links, cards, marketplace, or UI — FluxA's surfaces beyond the core protocol are out of scope here.
-- Trust model: the payee trusts the SP's receipt (the SP could fail to settle; `reconcile()` detects that as `spDefaults`, nothing enforces it on-chain yet), and the payer trusts the payee to deliver (no delivery receipt or recourse in AEP2).
+- **Custody moved to the EOA.** The USDC sits in the payer's own account: whoever holds `AGENTPAY_KEY` / `config.json` can move all of it with one `transfer`, and intent mandates bind the agent, not the key. Keep a small float there and top it up from a cold key; `balance` warns above `caps.floatWarnAtomic`.
+- **Settle after the handler means a handler can run and not be paid** (settlement fails after a 2xx: the client gets a 402 and the work was done). This is the x402 `authorization` flow's known cost; a handler that fails is never charged.
+- **A refused or lost call keeps its budget reserved until the authorization expires** (`maxTimeoutSeconds`, capped by the wallet); the payee could still settle it in that window. `reconcile()` releases it by chain time.
+- **A facilitator that broadcast but timed out** answers `settlement_pending` with the transaction; the payer was probably charged and the payee already answered 402. The wallet records `unknown` and `reconcile()` corrects it. The pending-settlement dedupe is per facilitator process.
+- **Self-hosted facilitator on a real network:** the key needs ETH, and there is no replacement logic for a stuck or underpriced transaction (the nonce manager will queue behind it; restart to resync).
+- **One wallet process per `AGENTPAY_HOME`** (unchanged): two processes sharing `mandates.json` can overshoot a limit.
+- On-chain payments are public; USDC can be frozen by its issuer; MockUSDC has an open mint and exists only for local chains.

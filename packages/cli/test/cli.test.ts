@@ -5,15 +5,18 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { KEYS, startStubPayee, type StubPayee } from '../../wallet/test/stub-payee.js';
+import { privateKeyToAccount } from 'viem/accounts';
+import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
+import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from '../../wallet/test/stub-payee.js';
 import { run } from '../src/cli.js';
 
 const execFileAsync = promisify(execFile);
 const CLI_DIR = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
-// Any well-formed addresses will do: nothing in these tests touches a chain.
-const WALLET = '0x5FbDB2315678afecb367f032d93F642f64180aa3';
+// Any well-formed address will do: nothing in these tests touches a chain.
 const TOKEN = '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512';
+const payeeAddress = privateKeyToAccount(KEYS.payee).address;
+const facilitatorAddress = privateKeyToAccount(KEYS.facilitator).address;
 
 function baseEnv(home: string): NodeJS.ProcessEnv {
   return {
@@ -21,9 +24,22 @@ function baseEnv(home: string): NodeJS.ProcessEnv {
     AGENTPAY_HOME: home,
     AGENTPAY_KEY: KEYS.payer,
     AGENTPAY_RPC: 'http://127.0.0.1:1',
-    AGENTPAY_WALLET: WALLET,
     AGENTPAY_TOKEN: TOKEN,
+    AGENTPAY_TOKEN_NAME: MOCK_USDC_DOMAIN.name,
+    AGENTPAY_TOKEN_VERSION: MOCK_USDC_DOMAIN.version,
     AGENTPAY_NETWORK: 'eip155:31337',
+  };
+}
+
+function stubOptions(over: Partial<StubPayeeOptions> = {}): StubPayeeOptions {
+  return {
+    payTo: payeeAddress,
+    token: TOKEN,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
+    network: 'eip155:31337',
+    price: '$0.001',
+    facilitatorAddress,
+    ...over,
   };
 }
 
@@ -37,15 +53,7 @@ describe('agentpay CLI', () => {
   beforeAll(async () => {
     home = mkdtempSync(join(tmpdir(), 'agentpay-cli-'));
     env = baseEnv(home);
-    payee = await startStubPayee({
-      payeeKey: KEYS.payee,
-      spKey: KEYS.sp,
-      wallet: WALLET,
-      token: TOKEN,
-      network: 'eip155:31337',
-      price: '1000',
-      settleWindowSeconds: 300,
-    });
+    payee = await startStubPayee(stubOptions());
   });
 
   afterAll(async () => {
@@ -69,7 +77,23 @@ describe('agentpay CLI', () => {
     // DEPLOYMENT names a record that does not exist, so the localhost fallback is not consulted.
     const r = await run(['mandate-list'], { PATH: env.PATH, AGENTPAY_HOME: home, AGENTPAY_KEY: KEYS.payer, DEPLOYMENT: 'does-not-exist' });
     expect(r.code).toBe(2);
-    expect((r.output as Out).message).toMatch(/missing configuration: wallet/);
+    expect((r.output as Out).message).toMatch(/missing configuration: token/);
+    // a token without its domain is not enough: the payer would sign under the wrong domain
+    const noDomain = await run(['mandate-list'], { ...env, AGENTPAY_TOKEN_NAME: undefined, AGENTPAY_TOKEN_VERSION: undefined, DEPLOYMENT: 'does-not-exist' });
+    expect(noDomain.code).toBe(2);
+    expect((noDomain.output as Out).message).toMatch(/token domain/);
+  });
+
+  it('address prints where to send USDC; balance and reconcile need an RPC', async () => {
+    const a = await run(['address'], env);
+    expect(a.code).toBe(0);
+    expect((a.output as Out).address).toBe(privateKeyToAccount(KEYS.payer).address);
+    expect((a.output as Out).tokenDomain).toEqual(MOCK_USDC_DOMAIN);
+    // networks with a known public RPC get it by default; one without needs --rpc for the chain commands
+    const noRpc = { ...env, AGENTPAY_RPC: undefined, AGENTPAY_NETWORK: 'eip155:5' };
+    expect((await run(['balance'], noRpc)).code).toBe(2);
+    expect((await run(['reconcile'], noRpc)).code).toBe(2);
+    expect((await run(['address'], noRpc)).code).toBe(0); // signing-only commands work without one
   });
 
   it('mandate-create / list / status / disable', async () => {
@@ -120,31 +144,35 @@ describe('agentpay CLI', () => {
     expect(r.code).toBe(0);
     const out = r.output as Out;
     expect(out.status).toBe(402);
-    expect(out.offer[0].scheme).toBe('aep2');
+    expect(out.offer[0].scheme).toBe('exact');
     expect(out.offer[0].amount).toBe('1000');
+    expect(out.offer[0].extra).toMatchObject(MOCK_USDC_DOMAIN);
+    expect(out.resource.url).toBe(`${payee.url}/predict`);
+    expect(out.payment_model_context.reason).toBe('payment_required');
     expect(payee.served).toBe(0);
   });
 
-  it('pay pays through the wallet and reports the SP receipt; ledger and report reflect it', async () => {
+  it('pay pays through the wallet and reports the settlement; ledger and report reflect it', async () => {
     const r = await run(['pay', `${payee.url}/predict`], env);
     expect(r.code).toBe(0);
     const out = r.output as Out;
     expect(out.paid).toBe(true);
     expect(out.status).toBe(200);
-    expect(out.payment.mandateDigest).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(out.payment.spReceipt.sp.toLowerCase()).toBe(payee.spAddress.toLowerCase());
+    expect(out.payment.transaction).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(out.payment.nonce).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(out.payment.payer).toBe(privateKeyToAccount(KEYS.payer).address);
     expect(out.payment.amount).toBe('1000');
-    expect(out.payment.ledgerStatus).toBe('enqueued');
+    expect(out.payment.ledgerStatus).toBe('settled');
     expect(payee.served).toBe(1);
 
     const ledger = await run(['ledger'], env);
     expect((ledger.output as Out).count).toBe(1);
-    const enqueuedOnly = await run(['ledger', '--status', 'settled'], env);
-    expect((enqueuedOnly.output as Out).count).toBe(0);
+    const rejectedOnly = await run(['ledger', '--status', 'rejected'], env);
+    expect((rejectedOnly.output as Out).count).toBe(0);
 
     const report = await run(['report'], env);
     expect((report.output as Out).report.totals.spent).toBe('1000');
-    expect((report.output as Out).report.totals.enqueued).toBe(1);
+    expect((report.output as Out).report.totals.settled).toBe(1);
   });
 
   it('pay is refused before signing once the budget is exhausted (exit 1 + payment_model_context)', async () => {
@@ -162,17 +190,9 @@ describe('agentpay CLI', () => {
     expect(payee.served).toBe(servedBefore);
   });
 
-  it('pay surfaces a payee rejection as exit 1 with the payee reason', async () => {
-    const rejecting = await startStubPayee({
-      payeeKey: KEYS.payee,
-      spKey: KEYS.sp,
-      wallet: WALLET,
-      token: TOKEN,
-      network: 'eip155:31337',
-      price: '100',
-      settleWindowSeconds: 300,
-      mode: { reject: { status: 402, body: { error: 'settlement_unavailable: sp_not_authorized' } } },
-    });
+  it('pay surfaces a facilitator refusal as exit 1 with the reason and its hint', async () => {
+    const rejecting = await startStubPayee(stubOptions({ price: '$0.0001' }));
+    rejecting.mode = { kind: 'invalid', reason: 'invalid_exact_evm_insufficient_balance' };
     try {
       // A fresh mandate with budget for this (cheaper) resource.
       const created = await run(['mandate-create', '--purpose', 'rejected', '--limit', '1', '--hosts', '127.0.0.1'], env);
@@ -180,10 +200,25 @@ describe('agentpay CLI', () => {
       expect(r.code).toBe(1);
       const out = r.output as Out;
       expect(out.status).toBe(402);
-      expect(out.error).toBe('settlement_unavailable: sp_not_authorized');
-      expect(out.payment_model_context.reason).toBe('settlement_unavailable');
+      expect(out.error).toBe('invalid_exact_evm_insufficient_balance');
+      expect(out.payment_model_context.commands).toContain('agentpay address');
     } finally {
       await rejecting.close();
+    }
+  });
+
+  it('a 2xx without a settlement report is paid: false with the reconcile-first hint', async () => {
+    const raw = await startStubPayee(stubOptions({ price: '$0.0001', rawMode: 'no-response-header' }));
+    try {
+      const created = await run(['mandate-create', '--purpose', 'raw', '--limit', '1', '--hosts', '127.0.0.1'], env);
+      const r = await run(['pay', `${raw.url}/raw`, '--mandate', (created.output as Out).mandate.id], env);
+      expect(r.code).toBe(0);
+      const out = r.output as Out;
+      expect(out.paid).toBe(false);
+      expect(out.payment.ledgerStatus).toBe('unknown');
+      expect(out.payment.payment_model_context.commands).toContain('agentpay reconcile');
+    } finally {
+      await raw.close();
     }
   });
 

@@ -1,5 +1,5 @@
 /**
- * agentpay — agent-facing CLI for the AEP2-style debit wallet.
+ * agentpay — agent-facing CLI for the budgeted x402 wallet.
  *
  * Every command writes exactly one JSON document to stdout. Exit codes:
  *   0 success · 1 business error (policy denial, payee rejection, revert)
@@ -17,14 +17,9 @@ import { init } from './commands/init.js';
 
 export const USAGE = `usage: agentpay <command> [options]
 
-wallet (on-chain)                  (amounts are US dollars: 5, 0.25, $0.001)
-  balance                          balances, debitable amount, pending withdrawal
-  deposit <usd>                    approve + deposit into the debit wallet
-  withdraw-request <usd>           start the withdrawal timer
-  withdraw-cancel                  cancel a pending withdrawal
-  withdraw [--to 0x..]             pay out a matured withdrawal
-  sp-authorize <0xsp>              let a settlement processor debit this account
-  sp-revoke <0xsp>                 revoke it (takes effect after the withdrawal delay)
+wallet                             (amounts are US dollars: 5, 0.25, $0.001)
+  address                          the payer address to send USDC to (no ETH needed)
+  balance                          USDC balance of the payer address
 
 intent mandates (budgets)
   mandate-request --purpose "…" --limit <usd> --hosts a.com[,b.com] [--valid-for s] [--category c] [--per-call usd] [--rate n]
@@ -38,22 +33,20 @@ intent mandates (budgets)
 
 payments
   offer <url> [--method m --body b --header k=v]   print the 402 offer, pay nothing
-  pay <url> [--method m --body b --header k=v --mandate id --prepay --legacy]
+  pay <url> [--method m --body b --header k=v --mandate id --prepay]
   ledger [--status s] | reconcile | report
 
 setup
-  init [--from-deployment localhost|base-sepolia|path.json] [--key 0x.. --rpc url --wallet 0x.. --token 0x.. --network eip155:n --sp 0x..,0x..]
+  init [--from-deployment localhost|base-sepolia|path.json] [--key 0x.. --rpc url --token 0x.. --network eip155:n]
 
-global options: --key --rpc --wallet --token --network --sp --home --deployment
+global options: --key --rpc --token --network --home --deployment
 config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > packages/contracts/deployments/<name>.json`;
 
 const OPTIONS = {
   key: { type: 'string' },
   rpc: { type: 'string' },
-  wallet: { type: 'string' },
   token: { type: 'string' },
   network: { type: 'string' },
-  sp: { type: 'string' },
   home: { type: 'string' },
   deployment: { type: 'string' },
   'from-deployment': { type: 'string' },
@@ -70,8 +63,6 @@ const OPTIONS = {
   header: { type: 'string', multiple: true },
   mandate: { type: 'string' },
   prepay: { type: 'boolean' },
-  legacy: { type: 'boolean' },
-  to: { type: 'string' },
   status: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
@@ -81,13 +72,8 @@ type Flags = { [K in keyof typeof OPTIONS]?: (typeof OPTIONS)[K] extends { multi
 type Handler = (ctx: CommandContext, positional: string[], flags: Flags) => Promise<CliResult>;
 
 const COMMANDS: Record<string, Handler> = {
+  address: chain.address,
   balance: chain.balance,
-  deposit: chain.deposit,
-  'withdraw-request': chain.withdrawRequest,
-  'withdraw-cancel': chain.withdrawCancel,
-  withdraw: chain.withdraw,
-  'sp-authorize': chain.spAuthorize,
-  'sp-revoke': chain.spRevoke,
   'mandate-request': mandate.mandateRequest,
   'mandate-create': mandate.mandateCreate,
   'mandate-approve': mandate.mandateApprove,

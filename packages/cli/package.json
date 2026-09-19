@@ -16,6 +16,11 @@
     "@agentpay/contracts": "*",
     "@agentpay/core": "*",
     "@agentpay/wallet": "*",
+    "@x402/core": "~2.26.0",
     "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@agentpay/payee": "*",
+    "express": "^4.21.0"
   }
 }

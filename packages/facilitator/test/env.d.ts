@@ -5,8 +5,6 @@ declare module 'vitest' {
     rpcUrl: string;
     chainId: number;
     usdc: Address;
-    wallet: Address;
-    withdrawDelay: number;
   }
 }
 

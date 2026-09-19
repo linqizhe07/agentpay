@@ -8,12 +8,8 @@ module.exports = {
     version: '0.8.24',
     settings: {
       optimizer: { enabled: true, runs: 200 },
-      // authorize() carries the full EIP-3009 arg surface (13 args) — needs IR
-      // codegen to avoid stack-too-deep.
-      viaIR: true,
       // OpenZeppelin 5.x uses the mcopy opcode; 0.8.24 defaults to shanghai.
-      // ReentrancyGuardTransient also needs EIP-1153 (tload/tstore), so the
-      // target chain must be Cancun-capable: Base (mainnet and Sepolia) is.
+      // Base (mainnet and Sepolia) is Cancun-capable.
       evmVersion: 'cancun',
     },
   },

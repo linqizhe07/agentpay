@@ -27,10 +27,9 @@ export class CommandContext {
       this.walletInstance = new MandateWallet({
         key: requireKey(this.config),
         rpcUrl: this.config.rpcUrl,
-        walletContract: this.config.walletContract,
         token: this.config.token,
+        assetDomain: this.config.tokenDomain,
         network: this.config.network,
-        trustedSps: this.config.trustedSps.length > 0 ? this.config.trustedSps : undefined,
         mandatesPath: this.config.mandatesPath,
         ledgerPath: this.config.ledgerPath,
         fetch: this.fetch,

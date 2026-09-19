@@ -2,24 +2,19 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { hashTypedData } from 'viem';
+import { hashTypedData, verifyTypedData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import {
-  HEADER,
-  PolicyViolation,
-  WireError,
-  mandateDigest,
-  recoverMandateSigner,
-  resourceRef,
-  type Address,
-  type Hex,
-} from '@agentpay/core';
+import { decodePaymentResponseHeader } from '@x402/core/http';
+import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
+import { PolicyViolation, WireError, type Address, type Hex } from '@agentpay/core';
 import {
   INTENT_DOMAIN,
   INTENT_MANDATE_TYPES,
   IntentMandateStore,
+  LEDGER_STATUS_HEADER,
   Ledger,
   MandateWallet,
+  NONCE_HEADER,
   intentMandateHash,
   matchHost,
   recoverIntentMandateSigner,
@@ -31,12 +26,13 @@ import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from './s
 
 const NETWORK = 'eip155:31337';
 const CHAIN_ID = 31337;
-const WALLET = ('0x' + '22'.repeat(20)) as Address;
 const TOKEN = ('0x' + '11'.repeat(20)) as Address;
-const PRICE = '1000'; // $0.001
-const SETTLE_WINDOW = 600;
+const PRICE = '$0.001';
+const AMOUNT = 1000n;
+const MAX_TIMEOUT = 60;
 const payerAccount = privateKeyToAccount(KEYS.payer);
-const spAddress = privateKeyToAccount(KEYS.sp).address;
+const payeeAddress = privateKeyToAccount(KEYS.payee).address;
+const facilitatorAddress = privateKeyToAccount(KEYS.facilitator).address;
 const strangerAddress = privateKeyToAccount(KEYS.stranger).address;
 
 const root = mkdtempSync(join(tmpdir(), 'agentpay-wallet-test-'));
@@ -57,12 +53,14 @@ function makeWallet(over: Partial<MandateWalletOptions> = {}): Made {
   const account = over.account ?? privateKeyToAccount(KEYS.payer);
   const wallet = new MandateWallet({
     account,
-    rpcUrl: 'http://127.0.0.1:1', // never reachable; offline suite
-    walletContract: WALLET,
+    // offline suite: fetch() never touches the chain, reconcile() must fail fast
+    rpcUrl: 'http://127.0.0.1:1',
     token: TOKEN,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     network: NETWORK,
     mandatesPath,
     ledgerPath,
+    transportRetries: { attempts: 2, delayMs: 5 },
     ...over,
   });
   return { wallet, dir, mandatesPath, ledgerPath, account };
@@ -71,13 +69,13 @@ function makeWallet(over: Partial<MandateWalletOptions> = {}): Made {
 const servers: StubPayee[] = [];
 async function serve(over: Partial<StubPayeeOptions> = {}): Promise<StubPayee> {
   const s = await startStubPayee({
-    payeeKey: KEYS.payee,
-    spKey: KEYS.sp,
-    wallet: WALLET,
+    payTo: payeeAddress,
     token: TOKEN,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     network: NETWORK,
     price: PRICE,
-    settleWindowSeconds: SETTLE_WINDOW,
+    maxTimeoutSeconds: MAX_TIMEOUT,
+    facilitatorAddress,
     ...over,
   });
   servers.push(s);
@@ -117,11 +115,36 @@ async function expectViolation(p: Promise<unknown>, reason: string): Promise<Pol
   expect(err).toBeInstanceOf(PolicyViolation);
   expect((err as PolicyViolation).reason).toBe(reason);
   expect((err as PolicyViolation).payment_model_context?.reason).toBe(reason);
-  expect((err as PolicyViolation).payment_model_context?.protocol).toBe('aep2');
+  expect((err as PolicyViolation).payment_model_context?.protocol).toBe('x402');
   return err as PolicyViolation;
 }
 
 const nowSec = () => Math.floor(Date.now() / 1000);
+
+const ledgerEntry = (nonceByte: string, over: Partial<LedgerEntry> = {}): LedgerEntry => {
+  const nonce = ('0x' + nonceByte.repeat(32)) as Hex;
+  return {
+    v: 2,
+    kind: 'payment',
+    timestamp: 1,
+    url: 'http://x/y',
+    host: 'x',
+    resource: 'GET /y',
+    network: NETWORK,
+    asset: TOKEN,
+    amount: '5',
+    payer: payerAccount.address,
+    payee: strangerAddress,
+    intentMandateId: 'im_1',
+    nonce,
+    validBefore: 2,
+    authorization: { from: payerAccount.address, to: strangerAddress, value: '5', validAfter: '0', validBefore: '2', nonce },
+    signature: '0x' as Hex,
+    httpStatus: 200,
+    status: 'settled',
+    ...over,
+  };
+};
 
 // ---------------------------------------------------------------------------
 
@@ -142,48 +165,19 @@ describe('matchHost', () => {
   });
 });
 
-const ledgerEntry = (digest: string, over: Partial<LedgerEntry> = {}): LedgerEntry => ({
-  kind: 'payment',
-  timestamp: 1,
-  url: 'http://x/y',
-  host: 'x',
-  resource: 'GET /y',
-  network: NETWORK,
-  asset: TOKEN,
-  amount: '5',
-  payer: payerAccount.address,
-  payee: strangerAddress,
-  walletContract: WALLET,
-  intentMandateId: 'im_1',
-  mandate: {
-    owner: payerAccount.address,
-    token: TOKEN,
-    payee: strangerAddress,
-    amount: '5',
-    nonce: '1',
-    deadline: 2,
-    ref: resourceRef('GET /y'),
-  },
-  payerSig: '0x' as Hex,
-  mandateDigest: ('0x' + digest.repeat(32)) as Hex,
-  httpStatus: 200,
-  status: 'enqueued',
-  ...over,
-});
-
 describe('Ledger', () => {
-  it('appends, reads back, and patches status by digest', () => {
+  it('appends, reads back, and patches status by nonce', () => {
     const ledger = new Ledger(join(root, 'ledger-unit', 'ledger.jsonl'));
-    const entry = ledgerEntry('ab');
+    const entry = ledgerEntry('ab', { status: 'rejected' });
     expect(ledger.read()).toEqual([]);
     ledger.append(entry);
     ledger.append(ledgerEntry('cd'));
     expect(ledger.read()).toHaveLength(2);
-    ledger.updateStatus(entry.mandateDigest, 'settled', { settledTx: ('0x' + '01'.repeat(32)) as Hex });
+    ledger.updateStatus(entry.nonce, 'settled', { transaction: ('0x' + '01'.repeat(32)) as Hex });
     const [a, b] = ledger.read();
     expect(a.status).toBe('settled');
-    expect(a.settledTx).toBe('0x' + '01'.repeat(32));
-    expect(b.status).toBe('enqueued');
+    expect(a.transaction).toBe('0x' + '01'.repeat(32));
+    expect(b.status).toBe('settled');
     expect(() => ledger.updateStatus(('0x' + 'ee'.repeat(32)) as Hex, 'settled')).toThrow(/no ledger entry/);
   });
 
@@ -192,8 +186,8 @@ describe('Ledger', () => {
     const ledger = new Ledger(join(dir, 'ledger.jsonl'));
     const entry = ledgerEntry('ab');
     ledger.append(entry);
-    ledger.updateStatus(entry.mandateDigest, 'settled');
-    ledger.updateStatus(entry.mandateDigest, 'expired-unused');
+    ledger.updateStatus(entry.nonce, 'settled');
+    ledger.updateStatus(entry.nonce, 'expired-unused');
     expect(readdirSync(dir)).toEqual(['ledger.jsonl']);
     expect(ledger.read().map((e) => e.status)).toEqual(['expired-unused']);
   });
@@ -203,7 +197,7 @@ describe('Ledger', () => {
     const w = new Ledger(path);
     const a = ledgerEntry('ab');
     w.append(a);
-    const torn = '{"kind":"payment","mandateDigest":"0x00","status":"enq';
+    const torn = '{"v":2,"kind":"payment","nonce":"0x00","status":"sett';
     appendFileSync(path, torn, 'utf8'); // crash mid-append
     const asLeft = readFileSync(path, 'utf8');
 
@@ -226,8 +220,8 @@ describe('Ledger', () => {
 
     // updateStatus() rewrites only what parsed, so a torn tail goes away with it
     appendFileSync(path, torn, 'utf8');
-    r.updateStatus(a.mandateDigest, 'settled');
-    expect(new Ledger(path).read().map((e) => e.status)).toEqual(['settled', 'enqueued']);
+    r.updateStatus(a.nonce, 'expired-unused');
+    expect(new Ledger(path).read().map((e) => e.status)).toEqual(['expired-unused', 'settled']);
     expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(3);
   });
 
@@ -240,7 +234,6 @@ describe('Ledger', () => {
     expect(new Ledger(path, (line) => warnings.push(line)).read()).toEqual([a]);
     expect(warnings).toEqual([]);
     expect(readFileSync(path, 'utf8').endsWith('\n')).toBe(false); // a reader leaves the file alone
-    // append() terminates it instead of gluing the next line on
     const b = ledgerEntry('cd');
     new Ledger(path).append(b);
     expect(new Ledger(path).read()).toEqual([a, b]);
@@ -253,9 +246,21 @@ describe('Ledger', () => {
     new Ledger(path).append(a);
     writeFileSync(path, `${JSON.stringify(a)}\n{"kind":"pay\n${JSON.stringify(ledgerEntry('cd'))}\n`, 'utf8');
     expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 2/);
-    expect(() => new Ledger(path).updateStatus(a.mandateDigest, 'settled')).toThrow(/malformed ledger line 2/);
+    expect(() => new Ledger(path).updateStatus(a.nonce, 'settled')).toThrow(/malformed ledger line 2/);
     writeFileSync(path, '42\n', 'utf8');
     expect(() => new Ledger(path).read()).toThrow(/malformed ledger line 1 .*not an object/);
+  });
+
+  it('refuses an AEP2-era ledger instead of guessing at its rows', () => {
+    const path = join(root, 'ledger-aep2', 'ledger.jsonl');
+    mkdirSync(dirname(path), { recursive: true });
+    const old = { kind: 'payment', mandateDigest: '0x' + 'ab'.repeat(32), status: 'enqueued', amount: '1000', intentMandateId: 'im_1' };
+    writeFileSync(path, `${JSON.stringify(old)}\n`, 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/AEP2-era row \(v1\).*fresh AGENTPAY_HOME/);
+    // and the wallet refuses to start on it, so a stale budget is never rebuilt from it
+    expect(() => makeWallet({ ledgerPath: path })).toThrow(/AEP2-era/);
+    writeFileSync(path, `${JSON.stringify({ ...ledgerEntry('ab'), v: 3 })}\n`, 'utf8');
+    expect(() => new Ledger(path).read()).toThrow(/version 3/);
   });
 });
 
@@ -333,20 +338,16 @@ describe('intent mandate lifecycle', () => {
       rejected: [{ id: draft.id, reason: 'mandate_required', detail: expect.anything() }],
     });
     await expectViolation(wallet.fetch(`${s.url}/predict`), 'mandate_required');
-    expect(s.mandates).toHaveLength(0);
+    expect(s.payments).toHaveLength(0);
 
     const signed = await wallet.approveIntentMandate(draft.id);
     expect(signed.status).toBe('signed');
     expect(signed.signedAt).toBeGreaterThan(0);
     expect(await recoverIntentMandateSigner(CHAIN_ID, signed, signed.signature!)).toBe(wallet.address);
-    expect(wallet.eligibleMandates({ host: '127.0.0.1', amount: 1000n }).eligible.map((m) => m.id)).toEqual([
-      draft.id,
-    ]);
-    // eligibleMandates accepts host:port too and matches on the bare hostname
+    expect(wallet.eligibleMandates({ host: '127.0.0.1', amount: 1000n }).eligible.map((m) => m.id)).toEqual([draft.id]);
     expect(wallet.eligibleMandates({ host: '127.0.0.1:8080', amount: 1000n }).eligible).toHaveLength(1);
     expect(wallet.remaining(draft.id)).toBe(2_500_000n);
 
-    // approving twice is idempotent; the persisted file has the signature
     expect((await wallet.approveIntentMandate(draft.id)).signature).toBe(signed.signature);
     expect(new IntentMandateStore(mandatesPath).get(draft.id)?.signature).toBe(signed.signature);
 
@@ -369,6 +370,7 @@ describe('intent mandate lifecycle', () => {
     expect(wallet.getMandate(ok.id)?.id).toBe(ok.id);
     expect(wallet.listMandates()).toHaveLength(1);
     expect(() => wallet.remaining('im_nope')).toThrow(/no intent mandate/);
+    expect(() => makeWallet({ assetDomain: { name: '', version: '2' } })).toThrow(/assetDomain/);
   });
 
   it('setEnabled toggles and persists', async () => {
@@ -384,7 +386,7 @@ describe('intent mandate lifecycle', () => {
 // ---------------------------------------------------------------------------
 
 describe('policy gate: every PolicyReason fires BEFORE signTypedData', () => {
-  it('unsupported_offer (no aep2 offer for this wallet token)', async () => {
+  it('unsupported_offer (no exact offer for this wallet token)', async () => {
     const s = await serve();
     const { wallet, account } = makeWallet({ token: strangerAddress });
     await approved(wallet);
@@ -392,32 +394,31 @@ describe('policy gate: every PolicyReason fires BEFORE signTypedData', () => {
     const err = await expectViolation(wallet.fetch(`${s.url}/predict`), 'unsupported_offer');
     expect(err.detail?.offered).toBe(1);
     expect(spy).not.toHaveBeenCalled();
-    expect(s.mandates).toHaveLength(0);
+    expect(s.payments).toHaveLength(0);
   });
 
-  it('unsupported_offer when the offer names another debit-wallet contract or network', async () => {
-    const other = await serve({ wallet: strangerAddress });
+  it('unsupported_offer when the offer names another network or another token domain', async () => {
+    const otherNet = await serve({ network: 'eip155:84532' });
     const { wallet, account } = makeWallet();
     await approved(wallet);
     const spy = vi.spyOn(account, 'signTypedData');
-    await expectViolation(wallet.fetch(`${other.url}/predict`), 'unsupported_offer');
-    const otherNet = await serve({ network: 'eip155:84532' });
     await expectViolation(wallet.fetch(`${otherNet.url}/predict`), 'unsupported_offer');
+    const otherDomain = await serve({ assetDomain: { name: 'USDC', version: '2' } });
+    await expectViolation(wallet.fetch(`${otherDomain.url}/predict`), 'unsupported_offer');
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('sp_not_trusted', async () => {
-    const s = await serve();
-    const { wallet, account } = makeWallet({ trustedSps: [strangerAddress] });
+  it('timeout_too_long when the offer wants an authorization outliving the wallet cap', async () => {
+    const s = await serve({ maxTimeoutSeconds: 3600 });
+    const { wallet, account } = makeWallet();
     await approved(wallet);
     const spy = vi.spyOn(account, 'signTypedData');
-    const err = await expectViolation(wallet.fetch(`${s.url}/predict`), 'sp_not_trusted');
-    expect(err.detail?.spAddress).toBe(spAddress);
+    const err = await expectViolation(wallet.fetch(`${s.url}/predict`), 'timeout_too_long');
+    expect(err.detail).toEqual({ maxTimeoutSeconds: 3600, cap: 300 });
     expect(spy).not.toHaveBeenCalled();
-    // a trust list containing the SP (any case) passes
-    const trusting = makeWallet({ trustedSps: [spAddress.toLowerCase() as Address] });
-    await approved(trusting.wallet);
-    expect((await trusting.wallet.fetch(`${s.url}/predict`)).status).toBe(200);
+    const lenient = makeWallet({ caps: { maxAuthorizationValiditySeconds: 3600 } });
+    await approved(lenient.wallet);
+    expect((await lenient.wallet.fetch(`${s.url}/predict`)).status).toBe(200);
   });
 
   it('per_call_max via caps', async () => {
@@ -533,7 +534,6 @@ describe('policy gate: every PolicyReason fires BEFORE signTypedData', () => {
     expect(spy).not.toHaveBeenCalled();
     for (const m of [good, wrongHost, tiny, disabled, draft]) expect(wallet.remaining(m.id)).toBe(BigInt(m.limitAmount));
 
-    // and the explicit id is the one charged
     const res = await wallet.fetch(`${s.url}/predict`, undefined, { mandateId: good.id });
     expect(res.status).toBe(200);
     expect(wallet.remaining(good.id)).toBe(999_000n);
@@ -605,10 +605,7 @@ describe('auto-selection', () => {
     const { wallet } = makeWallet();
     const late = await approved(wallet, { validForSeconds: 7200 });
     const soon = await approved(wallet, { validForSeconds: 600 });
-    expect(wallet.eligibleMandates({ host: '127.0.0.1', amount: 1000n }).eligible.map((m) => m.id)).toEqual([
-      soon.id,
-      late.id,
-    ]);
+    expect(wallet.eligibleMandates({ host: '127.0.0.1', amount: 1000n }).eligible.map((m) => m.id)).toEqual([soon.id, late.id]);
     await wallet.fetch(`${s.url}/predict`);
     expect(wallet.remaining(soon.id)).toBe(999_000n);
     expect(wallet.remaining(late.id)).toBe(1_000_000n);
@@ -618,7 +615,7 @@ describe('auto-selection', () => {
 // ---------------------------------------------------------------------------
 
 describe('payment happy path + budget accounting', () => {
-  it('pays, verifies the SP receipt, commits the reservation, writes the ledger, persists the budget', async () => {
+  it('pays with a single-use authorization, commits the reservation on the settlement report, writes the ledger', async () => {
     const s = await serve();
     const t = nowSec();
     const { wallet, ledgerPath, mandatesPath } = makeWallet({ now: () => t });
@@ -626,33 +623,57 @@ describe('payment happy path + budget accounting', () => {
 
     const res = await wallet.fetch(`${s.url}/predict?symbol=ETH`, { headers: { 'x-trace': '1' } });
     expect(res.status).toBe(200);
-    expect(res.headers.get(HEADER.response)).toBeTruthy();
     expect(await res.json()).toEqual({ ok: true, resource: 'GET /predict', served: 1 });
     expect(s.served).toBe(1);
     expect(s.requests).toBe(2); // 402 then paid
+    const settlement = decodePaymentResponseHeader(res.headers.get('PAYMENT-RESPONSE')!);
+    expect(settlement.success).toBe(true);
+    expect(res.headers.get(NONCE_HEADER)).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(res.headers.get(LEDGER_STATUS_HEADER)).toBe('settled');
 
     // budget: reservation converted to spend
-    const stored = wallet.getMandate(m.id)!;
-    expect(stored.spentAmount).toBe('1000');
-    expect(stored.pendingSpentAmount).toBe('0');
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
     expect(wallet.remaining(m.id)).toBe(9000n);
 
-    // the stub verified a mandate that recovers to the payer
-    const [{ mandate, payerSig }] = s.mandates;
-    expect(mandate.owner).toBe(wallet.address);
-    expect(mandate.token).toBe(TOKEN);
-    expect(mandate.payee).toBe(s.address);
-    expect(mandate.amount).toBe('1000');
-    expect(mandate.deadline).toBe(t + SETTLE_WINDOW + 60);
-    expect(mandate.ref).toBe(resourceRef('GET /predict'));
-    const domain = { chainId: CHAIN_ID, verifyingContract: WALLET };
-    expect(await recoverMandateSigner(domain, mandate, payerSig)).toBe(wallet.address);
+    // the payee received an authorization that recovers to the payer under the token domain
+    const [payload] = s.payments;
+    const { authorization, signature } = payload.payload as { authorization: Record<string, string>; signature: Hex };
+    expect(authorization).toMatchObject({ from: wallet.address, to: s.address, value: '1000', validAfter: '0' });
+    expect(Number(authorization.validBefore)).toBeGreaterThanOrEqual(nowSec() + MAX_TIMEOUT - 5);
+    expect(Number(authorization.validBefore)).toBeLessThanOrEqual(nowSec() + MAX_TIMEOUT + 5);
+    expect(
+      await verifyTypedData({
+        address: wallet.address,
+        domain: { ...MOCK_USDC_DOMAIN, chainId: CHAIN_ID, verifyingContract: TOKEN },
+        types: {
+          TransferWithAuthorization: [
+            { name: 'from', type: 'address' },
+            { name: 'to', type: 'address' },
+            { name: 'value', type: 'uint256' },
+            { name: 'validAfter', type: 'uint256' },
+            { name: 'validBefore', type: 'uint256' },
+            { name: 'nonce', type: 'bytes32' },
+          ],
+        },
+        primaryType: 'TransferWithAuthorization',
+        message: {
+          from: authorization.from as Address,
+          to: authorization.to as Address,
+          value: BigInt(authorization.value),
+          validAfter: BigInt(authorization.validAfter),
+          validBefore: BigInt(authorization.validBefore),
+          nonce: authorization.nonce as Hex,
+        },
+        signature,
+      }),
+    ).toBe(true);
 
     // ledger entry shape
     const entries = readLedger(ledgerPath);
     expect(entries).toHaveLength(1);
     const e = entries[0];
     expect(e).toMatchObject({
+      v: 2,
       kind: 'payment',
       timestamp: t,
       signedAt: t,
@@ -664,254 +685,247 @@ describe('payment happy path + budget accounting', () => {
       amount: '1000',
       payer: wallet.address,
       payee: s.address,
-      walletContract: WALLET,
       intentMandateId: m.id,
-      mandate,
-      payerSig,
-      mandateDigest: mandateDigest(domain, mandate),
+      nonce: authorization.nonce,
+      validBefore: Number(authorization.validBefore),
+      authorization,
+      signature,
       httpStatus: 200,
-      status: 'enqueued',
+      status: 'settled',
+      transaction: settlement.transaction,
     });
-    expect(e.spReceipt?.sp).toBe(spAddress);
-    expect(e.spReceipt?.mandateDigest).toBe(e.mandateDigest);
-    expect(e.spReceipt?.enqueueDeadline).toBeLessThanOrEqual(mandate.deadline);
     expect(e.error).toBeUndefined();
+    expect(e.verified).toBeUndefined();
 
     // a second wallet over the same files sees the same budget and ledger
     const again = new MandateWallet({
       key: KEYS.payer,
-      rpcUrl: 'http://127.0.0.1:1',
-      walletContract: WALLET,
       token: TOKEN,
+      assetDomain: { ...MOCK_USDC_DOMAIN },
       network: NETWORK,
       mandatesPath,
       ledgerPath,
       now: () => t,
     });
     expect(again.remaining(m.id)).toBe(9000n);
-    expect(again.report().totals).toMatchObject({ spent: '1000', pending: '0', enqueued: 1 });
+    expect(again.report().totals).toMatchObject({ spent: '1000', pending: '0', settled: 1 });
     await again.fetch(`${s.url}/predict`);
     expect(again.remaining(m.id)).toBe(8000n);
-    expect(wallet.report().totals.enqueued).toBe(2); // ledger is shared…
+    expect(wallet.report().totals.settled).toBe(2); // ledger is shared…
     expect(new IntentMandateStore(mandatesPath).get(m.id)?.spentAmount).toBe('2000'); // …and so is the store
   });
 
-  it('the request body is re-sent with the mandate, and the offer ref honours quoteId', async () => {
-    const s = await serve({ resource: 'POST /analyze', quoteId: 'q-42', mode: { bodyPayment: true } });
+  it('the request body is re-sent with the payment', async () => {
+    const s = await serve();
     const { wallet } = makeWallet();
     await approved(wallet);
-    const res = await wallet.fetch(`${s.url}/analyze`, { method: 'POST', body: '{"text":"hi"}' });
+    const res = await wallet.fetch(`${s.url}/analyze`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'hello' }),
+    });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { payment?: { status: string; spReceipt: { sp: string } } };
-    expect(body.payment?.status).toBe('enqueued');
-    expect(body.payment?.spReceipt.sp).toBe(spAddress);
-    expect(s.mandates[0].mandate.ref).toBe(resourceRef('POST /analyze', 'q-42'));
-    expect(wallet.report().byResource['POST /analyze']).toBe('1000');
+    expect(await res.json()).toEqual({ ok: true, echo: { text: 'hello' } });
+    expect(readLedger(wallet.report().address ? (servers.length ? join(root, `w${n - 1}`, 'ledger.jsonl') : '') : '')[0]?.resource).toBe('POST /analyze');
   });
 
   it('non-402 responses pass through untouched and cost nothing', async () => {
     const s = await serve();
-    const { wallet, ledgerPath } = makeWallet();
+    const { wallet, account, ledgerPath } = makeWallet();
     const m = await approved(wallet);
-    const res = await wallet.fetch(`${s.url}/health`);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    const spy = vi.spyOn(account, 'signTypedData');
+    const res = await wallet.fetch(`${s.url}/nope`);
+    expect(res.status).toBe(404);
+    expect(spy).not.toHaveBeenCalled();
     expect(wallet.remaining(m.id)).toBe(1_000_000n);
-    expect(readLedger(ledgerPath)).toEqual([]);
-    expect((await wallet.fetch(`${s.url}/nope`)).status).toBe(404);
+    expect(existsSync(ledgerPath)).toBe(false);
   });
 
-  it('a 402 without a usable offer is a WireError, not a payment', async () => {
-    const { wallet } = makeWallet({
-      fetch: async () => new Response('nope', { status: 402 }),
+  it('a 402 without a usable PAYMENT-REQUIRED header is a WireError, not a payment', async () => {
+    const { wallet, account } = makeWallet({
+      fetch: async () => new Response('{"error":"pay me"}', { status: 402, headers: { 'content-type': 'application/json' } }),
     });
     await approved(wallet);
-    await expect(wallet.fetch('http://127.0.0.1:9/x')).rejects.toBeInstanceOf(WireError);
+    const spy = vi.spyOn(account, 'signTypedData');
+    await expect(wallet.fetch('http://127.0.0.1:1/predict')).rejects.toThrow(WireError);
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it('a signing failure releases the reservation and rethrows', async () => {
     const s = await serve();
     const { wallet, account, ledgerPath } = makeWallet();
     const m = await approved(wallet);
-    vi.spyOn(account, 'signTypedData').mockRejectedValueOnce(new Error('signer unavailable'));
-    await expect(wallet.fetch(`${s.url}/predict`)).rejects.toThrow('signer unavailable');
-    expect(wallet.getMandate(m.id)?.pendingSpentAmount).toBe('0');
-    expect(wallet.remaining(m.id)).toBe(1_000_000n);
-    expect(readLedger(ledgerPath)).toEqual([]);
-    expect(s.mandates).toHaveLength(0);
-  });
-
-  it('caps.maxMandateValiditySeconds bounds the deadline horizon', async () => {
-    const s = await serve({ settleWindowSeconds: 120 });
-    const t = nowSec();
-    const { wallet } = makeWallet({ now: () => t, caps: { maxMandateValiditySeconds: 150 } });
-    await approved(wallet);
-    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
-    expect(s.mandates[0].mandate.deadline).toBe(t + 150); // min(120 + 60, 150)
+    vi.spyOn(account, 'signTypedData').mockRejectedValueOnce(new Error('hsm offline'));
+    await expect(wallet.fetch(`${s.url}/predict`)).rejects.toThrow(/hsm offline/);
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '0' });
+    expect(existsSync(ledgerPath)).toBe(false); // nothing was signed, nothing to remember
+    expect(s.payments).toHaveLength(0);
   });
 
   it('signedAt is the signing time and survives the status update; timestamp moves with it', async () => {
     const s = await serve();
     let t = nowSec();
-    const { wallet, ledgerPath } = makeWallet({
+    const { wallet, ledgerPath } = makeWallet({ now: () => t });
+    await approved(wallet);
+    const signedAt = t;
+    const fetchImpl = globalThis.fetch;
+    // the paid retry happens 5 "seconds" after signing
+    const w2 = makeWallet({
       now: () => t,
       fetch: async (input, init) => {
-        const res = await globalThis.fetch(input, init);
-        if (new Headers(init?.headers).has(HEADER.signature)) t += 5; // the paid round trip took a while
+        const res = await fetchImpl(input, init);
+        if (new Headers(init?.headers).has('PAYMENT-SIGNATURE')) t += 5;
         return res;
       },
     });
-    await approved(wallet);
-    const signed = t;
-    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
-    const [e] = readLedger(ledgerPath);
-    expect(e).toMatchObject({ status: 'enqueued', signedAt: signed, timestamp: signed + 5 });
+    await approved(w2.wallet);
+    await w2.wallet.fetch(`${s.url}/predict`);
+    const [e] = readLedger(w2.ledgerPath);
+    expect(e.signedAt).toBe(signedAt);
+    expect(e.timestamp).toBe(signedAt + 5);
+    void ledgerPath;
   });
 });
 
 // ---------------------------------------------------------------------------
 
-describe('SP receipt verification', () => {
-  for (const receipt of ['missing', 'bad-sig', 'wrong-sp', 'late-deadline'] as const) {
-    it(`${receipt} receipt -> ledger 'unknown', but the budget is still spent`, async () => {
-      const s = await serve({ mode: { receipt } });
+describe('settlement report handling', () => {
+  for (const [rawMode, error] of [
+    ['no-response-header', 'missing PAYMENT-RESPONSE'],
+    ['malformed-response', 'malformed PAYMENT-RESPONSE'],
+    ['wrong-network', 'settlement not successful'],
+    ['success-false', 'settlement not successful: invalid_exact_evm_transaction_failed'],
+  ] as const) {
+    it(`2xx with ${rawMode} -> ledger 'unknown', budget spent (charged or not is unknowable offline)`, async () => {
+      const s = await serve({ rawMode });
       const { wallet, ledgerPath } = makeWallet();
       const m = await approved(wallet);
-      const res = await wallet.fetch(`${s.url}/predict`);
+      const res = await wallet.fetch(`${s.url}/raw`);
       expect(res.status).toBe(200);
+      expect(res.headers.get(LEDGER_STATUS_HEADER)).toBe('unknown');
       const [e] = readLedger(ledgerPath);
       expect(e.status).toBe('unknown');
       expect(e.httpStatus).toBe(200);
-      if (receipt === 'missing') {
-        expect(e.spReceipt).toBeUndefined();
-        expect(e.error).toBe('missing sp receipt');
-      } else {
-        expect(e.spReceipt).toBeDefined();
-        expect(e.error).toMatch(/^invalid_sp_receipt: (bad_signature|sp_mismatch|deadline_too_far|deadline_after_mandate)$/);
-      }
+      expect(e.error).toContain(error.split(':')[0]);
       expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
-      expect(wallet.report().totals).toMatchObject({ unknown: 1, enqueued: 0, spent: '1000' });
     });
   }
 
-  it('a malformed PAYMENT-RESPONSE header -> unknown', async () => {
-    const s = await serve();
-    const { wallet, ledgerPath } = makeWallet({
-      fetch: async (input, init) => {
-        const res = await globalThis.fetch(input, init);
-        if (!res.headers.has(HEADER.response)) return res;
-        const headers = new Headers(res.headers);
-        headers.set(HEADER.response, '%%%not-base64-json');
-        return new Response(await res.arrayBuffer(), { status: res.status, headers });
-      },
-    });
-    await approved(wallet);
-    expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
+  it('settlement_pending (broadcast, receipt unknown) -> unknown with the transaction, reservation kept', async () => {
+    const s = await serve({ rawMode: 'settlement-pending' });
+    const { wallet, ledgerPath } = makeWallet();
+    const m = await approved(wallet);
+    const res = await wallet.fetch(`${s.url}/raw`);
+    expect(res.status).toBe(402);
     const [e] = readLedger(ledgerPath);
-    expect(e.status).toBe('unknown');
-    expect(e.error).toMatch(/malformed PAYMENT-RESPONSE/);
-  });
-
-  it('requireReceipt: false keeps a missing receipt as enqueued (invalid ones stay unknown)', async () => {
-    const missing = await serve({ mode: { receipt: 'missing' } });
-    const bad = await serve({ mode: { receipt: 'bad-sig' } });
-    const { wallet, ledgerPath } = makeWallet({ caps: { requireReceipt: false } });
-    await approved(wallet);
-    await wallet.fetch(`${missing.url}/predict`);
-    await wallet.fetch(`${bad.url}/predict`);
-    const [a, b] = readLedger(ledgerPath);
-    expect(a.status).toBe('enqueued');
-    expect(b.status).toBe('unknown');
+    expect(e).toMatchObject({ status: 'unknown', httpStatus: 402, error: 'settlement_pending', transaction: '0x' + 'ab'.repeat(32) });
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
   });
 });
 
 // ---------------------------------------------------------------------------
 
 describe('refusals after signing', () => {
-  it('non-2xx -> ledger rejected with the body error, reservation KEPT, response returned', async () => {
-    const s = await serve({
-      mode: { reject: { status: 402, body: { error: 'settlement_unavailable: sp_not_authorized' } } },
-    });
+  it('a facilitator refusal -> ledger rejected with the header reason, reservation KEPT, response returned', async () => {
+    const s = await serve();
+    s.mode = { kind: 'invalid', reason: 'invalid_exact_evm_insufficient_balance' };
     const { wallet, ledgerPath } = makeWallet();
     const m = await approved(wallet);
     const res = await wallet.fetch(`${s.url}/predict`);
     expect(res.status).toBe(402);
-    expect(await res.json()).toEqual({ error: 'settlement_unavailable: sp_not_authorized' });
+    expect(res.headers.get(LEDGER_STATUS_HEADER)).toBe('rejected');
     const [e] = readLedger(ledgerPath);
-    expect(e.status).toBe('rejected');
-    expect(e.httpStatus).toBe(402);
-    expect(e.error).toBe('settlement_unavailable: sp_not_authorized');
-    expect(e.spReceipt).toBeUndefined();
-    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
+    expect(e).toMatchObject({ status: 'rejected', httpStatus: 402, error: 'invalid_exact_evm_insufficient_balance' });
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' }); // the authorization is live until validBefore
     expect(wallet.remaining(m.id)).toBe(999_000n);
-    expect(wallet.report().totals).toMatchObject({ rejected: 1, pending: '1000', spent: '0' });
-    expect(wallet.report().byHost).toEqual({}); // rejected is not spend
+    expect(s.served).toBe(0);
   });
 
-  it('a payee that refuses the x402 envelope answers 402 again: recorded, not retried', async () => {
-    const s = await serve({ mode: { legacyOnly: true } });
+  it('a settlement that fails after the handler ran -> rejected with the settlement reason', async () => {
+    const s = await serve();
+    s.mode = { kind: 'settle-fail', reason: 'invalid_exact_evm_transaction_failed' };
     const { wallet, ledgerPath } = makeWallet();
     await approved(wallet);
     const res = await wallet.fetch(`${s.url}/predict`);
     expect(res.status).toBe(402);
-    expect(s.offersSent).toBe(2);
-    expect(readLedger(ledgerPath)[0].status).toBe('rejected');
+    expect(readLedger(ledgerPath)[0]).toMatchObject({ status: 'rejected', error: 'invalid_exact_evm_transaction_failed' });
+    expect(s.served).toBe(1);
   });
 
-  it('409 replay -> SP /status says pending -> treated as enqueued (pending -> spent)', async () => {
-    const s = await serve({ mode: { replay409: true, spStatus: 'pending' } });
-    const { wallet, ledgerPath } = makeWallet();
-    const m = await approved(wallet);
-    const res = await wallet.fetch(`${s.url}/predict`);
-    expect(res.status).toBe(409);
-    expect((await res.json()).error).toBe('replay');
-    const [e] = readLedger(ledgerPath);
-    expect(e.status).toBe('enqueued');
-    expect(e.httpStatus).toBe(409);
-    expect(e.error).toMatch(/replay; sp status pending/);
-    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
-  });
-
-  it('409 replay -> SP /status unknown (404) or terminal -> rejected, reservation kept', async () => {
-    const s404 = await serve({ mode: { replay409: true } });
-    const sFailed = await serve({ mode: { replay409: true, spStatus: 'failed' } });
-    const { wallet, ledgerPath } = makeWallet();
-    const m = await approved(wallet);
-    expect((await wallet.fetch(`${s404.url}/predict`)).status).toBe(409);
-    expect((await wallet.fetch(`${sFailed.url}/predict`)).status).toBe(409);
-    const [a, b] = readLedger(ledgerPath);
-    expect(a.status).toBe('rejected');
-    expect(b.status).toBe('rejected');
-    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '2000' });
-  });
-
-  it('a network error on the paid retry -> ledger unknown (httpStatus 0), reservation kept, error rethrown', async () => {
+  it('a payee that pays but then fails (5xx after settlement) -> settled, "paid but http 500"', async () => {
+    const fetchImpl = globalThis.fetch;
     const s = await serve();
+    // The stub payee settles after the handler; emulate a payee that settled and then broke by rewriting the status.
     const { wallet, ledgerPath } = makeWallet({
       fetch: async (input, init) => {
-        if (new Headers(init?.headers).has(HEADER.signature)) throw new TypeError('fetch failed: ECONNRESET');
-        return globalThis.fetch(input, init);
+        const res = await fetchImpl(input, init);
+        if (res.status === 200 && res.headers.has('PAYMENT-RESPONSE')) {
+          return new Response(await res.arrayBuffer(), { status: 500, headers: res.headers });
+        }
+        return res;
       },
     });
     const m = await approved(wallet);
-    await expect(wallet.fetch(`${s.url}/predict`)).rejects.toThrow('ECONNRESET');
+    const res = await wallet.fetch(`${s.url}/predict`);
+    expect(res.status).toBe(500);
+    expect(readLedger(ledgerPath)[0]).toMatchObject({ status: 'settled', httpStatus: 500, error: 'paid but http 500' });
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
+  });
+
+  it('a transport error on the paid retry re-presents the SAME header; success on the second try is one payment', async () => {
+    const fetchImpl = globalThis.fetch;
+    const s = await serve();
+    let paidAttempts = 0;
+    const { wallet, account, ledgerPath } = makeWallet({
+      fetch: async (input, init) => {
+        if (new Headers(init?.headers).has('PAYMENT-SIGNATURE') && ++paidAttempts === 1) throw new TypeError('fetch failed');
+        return fetchImpl(input, init);
+      },
+    });
+    const m = await approved(wallet);
+    const spy = vi.spyOn(account, 'signTypedData');
+    const res = await wallet.fetch(`${s.url}/predict`);
+    expect(res.status).toBe(200);
+    expect(paidAttempts).toBe(2);
+    expect(spy).toHaveBeenCalledTimes(1); // one authorization, presented twice
+    expect(s.payments).toHaveLength(1);
+    expect(readLedger(ledgerPath)[0].status).toBe('settled');
+    expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
+  });
+
+  it('a transport error that persists -> ledger unknown (httpStatus 0), reservation kept, error rethrown', async () => {
+    const fetchImpl = globalThis.fetch;
+    let paidAttempts = 0;
+    const { wallet, ledgerPath } = makeWallet({
+      fetch: async (input, init) => {
+        if (new Headers(init?.headers).has('PAYMENT-SIGNATURE')) {
+          paidAttempts++;
+          throw new TypeError('fetch failed');
+        }
+        return fetchImpl(input, init);
+      },
+    });
+    const s = await serve();
+    const m = await approved(wallet);
+    await expect(wallet.fetch(`${s.url}/predict`)).rejects.toThrow(/fetch failed/);
+    expect(paidAttempts).toBe(3); // 1 + 2 retries
     const [e] = readLedger(ledgerPath);
-    expect(e.status).toBe('unknown');
-    expect(e.httpStatus).toBe(0);
-    expect(e.error).toMatch(/^network: /);
+    expect(e).toMatchObject({ status: 'unknown', httpStatus: 0, error: 'network: fetch failed' });
     expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
   });
 
-  it('reconcile() with an unreachable RPC keeps everything pending', async () => {
-    const s = await serve({ mode: { reject: { status: 500, body: { error: 'boom' } } } });
-    const { wallet } = makeWallet();
-    const m = await approved(wallet);
+  it('reconcile() needs an RPC, and keeps everything pending when it is unreachable', async () => {
+    const s = await serve();
+    s.mode = { kind: 'invalid', reason: 'invalid_exact_evm_insufficient_balance' };
+    const { wallet, ledgerPath } = makeWallet();
+    await approved(wallet);
     await wallet.fetch(`${s.url}/predict`);
-    const r = await wallet.reconcile();
-    expect(r.settled).toEqual([]);
-    expect(r.expiredUnused).toEqual([]);
-    expect(r.stillPending).toHaveLength(1);
-    expect(wallet.remaining(m.id)).toBe(999_000n);
+    const [e] = readLedger(ledgerPath);
+    expect(await wallet.reconcile()).toEqual({ settled: [], expiredUnused: [], stillPending: [e.nonce], verified: [] });
+    expect(readLedger(ledgerPath)[0].status).toBe('rejected');
+    const noRpc = makeWallet({ rpcUrl: undefined, ledgerPath, mandatesPath: join(root, `w${n - 1}`, 'mandates.json') });
+    await expect(noRpc.wallet.reconcile()).rejects.toThrow(/rpcUrl is required/);
+    await expect(noRpc.wallet.balance()).rejects.toThrow(/rpcUrl is required/);
   });
 });
 
@@ -925,9 +939,7 @@ describe('concurrency', () => {
     const m = await approved(wallet, { limitAmount: String(1000 * (N - 1)) });
     const results = await Promise.allSettled(Array.from({ length: N }, () => wallet.fetch(`${s.url}/predict`)));
     const ok = results.filter((r) => r.status === 'fulfilled' && r.value.status === 200);
-    const denied = results.filter(
-      (r): r is PromiseRejectedResult => r.status === 'rejected' && r.reason instanceof PolicyViolation,
-    );
+    const denied = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected' && r.reason instanceof PolicyViolation);
     expect(ok).toHaveLength(N - 1);
     expect(denied).toHaveLength(1);
     expect(denied[0].reason.reason).toBe('mandate_insufficient_budget');
@@ -946,17 +958,15 @@ describe('budget counters are rebuilt from the ledger on load', () => {
     const m = await approved(wallet);
     expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
     expect(wallet.getMandate(m.id)).toMatchObject({ spentAmount: '1000', pendingSpentAmount: '0' });
-    // Put the ledger line back to what fetch() wrote right after signing: the
-    // state a crash between adjustBudget() and record() leaves behind.
     const [e] = readLedger(ledgerPath);
-    new Ledger(ledgerPath).updateStatus(e.mandateDigest, 'unknown', { httpStatus: 0, error: 'in_flight', spReceipt: undefined });
+    new Ledger(ledgerPath).updateStatus(e.nonce, 'unknown', { httpStatus: 0, error: 'in_flight', transaction: undefined });
 
     const lines: string[] = [];
     const again = makeWallet({ mandatesPath, ledgerPath, log: (l) => lines.push(l) }).wallet;
     expect(again.getMandate(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
     expect(again.remaining(m.id)).toBe(999_000n);
     expect(lines).toEqual([expect.stringContaining(`${m.id}: counters rebuilt from the ledger (spent 1000 -> 0, pending 0 -> 1000)`)]);
-    expect(new IntentMandateStore(mandatesPath).get(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' }); // saved
+    expect(new IntentMandateStore(mandatesPath).get(m.id)).toMatchObject({ spentAmount: '0', pendingSpentAmount: '1000' });
     expect(again.report().totals).toMatchObject({ spent: '0', pending: '1000', unknown: 1 });
   });
 
@@ -975,25 +985,22 @@ describe('budget counters are rebuilt from the ledger on load', () => {
     expect(lines).toEqual([expect.stringContaining('pending 1000 -> 0')]);
   });
 
-  it('classifies every status: rejected and in-flight hold the reservation, enqueued/settled/unknown-2xx are spent, expired-unused is neither', async () => {
+  it('classifies every status: rejected and in-flight hold the reservation, settled/unknown-2xx are spent, expired-unused is neither', async () => {
     const { wallet, mandatesPath, ledgerPath } = makeWallet();
     const m = await approved(wallet);
     const l = new Ledger(ledgerPath);
     l.append(ledgerEntry('01', { intentMandateId: m.id, amount: '1', status: 'rejected', httpStatus: 402 }));
     l.append(ledgerEntry('02', { intentMandateId: m.id, amount: '2', status: 'unknown', httpStatus: 0, error: 'in_flight' }));
-    l.append(ledgerEntry('03', { intentMandateId: m.id, amount: '4', status: 'enqueued', httpStatus: 200 }));
-    l.append(ledgerEntry('04', { intentMandateId: m.id, amount: '8', status: 'settled', httpStatus: 200 }));
-    l.append(ledgerEntry('05', { intentMandateId: m.id, amount: '16', status: 'unknown', httpStatus: 200, error: 'missing sp receipt' }));
-    l.append(ledgerEntry('06', { intentMandateId: m.id, amount: '32', status: 'expired-unused', httpStatus: 200 }));
-    l.append(ledgerEntry('07', { intentMandateId: m.id, amount: '64', status: 'enqueued', httpStatus: 409, error: 'replay; sp status pending' }));
-    l.append(ledgerEntry('08', { intentMandateId: 'im_gone', amount: '128', status: 'enqueued', httpStatus: 200 })); // not in the store: ignored
-    // SP defaults: a line written before the flag existed (legacy error prefix only) and a flagged one
-    l.append(ledgerEntry('09', { intentMandateId: m.id, amount: '256', status: 'expired-unused', httpStatus: 200, error: 'sp_default: legacy line' }));
-    l.append(ledgerEntry('0a', { intentMandateId: m.id, amount: '512', status: 'expired-unused', httpStatus: 200, spDefault: true, error: 'anything' }));
+    l.append(ledgerEntry('03', { intentMandateId: m.id, amount: '4', status: 'settled', httpStatus: 200 }));
+    l.append(ledgerEntry('04', { intentMandateId: m.id, amount: '8', status: 'unknown', httpStatus: 200, error: 'missing PAYMENT-RESPONSE' }));
+    l.append(ledgerEntry('05', { intentMandateId: m.id, amount: '16', status: 'expired-unused', httpStatus: 402 }));
+    l.append(ledgerEntry('06', { intentMandateId: m.id, amount: '32', status: 'unknown', httpStatus: 402, error: 'settlement_pending' }));
+    l.append(ledgerEntry('07', { intentMandateId: m.id, amount: '64', status: 'settled', httpStatus: 500, error: 'paid but http 500' }));
+    l.append(ledgerEntry('08', { intentMandateId: 'im_gone', amount: '128', status: 'settled', httpStatus: 200 })); // not in the store: ignored
     const again = makeWallet({ mandatesPath, ledgerPath }).wallet;
-    expect(again.getMandate(m.id)).toMatchObject({ pendingSpentAmount: '3', spentAmount: '92' });
+    expect(again.getMandate(m.id)).toMatchObject({ pendingSpentAmount: '35', spentAmount: '76' });
     expect(again.listMandates().map((x) => x.id)).toEqual([m.id]);
-    expect(again.report().totals).toMatchObject({ expiredUnused: 3, spDefaults: 2 });
+    expect(again.report().totals).toMatchObject({ settled: 3, rejected: 1, unknown: 3, expiredUnused: 1 });
   });
 
   it('counters that already agree are left alone: nothing logged, nothing rewritten', async () => {
@@ -1012,41 +1019,18 @@ describe('budget counters are rebuilt from the ledger on load', () => {
 
 // ---------------------------------------------------------------------------
 
-describe('Intent Mode (prepay) and legacy header', () => {
-  it('prepay attaches the mandate to the FIRST request once an offer for the resource is cached', async () => {
+describe('Intent Mode (prepay)', () => {
+  it('prepay attaches the payment to the FIRST request once an offer for the resource is cached', async () => {
     const s = await serve();
     const { wallet } = makeWallet();
     await approved(wallet);
-    // no cache yet: prepay falls back to Order Mode (402 first)
     expect((await wallet.fetch(`${s.url}/predict`, undefined, { prepay: true })).status).toBe(200);
-    expect(s.requests).toBe(2);
-    expect(s.offersSent).toBe(1);
-    // cached: one round trip, no 402
-    expect((await wallet.fetch(`${s.url}/predict?x=1`, undefined, { prepay: true })).status).toBe(200);
-    expect(s.requests).toBe(3);
-    expect(s.offersSent).toBe(1);
-    expect(s.served).toBe(2);
-    // without prepay the wallet still negotiates
+    expect(s.requests).toBe(2); // nothing cached yet: 402 first
+    expect((await wallet.fetch(`${s.url}/predict`, undefined, { prepay: true })).status).toBe(200);
+    expect(s.requests).toBe(3); // paid on the first request
     expect((await wallet.fetch(`${s.url}/predict`)).status).toBe(200);
-    expect(s.requests).toBe(5);
-    expect(s.offersSent).toBe(2);
-    // the cache is per method+origin+path: a different resource negotiates again
-    const s2 = await serve({ resource: 'POST /analyze' });
-    expect((await wallet.fetch(`${s2.url}/analyze`, { method: 'POST' }, { prepay: true })).status).toBe(200);
-    expect(s2.offersSent).toBe(1);
-  });
-
-  it('caps.legacyHeader sends X-Payment-Mandate with the bare {mandate, payerSig}', async () => {
-    const s = await serve({ mode: { legacyOnly: true } });
-    const { wallet, ledgerPath } = makeWallet({ caps: { legacyHeader: true } });
-    await approved(wallet);
-    const res = await wallet.fetch(`${s.url}/predict`);
-    expect(res.status).toBe(200);
-    expect(s.served).toBe(1);
-    expect(readLedger(ledgerPath)[0].status).toBe('enqueued');
-    // still an ordinary payee accepts it too
-    const modern = await serve();
-    expect((await wallet.fetch(`${modern.url}/predict`)).status).toBe(200);
+    expect(s.requests).toBe(5); // without prepay: 402 first again
+    expect(s.served).toBe(3);
   });
 });
 
@@ -1054,61 +1038,22 @@ describe('Intent Mode (prepay) and legacy header', () => {
 
 describe('report()', () => {
   it('has the documented shape and aggregates mandates, ledger statuses, hosts and resources', async () => {
-    const ok = await serve();
-    const bad = await serve({ resource: 'POST /analyze', mode: { receipt: 'bad-sig' } });
-    const refuse = await serve({ mode: { reject: { status: 402, body: { error: 'insufficient_balance' } } } });
-    const t = nowSec();
-    const { wallet } = makeWallet({ now: () => t });
-    const a = await approved(wallet, { limitAmount: '$0.005', hostAllowlist: ['127.0.0.1'] });
-    const b = await approved(wallet, { limitAmount: '$0.002', validForSeconds: 60, hostAllowlist: ['*'] });
-    await wallet.fetch(`${ok.url}/predict`); // b expires first -> charged to b
-    await wallet.fetch(`${bad.url}/analyze`, { method: 'POST' }); // b again (unknown)
-    await wallet.fetch(`${refuse.url}/predict`); // b exhausted -> a, rejected (reserved)
-    await expectViolation(wallet.fetch(`${ok.url}/predict`, undefined, { mandateId: 'im_x' }), 'mandate_not_found');
-
+    const s = await serve();
+    const { wallet, ledgerPath } = makeWallet();
+    const m = await approved(wallet, { limitAmount: '$0.01' });
+    await wallet.fetch(`${s.url}/predict`);
+    await wallet.fetch(`${s.url}/analyze`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    s.mode = { kind: 'invalid', reason: 'invalid_exact_evm_insufficient_balance' };
+    await wallet.fetch(`${s.url}/predict`);
     const r = wallet.report();
-    expect(r.address).toBe(wallet.address);
-    expect(r.walletContract).toBe(WALLET);
+    expect(r).toMatchObject({ address: wallet.address, token: TOKEN, network: NETWORK });
     expect(r.mandates).toEqual([
-      {
-        id: a.id,
-        naturalLanguage: a.naturalLanguage,
-        limitAmount: '5000',
-        spentAmount: '0',
-        pendingSpentAmount: '1000',
-        validUntil: a.validUntil,
-        isEnabled: true,
-        status: 'signed',
-        hostAllowlist: ['127.0.0.1'],
-        remainingAmount: '4000',
-      },
-      {
-        id: b.id,
-        naturalLanguage: b.naturalLanguage,
-        limitAmount: '2000',
-        spentAmount: '2000',
-        pendingSpentAmount: '0',
-        validUntil: b.validUntil,
-        isEnabled: true,
-        status: 'signed',
-        hostAllowlist: ['*'],
-        remainingAmount: '0',
-      },
+      expect.objectContaining({ id: m.id, limitAmount: '10000', spentAmount: '2000', pendingSpentAmount: '1000', remainingAmount: '7000', status: 'signed', isEnabled: true, hostAllowlist: ['127.0.0.1'] }),
     ]);
-    expect(r.totals).toEqual({
-      spent: '2000',
-      pending: '1000',
-      enqueued: 1,
-      settled: 0,
-      rejected: 1,
-      unknown: 1,
-      expiredUnused: 0,
-      spDefaults: 0,
-    });
-    expect(r.byHost).toEqual({ [new URL(ok.url).host]: '1000', [new URL(bad.url).host]: '1000' });
+    expect(r.totals).toEqual({ spent: '2000', pending: '1000', settled: 2, rejected: 1, unknown: 0, expiredUnused: 0 });
+    expect(r.byHost).toEqual({ [new URL(s.url).host]: '2000' });
     expect(r.byResource).toEqual({ 'GET /predict': '1000', 'POST /analyze': '1000' });
-    expect(r.policyDenials).toEqual([
-      { reason: 'mandate_not_found', url: `${ok.url}/predict`, mandateId: 'im_x', timestamp: t },
-    ]);
+    expect(r.policyDenials).toEqual([]);
+    expect(readLedger(ledgerPath)).toHaveLength(3);
   });
 });

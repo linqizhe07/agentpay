@@ -1,7 +1,7 @@
 /**
  * End-to-end: runs the demo script as a child process (fresh hardhat node,
- * in-process settlement processor, express payee, agent wallet) and asserts
- * every scenario reported PASS. Needs free ports 8545 / 3001 / 4021.
+ * in-process facilitator, express payee, agent wallet) and asserts every
+ * scenario reported PASS. Needs free ports 8545 / 3001 / 4021.
  */
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
@@ -32,19 +32,18 @@ function runDemo(args: string[] = []): Promise<{ code: number | null; stdout: st
 }
 
 describe('demo end-to-end', () => {
-  it('all seven scenarios pass', async () => {
+  it('all ten scenarios pass', async () => {
     const { code, stdout, stderr } = await runDemo();
     if (code !== 0) console.error(stdout, stderr);
     expect(code).toBe(0);
     expect(stdout).toContain('ALL SCENARIO ASSERTIONS PASSED');
     expect(stdout).not.toContain('✗');
-    for (const scenario of ['Scenario 1', 'Scenario 2', 'Scenario 3', 'Scenario 4', 'Scenario 5', 'Scenario 6', 'Scenario 7']) {
-      expect(stdout).toContain(scenario);
-    }
+    for (let i = 1; i <= 10; i++) expect(stdout).toContain(`Scenario ${i}`);
     // The headline claims of the protocol, as printed by the runner.
-    expect(stdout).toContain('settlement is deferred');
-    // Scenario 6 also sweeps the mandates left pending by earlier scenarios (24 in total).
-    expect(stdout).toMatch(/one settleBatch tx .* settled (2\d|[3-9]\d) mandates, skipped 0/);
-    expect(stdout).toContain('WithdrawalLocked');
+    expect(stdout).toContain('on-chain balances moved within the same call');
+    expect(stdout).toContain('20 distinct settlement transactions');
+    expect(stdout).toContain('invalid_exact_evm_nonce_already_used');
+    expect(stdout).toContain('expired-unused');
+    expect(stdout).toContain('@x402/fetch + @x402/evm');
   }, 240_000);
 });

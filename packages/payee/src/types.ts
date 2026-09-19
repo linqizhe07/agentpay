@@ -1,84 +1,73 @@
-// Type-only express import: the middleware is a plain (req, res, next) handler
-// and MUST NOT pull express in at runtime (it is a dev dependency only).
-import type { Request } from 'express';
-import type { Address, Hex, SettlementInfo, SpReceipt } from '@agentpay/core';
+import type { RequestHandler } from 'express';
+import type { x402ResourceServer, SettleResultContext } from '@x402/core/server';
+import type { Address, AssetDomain, SettleResponse } from '@agentpay/core';
 
 /**
- * Atomic per-mandate idempotency ledger keyed by the EIP-712 mandate digest:
- * one signed mandate buys exactly one delivery. `claim` must not await between
- * check and set (the in-memory store relies on Node's single-threaded loop).
+ * In-flight guard keyed by `${from}:${nonce}`: one authorization buys one
+ * delivery, even while its settlement is still pending (the chain only knows
+ * afterwards). `claim` must not await between check and set (the in-memory
+ * store relies on Node's single-threaded loop). Entries expire server-side.
  */
 export interface IdempotencyStore {
-  /** Claims a digest; false when it is already claimed. */
-  claim(digest: Hex): boolean;
-  /** Frees a claim after a downstream failure so the same mandate can be retried. */
-  release(digest: Hex): void;
-  has(digest: Hex): boolean;
+  /** Claims `key` for `ttlSeconds`; false when it is in flight or retained. */
+  claim(key: string, ttlSeconds: number, now: number): boolean;
+  /** Frees a claim after a failed verify / settle / handler so the same authorization can be retried. */
+  release(key: string): void;
+  /** Keeps `key` refused for `ttlSeconds` after a successful settlement (no facilitator round trip for replays). */
+  retain(key: string, ttlSeconds: number, now: number): void;
+  has(key: string): boolean;
+  readonly size: number;
 }
 
-/**
- * Structural stand-in for a viem PublicClient: only `readContract` is used, and
- * viem's client generics differ per chain, so accept anything with that method.
- */
-export interface ReadContractClient {
-  readContract: (args: any) => Promise<any>;
-}
-
-/** The Settlement Processor this resource routes mandates to (advertised in the offer). */
-export interface SpEndpoint {
-  /** Base URL, e.g. 'http://127.0.0.1:3001'. */
+export interface FacilitatorEndpoint {
+  /** Base URL: a local @agentpay/facilitator, or a hosted one such as https://x402.org/facilitator. */
   url: string;
-  /** The SP's signing address; enqueue receipts must be signed by it. */
-  address: Address;
-  /** The SP settles within this many seconds of enqueueing; mandates must outlive it. */
-  settleWindowSeconds: number;
-  /** HTTP timeout for SP calls. Default 5000. */
+  /**
+   * HTTP timeout per facilitator call. A settle waits for the on-chain receipt,
+   * so keep this above the facilitator's receipt timeout (default 35000).
+   */
   timeoutMs?: number;
+  /** Sent as `authorization: Bearer <token>` on /verify and /settle. */
+  authToken?: string;
 }
 
-export interface MandatePaywallOptions {
-  /** Human price, e.g. '$0.001' (USDC, 6 decimals; sub-cent allowed). */
-  price: string;
+export interface PaywallOptions {
+  facilitator: FacilitatorEndpoint;
   /** CAIP-2 network id: 'eip155:31337' | 'eip155:84532'. */
   network: string;
-  /** Token contract the mandate must name. */
+  /** The EIP-3009 token to be paid in. */
   asset: Address;
-  /** Payee address (receives settlement payouts). */
+  /** Its EIP-712 domain, advertised as `extra.name/version` (the payer signs under it). */
+  assetDomain: AssetDomain;
+  /** Payee address (receives the settlement). */
   payTo: Address;
-  /** AEP2DebitWallet contract (EIP-712 verifyingContract of mandates and receipts). */
-  wallet: Address;
-  sp: SpEndpoint;
-  /** Resource identifier bound into mandates. Default `${req.method} ${req.path}`. */
-  resourceOf?: (req: Request) => string;
-  /** Optional per-request quote id; echoed as extra.quoteId and bound into the mandate ref. */
-  quoteIdOf?: (req: Request) => string | undefined;
-  /**
-   * Pre-check debitableBalance / usedNonces on-chain before enqueueing.
-   * Default: network === 'eip155:31337' && (publicClient || rpcUrl) given.
-   */
-  verifyOnChain?: boolean;
-  /** One of publicClient / rpcUrl is required when verifyOnChain is on. */
-  publicClient?: ReadContractClient;
-  rpcUrl?: string;
-  /** Default: a fresh InMemoryIdempotencyStore per middleware. */
-  idempotencyStore?: IdempotencyStore;
-  /** Add a FluxA-style `payment` field to JSON bodies. Default false. */
-  includeBodyPaymentField?: boolean;
-  /** Attach payment_model_context hints to refusals. Default true. */
+  /** How long a payer's authorization stays valid, i.e. how long settlement may take. Default 60. */
+  maxTimeoutSeconds?: number;
+  /** Attach payment_model_context hints to the initial 402 body. Default true. */
   includeHints?: boolean;
-  /** Mandates whose deadline is within this many seconds are refused as expired. Default 30. */
-  deadlineMarginSeconds?: number;
-  /** Injectable clock (unix seconds). */
-  now?: () => number;
-  /** Injectable fetch for SP calls. */
-  fetch?: typeof fetch;
-  /** Called once per accepted mandate, right before the route handler runs. */
-  onEnqueued?: (info: SettlementInfo, req: Request) => void;
+  /** Default: a fresh InMemoryIdempotencyStore shared by every route of this paywall. */
+  idempotencyStore?: IdempotencyStore;
+  /** Called once per settled payment, before the buffered response is sent. */
+  onSettled?: (result: SettleResponse, ctx: SettleResultContext) => void;
+  /** Log sink for settlement failures and cancellations; default console.error. */
+  log?: (line: string) => void;
 }
 
-/** What `includeBodyPaymentField` adds to JSON response bodies. */
-export interface PaymentBodyField {
-  status: 'enqueued';
-  mandateDigest: Hex;
-  spReceipt: SpReceipt;
+export interface ChargeOptions {
+  description?: string;
+  mimeType?: string;
+  /** Override for `resource.url` in the 402 (default: the request's own URL). */
+  resource?: string;
+  /** Per-route override of PaywallOptions.maxTimeoutSeconds. */
+  maxTimeoutSeconds?: number;
 }
+
+export interface Paywall {
+  /** The underlying x402 resource server (register extensions or more hooks on it). */
+  server: x402ResourceServer;
+  store: IdempotencyStore;
+  /** Express middleware charging `price` ('$0.001'; USDC, 6 decimals) for the route it is mounted on. */
+  charge(price: string, opts?: ChargeOptions): RequestHandler;
+}
+
+export type { RequestHandler };
