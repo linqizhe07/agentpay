@@ -1,26 +1,28 @@
 # agentpay 技术报告
 
-> 版本：基于 `main` 提交 `d86070f`（2026-09-18）。适用读者：接入或维护这套支付系统的工程师。
+> 版本：分支 `x402`（2026-09-19），x402 迁移完成后的第一版。适用读者：接入或维护这套支付系统的工程师。AEP2 时代的最后一版代码在 tag `aep2-final`。
 
 ## 1. 摘要
 
-agentpay 是一套给 AI agent 用的支付系统，复刻 FluxA 的 AEP2（Agent Embedded Payment Protocol）模型：**先授权、后结算**。付款方（agent）为每次 HTTP 调用签一张一次性的 EIP-712 mandate，收款方（数据源）拿到 mandate 后立即交付，结算处理器（SP）先签一张收据承诺结算时限，稍后把多张 mandate 打成一笔 `settleBatch` 交易，从付款方预存的链上余额里扣款并付给收款方。
+agentpay 是一套给 AI agent 用的支付系统：协议是 Coinbase 的 **x402 V2，`exact` scheme**（EIP-3009 `transferWithAuthorization`），实现用官方 `@x402/*` 包；agentpay 自己加的是**付款方的预算层**、一个可自建的 facilitator、收款方的 paywall 封装、给 LLM agent 的 CLI + SKILL.md，以及一条本地链上跑通全流程的 demo。
+
+一笔付款：agent 请求收费接口 → 402（`PAYMENT-REQUIRED` 头里是报价）→ 钱包过策略闸、预留预算、签一张**单次使用**的 USDC 授权 → 带 `PAYMENT-SIGNATURE` 重发 → 收款方让 facilitator 验证 → 跑业务 handler（响应先缓冲）→ facilitator 把授权广播上链、等回执 → 200 + `PAYMENT-RESPONSE`（交易哈希）。**每笔调用一笔链上交易，响应到达时钱已经到账。** 付款方只需持有 USDC，不需要 ETH、不需要存入合约、不需要 approve。
 
 | 项目 | 现状 |
 |---|---|
-| 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 合约 1 个（229 行） |
-| 链 | 本地 Hardhat 已跑通；Base Sepolia 部署脚本就绪，未部署 |
-| 测试 | 7 个工作区共 203 个测试，全绿；端到端 demo 7 个场景全过 |
-| 安全 | 一轮内部安全评审，7 项修复已合入 |
-| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库（`KairosPan/Evolving-Alpha-US`，PR #1 待合并） |
-| 不做 | escrow、争议、追索、ZK 批量证明、KYC、前端 |
+| 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 只剩测试用 `MockUSDC.sol` |
+| 协议 | x402 V2 / `exact` / EIP-3009，`@x402/core` `@x402/evm` `@x402/express` `@x402/fetch` ~2.26.0 |
+| 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交，未实跑） |
+| 测试 | 7 个工作区共 153 个测试，全绿；demo 10 个场景全过 |
+| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；`face/` 尚未调用 |
+| 不做 | V1、`upto`、Permit2、智能合约钱包签名、批量结算、争议、KYC、前端 |
 
 ## 2. 目标与范围
 
-- **忠实复刻 AEP2 的核心**：Debit Wallet 合约、SP 批量结算、mandate 嵌在 HTTP 调用里。
-- **可跑的 MVP**：四方（钱包、收款方、SP、链）都有可运行的实现，本地一条命令跑完整个流程。
+- **按 x402 生态来**：信封、facilitator API、客户端签名、收款方中间件都用官方实现，保证与托管 facilitator（`https://x402.org/facilitator`）和官方客户端（`@x402/fetch`）互通——demo 第 9 场景就是官方客户端付我们的 payee。
+- **预算是 agentpay 的差异化**：官方客户端只管签；`MandateWallet` 只在人批过的 intent mandate 内签、签前同步预留、记账本、事后对链核对。
 - **agent 优先的接入面**：一个 CLI 和一份 SKILL.md，让 agent 不碰私钥也能看报价、查预算、付款、对账。
-- **明确不做**：FluxA 协议核心之外的产品面（支付链接、卡、市场、UI），以及 recourse/escrow/dispute/ZK。
+- **明确不做**：x402 生态里的其它 scheme 与扩展，以及产品面。
 
 ## 3. 系统架构
 
@@ -28,38 +30,43 @@ agentpay 是一套给 AI agent 用的支付系统，复刻 FluxA 的 AEP2（Agen
 
 | 角色 | 包 | 持有 | 职责 |
 |---|---|---|---|
-| 付款方：agent 钱包 | `packages/wallet`、`packages/cli` | 付款私钥、用户批准的预算（intent mandate）、本地账本 | 收到 402 后过策略闸、签 mandate、记账、事后对账 |
-| 收款方：数据源 | `packages/payee` | 收款地址、报价 | 出 402 报价、验签、交 SP 排队、拿到收据后交付 |
-| 结算处理器 SP | `packages/sp` | SP 私钥、队列 | 验 mandate、签收据、攒批上链结算 |
-| 链上合约 | `packages/contracts` | 余额、已授权 SP、用过的 nonce、提现计时 | 唯一真正动钱的地方：`settle` / `settleBatch` |
+| 付款方：agent 钱包 | `packages/wallet`、`packages/cli` | 付款私钥（EOA 里就是 USDC）、用户批准的预算（intent mandate）、本地账本 | 收到 402 后过策略闸、签授权、记账、事后对账 |
+| 收款方：数据源 | `packages/payee` | 收款地址、报价、facilitator 地址 | 出 402 报价、让 facilitator 验证、跑 handler、让 facilitator 结算、回 `PAYMENT-RESPONSE` |
+| facilitator | `packages/facilitator`（或 x402.org 托管） | facilitator 私钥（付 gas） | 验证授权、广播 `transferWithAuthorization`、等回执 |
+| 链上 | `packages/contracts` | USDC（EIP-3009）：余额、`authorizationState(from, nonce)` | 唯一动钱的地方；我们没有自己的合约 |
 
-`packages/core` 是四方共用的底座：Mandate 与收据的 EIP-712 类型和摘要、签名规范化、头部编解码、错误码、给 agent 看的拒绝提示、金额与 CAIP-2 工具。`demo/` 在一个进程里把四方跑一遍。
+`packages/core` 是共用底座：金额与 CAIP-2 工具、EIP-3009 ABI 切片、错误码、`payment_model_context` 提示；协议类型从 `@x402/core/types` 再导出。`demo/` 在一个进程里把四方跑一遍。
 
 ### 3.2 依赖方向
 
 ```mermaid
 graph LR
+  x402["@x402/core · evm · express · fetch"]
   core[core]
-  contracts[contracts<br/>合约 + ABI + 部署记录]
-  sp[sp]
+  contracts[contracts<br/>MockUSDC + 部署记录]
+  facilitator[facilitator]
   payee[payee]
   wallet[wallet]
   cli[cli]
   demo[demo]
+  core --> x402
   contracts --> core
-  sp --> core
-  sp --> contracts
+  facilitator --> core
+  facilitator --> contracts
+  facilitator --> x402
   payee --> core
+  payee --> x402
   wallet --> core
   wallet --> contracts
+  wallet --> x402
   cli --> wallet
   cli --> contracts
-  demo --> sp
+  demo --> facilitator
   demo --> payee
   demo --> wallet
 ```
 
-只有 `core` 没有依赖；`contracts` 只导出 ABI、部署工具和部署记录读写；运行时三方（sp、payee、wallet）互不导入，只通过 HTTP 和链交互。
+运行时三方（facilitator、payee、wallet）互不导入，只通过 HTTP 和链交互。
 
 ### 3.3 一笔付款的时序
 
@@ -67,354 +74,251 @@ graph LR
 sequenceDiagram
   participant A as Agent 钱包
   participant P as 收款方
-  participant S as SP
-  participant C as 链上合约
-  A->>P: GET /quote
+  participant F as facilitator
+  participant U as USDC
+  A->>P: GET /predict
   P-->>A: 402 + PAYMENT-REQUIRED（报价）
-  Note over A: 策略闸 → 预留预算 → 签 mandate → 账本 in_flight
-  A->>P: GET /quote + PAYMENT-SIGNATURE
-  P->>P: 验报价回显、条款、签名、占位摘要
-  P->>S: POST /enqueue {mandate, payerSig}
-  S->>C: 读 authorizationOf / usedNonces / debitableBalance（钉在一个区块）
-  S-->>P: 收据 SPReceipt(digest, enqueueDeadline)
-  P-->>A: 200 + PAYMENT-RESPONSE（收据）
-  Note over A: 账本 enqueued
-  S->>C: settleBatch([...])（稍后，攒批）
-  C-->>S: Settled / SettleSkipped 事件
-  Note over A: reconcile()：nonce 已用且有 Settled 事件 → settled
+  Note over A: 策略闸 → 预留预算 → signTypedData → 账本 in_flight
+  A->>P: GET /predict + PAYMENT-SIGNATURE
+  P->>P: accepted 回显 == 本路由条款；在途守卫 claim(from:nonce)
+  P->>F: POST /verify
+  F->>U: eth_call 模拟 transferWithAuthorization
+  F-->>P: { isValid: true }
+  P->>P: 跑 handler，响应缓冲
+  P->>F: POST /settle
+  F->>U: transferWithAuthorization（facilitator 付 gas）
+  U-->>F: 回执 + Transfer / AuthorizationUsed
+  F-->>P: { success: true, transaction }
+  P-->>A: 200 + PAYMENT-RESPONSE
+  Note over A: 账本 settled；预留 → 已花
 ```
 
 ## 4. 协议与数据格式
 
+全部是 x402 V2 的形状，由 `@x402/core/http` 编解码；本项目在协议之外只加了两样：首次 402 的 JSON body 带 `payment_model_context`，钱包返回的 Response 带 `x-agentpay-nonce` / `x-agentpay-ledger-status`。
+
 ### 4.1 报价（402）
 
-收款方回 402，头 `PAYMENT-REQUIRED` 是 body 同一份 JSON 的 base64。形状对齐 x402 V2，scheme 为 `aep2`：
-
-```json
-{
-  "x402Version": 2,
-  "error": "mandate_required",
-  "accepts": [{
-    "scheme": "aep2", "network": "eip155:31337",
-    "amount": "1000", "asset": "0x…usdc", "payTo": "0x…payee",
-    "resource": "GET /predict", "maxTimeoutSeconds": 60,
-    "extra": { "wallet": "0x…debitWallet", "sp": "http://127.0.0.1:3001",
-               "spAddress": "0x…sp", "settleWindowSeconds": 10800, "quoteId": "可选" }
-  }],
-  "payment_model_context": { "protocol": "aep2", "reason": "mandate_required", "summary": "…", "remediation": ["…"] }
-}
-```
-
-`amount` 是 USDC 原子单位（6 位小数，`1000` = $0.001）。`payment_model_context` 是给 agent 读的补救提示，每种拒绝原因一条，原文在 `packages/core/src/hints.ts`。
-
-### 4.2 一次性 mandate
+`PAYMENT-REQUIRED` = base64 JSON：
 
 ```
-Mandate(address owner, address token, address payee, uint256 amount,
-        uint256 nonce, uint64 deadline, bytes32 ref)
-域：{ name: "AEP2DebitWallet", version: "1", chainId, verifyingContract: <wallet> }
-ref = keccak256("METHOD /path") 或 keccak256("METHOD /path#quoteId")
+PaymentRequired { x402Version: 2, error?, resource: { url, description?, mimeType? }, accepts: PaymentRequirements[] }
+PaymentRequirements { scheme: 'exact', network: 'eip155:<id>', amount, asset, payTo, maxTimeoutSeconds, extra: { name, version, assetTransferMethod: 'eip3009' } }
 ```
 
-- `nonce` 是付款方选的随机 uint256，合约按 `(owner, nonce)` 记录已用。
-- `ref` 把资源和报价 ID 哈希进摘要，一张 mandate 只能用于这一次报价。
-- 签名必须是规范的 65 字节 `(r, s, v)`，低 `s`，`v ∈ {27, 28}`。链下验证方（收款方、SP）拒绝非规范签名，使其接受集合与合约 ECDSA 完全一致；否则付款人可以拿一份可延展的签名副本被服务，却永远扣不到款。
+`extra.name/version` 是 token 的 EIP-712 域（MockUSDC：`Mock USD Coin`/`2`；Base Sepolia USDC：`USDC`/`2`）。`maxTimeoutSeconds` 决定授权的存活期（默认 60 s）。V2 的默认 body 是 `{}`，我们的 paywall 用 `unpaidResponseBody` 放入 `payment_model_context`。
 
-重试请求带头 `PAYMENT-SIGNATURE`，base64 内容：
+### 4.2 单次授权
 
-```json
-{ "x402Version": 2, "accepted": { …回显的报价… },
-  "payload": { "mandate": { … }, "payerSig": "0x…" } }
-```
-
-兼容 FluxA 的裸头 `X-Payment-Mandate`（base64 的 `{mandate, payerSig}`），只读不发。
-
-### 4.3 SP 收据与成功响应
+官方客户端生成并签名：
 
 ```
-SPReceipt(bytes32 mandateDigest, uint64 enqueueDeadline)
-域：{ name: "AEP2SettlementProcessor", version: "1", chainId, verifyingContract: <wallet> }
-enqueueDeadline = min(mandate.deadline, now + settleWindowSeconds)
+TransferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce)
+域 { name, version, chainId, verifyingContract: asset }
+from = 付款人；to = payTo；value = amount；validAfter = 0；validBefore = now + maxTimeoutSeconds；nonce = 随机 32 字节
 ```
 
-成功时收款方回 2xx，头 `PAYMENT-RESPONSE` = base64 的 `{ success: true, scheme: "aep2", network, payer, transaction: "", status: "enqueued", mandateDigest, spReceipt }`。body 不动；`includeBodyPaymentField: true` 时给 JSON 响应加 FluxA 风格的 `payment` 字段。
+`PAYMENT-SIGNATURE` = base64 `{ x402Version: 2, resource, accepted: <报价>, payload: { signature, authorization } }`。同一个 `(from, nonce)` 链上只能用一次。
 
-### 4.4 时限策略
+### 4.3 结算响应
 
-| 谁 | 规则 |
-|---|---|
-| 钱包签 mandate | `deadline = now + settleWindowSeconds + max(maxTimeoutSeconds, 60)`，上限 `maxMandateValiditySeconds`（默认 24h） |
-| 收款方 | `deadline ≤ now + 30s` 拒 `mandate_expired`；`deadline < now + settleWindow` 拒 `mandate_deadline_too_short` |
-| SP | `deadline < now + 120s` 拒 `deadline_too_soon`；`deadline > now + 86400s` 拒 `deadline_too_far` |
-| SP worker | 距 deadline 不足 30s 的 pending 项本地标 expired，不再发送 |
-| 钱包对账 | `now > deadline + 60s` 且 nonce 未用 → `expired-unused`；有收据却未结算 → 记 `sp_default`（撤销在收据窗口内生效则记 `payer_revoked`） |
+`PAYMENT-RESPONSE` = base64 `{ success, transaction, network, payer?, errorReason?, errorMessage? }`。成功时 `transaction` 是已上链的交易；结算失败时 `@x402/express` 回 402 且头里 `success: false` 带 `errorReason`；`settlement_pending` 表示已广播但没等到回执，带交易哈希。
+
+### 4.4 facilitator API
+
+`GET /supported` → `{ kinds: [{ x402Version: 2, scheme: 'exact', network }], extensions, signers }`；`POST /verify` / `POST /settle` 收 `{ x402Version: 2, paymentPayload, paymentRequirements }`，语义上的拒绝仍是 HTTP 200（`isValid: false` / `success: false`），结构错误 400 `invalid_body`，链不可达 503 + `Retry-After`。
 
 ### 4.5 错误码
 
-| 层 | 代码 |
-|---|---|
-| 钱包策略拒绝（签名前） | `mandate_required` `mandate_not_found` `no_eligible_mandate` `mandate_insufficient_budget` `mandate_expired` `mandate_disabled` `host_not_allowed` `per_call_max` `rate_limited` `sp_not_trusted` `unsupported_offer` |
-| 收款方拒绝（402/409） | `invalid_payment` `offer_mismatch` `invalid_payee` `invalid_token` `invalid_amount` `mandate_expired` `mandate_deadline_too_short` `invalid_ref` `invalid_signature` `replay`(409) `insufficient_balance` `nonce_used` `chain_unavailable` `settlement_unavailable` `invalid_sp_receipt` |
-| SP 拒绝 | `invalid_body` `unsupported_chain` `unsupported_token` `bad_params` `deadline_too_soon` `deadline_too_far` `invalid_signature` `mandate_terminal` `nonce_used` `sp_not_authorized` `sp_revocation_pending` `rpc_error`(503) |
-| 合约 `settleBatch` 状态 | `0 Ok` `1 SPNotAuthorized` `2 Expired` `3 NonceUsed` `4 InsufficientBalance` `5 BadSignature` `6 BadParams` |
+以 `@x402/evm` 的实现为准（与规范文档的词汇不同）：`invalid_exact_evm_signature`、`invalid_exact_evm_recipient_mismatch`、`invalid_exact_evm_payload_authorization_valid_before` / `_valid_after` / `_value_mismatch`、`invalid_exact_evm_missing_eip712_domain`、`invalid_exact_evm_network_mismatch`、`invalid_exact_evm_insufficient_balance`、`invalid_exact_evm_nonce_already_used`、`invalid_exact_evm_transaction_simulation_failed`、`invalid_exact_evm_transaction_failed`、`asset_not_deployed_contract`、`settlement_pending`。收款方自己的：`payment_required`（首次 402）、`replay`（在途守卫）、`settlement_unavailable`（facilitator 不可达/超时/5xx）。付款方策略：`mandate_required`、`mandate_not_found`、`no_eligible_mandate`、`mandate_insufficient_budget`、`mandate_expired`、`mandate_disabled`、`host_not_allowed`、`per_call_max`、`rate_limited`、`unsupported_offer`、`timeout_too_long`。每个码都有 `payment_model_context` 提示（`core/src/hints.ts`），测试保证不漏。
 
-## 5. 链上合约 `AEP2DebitWallet`
+## 5. 链上
 
-Solidity 0.8.24，OpenZeppelin 5（`EIP712`、`ECDSA`、`SafeERC20`、`ReentrancyGuardTransient`——重入锁用 EIP-1153 瞬态存储，目标链须支持 Cancun；Base 支持）。没有 owner、没有 admin、没有升级和暂停。
+没有我们自己的合约。付款方的 USDC 在它的 EOA 里，facilitator 用 `(v, r, s)` 重载调 `transferWithAuthorization`。
 
-### 5.1 存储
+- `packages/contracts/contracts/MockUSDC.sol`：测试用 EIP-3009 token（`transferWithAuthorization` / `receiveWithAuthorization` / `authorizationState`，OpenZeppelin `EIP712`，域 `Mock USD Coin`/`2`，开放 `mint`）。只在本地链用。
+- `deployLocalFixture()`：MockUSDC + 用 `hardhat_setCode` 放到规范地址 `0xcA11…CA11` 的 **Multicall3** 字节码——`@x402/evm` 在模拟失败后靠它诊断精确原因（余额不足、nonce 已用、域不匹配），没有它本地只能得到笼统的 `..._simulation_failed`。
+- 部署记录 `DeploymentRecord { chainId, network, usdc, usdcDomain: { name, version }, facilitatorUrl?, ... }`：`localhost.json` 由 `deploy:local` 生成（gitignored）；`base-sepolia.json` 是提交的静态记录，域已按链上 `DOMAIN_SEPARATOR()` 核对。缺 `usdcDomain` 的旧记录会被 `assertDeploymentRecord` 拒绝。
+- Gas：`transferWithAuthorization` 每笔约 6–8 万 gas，由 facilitator 付；Base 上一次付费调用约 2–4 s（一个块 + 回执轮询），本地 automine 约 50 ms。
 
-| 映射 | 含义 |
-|---|---|
-| `balances[payer][token]` | 总托管额，含待提现部分 |
-| `withdrawals[payer][token]` | 待提现 `{amount, unlockAt}`，每对 (payer, token) 最多一笔 |
-| `usedNonces[payer][nonce]` | nonce 已消耗 |
-| `_authorizations[payer][sp]` | `{enabled, revokeAt}`：该 payer 是否允许这个 SP 扣款，以及已排定的撤销生效时刻（0 = 未排定）。视图 `authorizedSP(owner, sp)` = `enabled && (revokeAt == 0 \|\| now < revokeAt)`，`authorizationOf(owner, sp)` 返回原始记录 |
-| `withdrawDelay`（immutable） | 提现锁定秒数（撤销 SP 同样延迟）。合约只要求非零；SP 启动时要求它比自己的结算窗口至少长 60 秒（时钟偏差余量，见 §6.4） |
+## 6. facilitator
 
-### 5.2 函数
+`packages/facilitator`，无状态 `node:http` 服务，核心是 `@x402/core` 的 `x402Facilitator` 加 `@x402/evm/exact/facilitator` 的 `ExactEvmScheme`，只注册 V2、一条链（直接 `register` 而不用 `registerExactEvmScheme`，后者会把 V1 也挂到它认识的所有网络上）。
 
-| 函数 | 说明 |
-|---|---|
-| `deposit(token, amount)` | 预存（需先 approve）。按**实际到账额**记账并发 `Deposited`：扣手续费的代币只记到账的部分，到账为 0 则 revert `BadParams` |
-| `authorizeSP(sp)` | 授权某个 SP，并清除已排定的撤销 |
-| `revokeSP(sp)` | 排定撤销：`revokeAt = now + withdrawDelay`，发 `SPRevocationScheduled`；未授权则 revert `BadParams`，已排定则不动（重复调用不会提前） |
-| `cancelRevoke(sp)` | 取消尚未生效的撤销（生效后只能 `authorizeSP` 重新授权） |
-| `requestWithdraw(token, amount)` | 开始提现计时，`unlockAt = now + withdrawDelay` |
-| `cancelWithdraw(token)` | 取消待提现 |
-| `executeWithdraw(token, to)` | 到期付出 `min(申请额, 剩余余额)`，锁定期内的结算优先 |
-| `debitableBalance(owner, token)` | `balance − 待提现`：SP 接纳**新** mandate 的依据 |
-| `mandateDigest(m)` | EIP-712 摘要，与 core 的 `mandateDigest()` 逐字节一致 |
-| `settle(m, sig)` | 结算一张，失败 revert 具体错误 |
-| `settleBatch(ms, sigs)` | 结算多张，单张失败**跳过并发事件** `SettleSkipped(digest, owner, nonce, status)`，只有代币转账失败才整批 revert |
-
-`_settle` 的检查顺序：参数 → `authorizedSP(owner, msg.sender)` → deadline → nonce 未用 → **全部**余额 ≥ amount → ECDSA 恢复 == owner → 标 nonce、扣款、`Settled` 事件、`safeTransfer` 给 payee。任何人都能调用 `settleBatch`，但只对授权了调用者的 payer 生效。
-
-### 5.3 提现安全
-
-提现要等 `withdrawDelay`；期间已排队的 mandate 仍按**全部**余额结算，`executeWithdraw` 只付剩下的。SP 用 `debitableBalance` 接纳新 mandate，所以永远不会针对已在路上的钱接单。这与 FluxA「自动延长的提现计时器」等价，但不需要计时器。
-
-撤销 SP 同样延迟：`revokeSP` 在 `withdrawDelay` 后生效，期间 SP 仍有授权，撤销前 SP 已签收的 mandate（都在其短于 `withdrawDelay` 的结算窗口内到期）仍可结算；否则付款人可以拿到数据后下一块撤销授权，绕过提现延迟。这只堵住付款人自己的 `revokeSP` / `requestWithdraw` 路径：付款人另授权的 SP（包括付款人自己控制的地址）仍可先消耗该 mandate 的 nonce 或余额，见 §15。SP 拒绝收据窗口会跨过待生效撤销的新 mandate（`sp_revocation_pending`）；钱包对账把撤销导致的过期记 `payer_revoked` 而非 `sp_default`。
-
-### 5.4 Gas
-
-本地演示：24 张 mandate 一笔 `settleBatch` 约 1.03M gas，每张约 42.9k（随签名与 calldata 逐次略有浮动；Hardhat 基线待合约测试的 gas 上限一起钉住）。批量摊薄交易开销，每张仍要一次 ecrecover。
-
-## 6. 结算处理器（SP）
-
-`node:http` 服务，默认绑定 `127.0.0.1:3001`，追加式 JSONL 存储（默认 `packages/sp/data/sp-queue.jsonl`）。
-
-### 6.1 HTTP API
-
-| 方法 路径 | 用途 |
-|---|---|
-| `POST /enqueue` | 提交 `{mandate, payerSig, chainId?}`；返回 `{success, status:"enqueued", created, enqueuedAt, receipt}` |
-| `GET /status/:digest` | 一条记录的投影：状态、txHash、errorCode、时间戳、收据 |
-| `GET /queue/:owner?token=` | 该付款人的 `balance`、`queueBalance`（已预留）、`available`、未结算列表 |
-| `GET /supported` | 链、钱包合约、代币、结算窗口 |
-| `GET /health` | RPC 可达性；不可达返回 503 |
-
-### 6.2 接纳检查（`/enqueue`）
-
-schema → 链与代币受支持 → 金额和 payee 非零 → deadline 窗口 → 规范签名并恢复为 owner → 已知摘要则幂等返回原收据（`created: false` + 原 `enqueuedAt`）→ 本地 nonce 索引 → 链上 `authorizationOf`、`usedNonces`、`debitableBalance`，三者**钉在同一区块号**读取（`cacheTime: 0`），且该区块不得早于本进程上次结算的区块，否则 503 `chain view is stale` → 已授权且没有在收据 `enqueueDeadline` 或之前生效的撤销（403 `sp_not_authorized` / `sp_revocation_pending`）→ `debitable ≥ amount + 该 (owner, token) 已预留` → 预留、落盘、签收据。
-
-### 6.3 队列状态机
-
-`pending → settling → settled | failed | expired`
-
-- worker 每 `batchIntervalMs`（默认 5000）一轮，每批最多 `batchMax`（默认 50）张，攒满立即触发。
-- 一轮：(a) 距 deadline 不足 `sendMarginSeconds`（30）的本地 expired；(b) dry run 剔除合约必然跳过的项；(c) 发送，先持久化 txHash，等收据，按事件更新。
-- 失败分两类：**transport**（RPC 超时、连接失败）退避 30s，不计 `attempts`，永远不会因此进入终态；**deterministic**（合约状态码）计一次，超过 `maxAttempts`（8）标 `failed:send_failed`。
-- `NonceUsed` 只有在链上找到**指向这个摘要**的 `Settled` 事件时才判 `settled`（可能是本进程更早的一次尝试，或付款人授权的另一个 SP）；nonce 被别的 mandate 用掉判 `failed:nonce_used`。
-- 启动恢复：崩溃时留在 `settling` 的记录，有 txHash 就查收据，否则由链上 nonce 决定，已用即落地、未用退回 pending。RPC 不可读则拒绝启动。
-
-### 6.4 配置
-
-环境变量：`SP_PK`、`RPC_URL`、`CHAIN_ID`、`WALLET_ADDRESS`、`SUPPORTED_TOKENS`（逗号分隔）、`SP_PORT`、`STORE_PATH`（默认 `packages/sp/data/sp-queue.jsonl`，按包位置锚定，与运行目录无关；`:memory:` 显式选入纯内存，启动时会打印警告）、`SETTLE_WINDOW`（10800；启动时读链上 `withdrawDelay`，不比窗口至少长 60 秒则拒绝启动）、`MIN_DEADLINE_MARGIN`（120）、`MAX_DEADLINE_HORIZON`（86400）、`BATCH_INTERVAL_MS`（5000）、`BATCH_MAX`（50）、`SEND_MARGIN`（30）、`MAX_ATTEMPTS`（8）。缺 `WALLET_ADDRESS` / `SUPPORTED_TOKENS` 时从 `packages/contracts/deployments/<DEPLOYMENT ?? localhost>.json` 补。
+- **签名器**：`privateKeyToAccount(key, { nonceManager })` + `createWalletClient(...).extend(publicActions)`，`pollingInterval` 显式设 500 ms（viem 默认按 `blockTime ?? 12 s` 取 4 s 轮询，Base 2 s 出块会白等）。`writeContract` / `sendTransaction` 包在一个**发送锁**里：viem 在 gas 估算之前就消费 nonce、任何失败都 `reset`，Hardhat automine 对乱序 nonce 报 "Nonce too high"，串行化广播（回执仍并行等）后 20 个并发结算稳定。`simulateInSettle: true`：广播前再模拟一次，revert 不消耗 nonce。
+- **签名离线验证**：EOA 签名先用 viem 离线 `verifyTypedData`，只有失败时才走链上（EIP-1271/6492）；否则 RPC 一抖，scheme 会把好签名报成 `invalid_exact_evm_signature`。
+- **传输错误计数**：signer 的每个链调用统计 transport 类失败；HTTP 层对比调用前后的计数，把 scheme 折叠成"拒绝"的 RPC 故障改答 **503 `unexpected_verify_error` / `unexpected_settle_error` + `Retry-After`**（`settlement_pending` 保留原样）。
+- **白名单**：`tokens`（必填）与 `payees`（可选）在 `onBeforeVerify` / `onBeforeSettle` 钩子与 HTTP 层各拒一次；`/settle` 是公开端点、替人付 gas，公网上没有 `PAYEES` 等于任何人都能让它烧钱。可选 `FACILITATOR_AUTH_TOKEN`（Bearer）。
+- **启动检查**：RPC 可达且 chainId 一致；每个 token 能答 `authorizationState`；`assetDomain` 与合约的 `eip712Domain()`（OpenZeppelin）或 `name()/version()/DOMAIN_SEPARATOR()`（Circle）重算一致；EOA 有 ETH。域错了启动即失败，而不是每笔 `invalid_exact_evm_signature`。
+- 配置见 `.env.example`：`FACILITATOR_PK`、`RPC_URL`、`CHAIN_ID`/`SUPPORTED_TOKENS`/`USDC_DOMAIN_*`（缺省来自部署记录）、`PAYEES`、`FACILITATOR_PORT`、`RECEIPT_TIMEOUT_MS`（30 s，不是 viem 的 180 s：授权本身只活 `maxTimeoutSeconds`）。
 
 ## 7. 收款方 paywall
 
-`createMandatePaywall(options)` 返回一个普通的 `(req, res, next)` 中间件；express 只做类型引用，运行时不依赖。
+`createPaywall(options)` 建一个 `x402ResourceServer`（`HTTPFacilitatorClient` + `ExactEvmScheme`，一条链、V2），`charge(price, opts)` 返回 `@x402/express` 的 `paymentMiddleware`，挂在某条路由上。中间件的行为是官方的：无支付 → 402；有 → `findMatchingRequirements`（`accepted` 回显必须等于本路由条款）→ `/verify` → `next()`，`res.write/res.end` 被缓冲 → handler 状态 ≥ 400 则取消结算 → `/settle` → 设 `PAYMENT-RESPONSE` 后才把缓冲的响应发出去；结算失败 → 402（头里 `success:false`）。
 
-八步固定顺序：
+agentpay 加的：
 
-1. 读 mandate：`PAYMENT-SIGNATURE`（x402 信封）或旧头 `X-Payment-Mandate`；都没有就回 402 报价。
-2. x402 信封回显的报价必须是自己的（`offer_mismatch`）。
-3. 形状与条款：`payee == payTo`、`token == asset`、`amount ≥ price`、deadline 两条规则、`ref` 绑定本资源与 quoteId。
-4. 签名恢复为 `owner`（非规范或畸形签名一律无效）。
-5. 幂等：按摘要占位，占不到回 409 `replay`；一张 mandate 只买一次交付。
-6. 可选链上预检 `debitableBalance` / `usedNonces`，RPC 出错时 fail closed（`chain_unavailable`）。默认只在 `eip155:31337` 且给了 RPC 时开启。
-7. `POST <sp>/enqueue`，验收据：签名、SP 地址、摘要一致、`enqueueDeadline` 未过且不超过 `settleWindow + 时钟偏差余量`、不晚于 mandate deadline。SP 回 `created:false` 且 `enqueuedAt` 早于 60s（`REPLAY_GRACE_SECONDS`）则视为跨进程重放，回 409；60s 内视为收款方自己在 SP 超时后的重试。
-8. 调 `onEnqueued`，再设置 `PAYMENT-RESPONSE` 头，最后执行路由。
+- 非默认资产（MockUSDC，或 scheme 不认识的链上的 USDC）必须以 `AssetAmount { asset, amount, extra: { name, version, assetTransferMethod } }` 报价，否则官方 server 找不到资产信息。
+- **在途守卫**（`IdempotencyStore`，键 `from:nonce`，服务端 TTL = `maxTimeoutSeconds + 60`）：`onBeforeVerify` 先 `claim`，重复在途 → abort `replay`；`onAfterVerify`（`isValid:false`）/ `onVerifyFailure` / `onSettleFailure` / `onVerifiedPaymentCanceled` 释放；`onAfterSettle` 成功后 `retain`，重放不再打 facilitator。同一个 paywall 的所有路由共享一个 store，所以同一授权并发打两条同价路由也只服务一次。
+- facilitator 抛出的错误（不可达、超时、5xx）在 `onVerifyFailure` / `onSettleFailure` 里 `recovered` 成干净的原因码：`settlement_unavailable`，或 facilitator 自己 5xx 里给的 `invalidReason` / `errorReason`。否则客户端看到的是异常文本。
+- 首次 402 的 body：`{ x402Version: 2, error: 'payment_required', message, payment_model_context }`（`includeHints: false` 可关）。verify 失败的 402 body 固定 `{}`，原因在头的 `error` 字段——这是官方实现的行为，钱包据此读原因。
 
-关键选项：`price`（`'$0.001'`）、`network`、`asset`、`payTo`、`wallet`、`sp {url, address, settleWindowSeconds}`、`resourceOf`、`quoteIdOf`、`verifyOnChain`、`idempotencyStore`（默认进程内存，多实例换 Redis）、`includeBodyPaymentField`、`includeHints`、`deadlineMarginSeconds`。
+配置：`facilitator { url, timeoutMs (默认 35 s ≥ facilitator 的回执超时), authToken? }`、`network`、`asset`、`assetDomain`、`payTo`、`maxTimeoutSeconds`（默认 60）、`onSettled`。
 
 ## 8. 付款方钱包
 
-`MandateWallet` 是一个 `fetch` 包装器加预算与账本管理。
+`MandateWallet` 是一个 `fetch` 包装器加预算与账本管理；协议动作委托给 `x402Client`（`setSpendControls(false)`——官方默认会拒绝非默认资产并封顶 $1/笔，策略闸就是我们的 spend control）与 `x402HTTPClient`。不用 `wrapFetchWithPayment`：它把我们的 `PolicyViolation` 包成普通 Error。
 
-### 8.1 预算：intent mandate
+### 8.1 预算：intent mandate（未变）
 
-用户批准的额度，链下 EIP-712 凭证（域 `AEP2AgentWallet` v1，无 verifyingContract，合约不校验）：
+用户批准的额度，链下 EIP-712 凭证（域 `AEP2AgentWallet` v1——名字沿用，改了会让所有已签预算卡失效）：`IntentMandate(id, naturalLanguage, limitAmount, validFrom, validUntil, hostAllowlist, category)`。字段 `limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`、`status: draft | signed`、`isEnabled`。agent 只能 `createIntentMandate` 生成 draft；批准、启用、加额是人的操作。两个计数器是账本的缓存，加载时从账本重算。
 
-```
-IntentMandate(string id, string naturalLanguage, uint256 limitAmount,
-              uint64 validFrom, uint64 validUntil, string hostAllowlist, string category)
-```
+### 8.2 策略闸（未变）
 
-记录字段：`limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`（最长一年）、`status: draft | signed`、`isEnabled`、`signature?`。agent 只能 `createIntentMandate` 生成 draft；`approveIntentMandate`（签名）、启用、加额都是人的操作。两个计数器是账本的缓存：钱包构造时读一次账本，按 `intentMandateId` 重算（`pending` = 仍持有预留的行，`spent` = 已提交的行），与文件不一致就记日志并写回一次；`mandates.json` 的 `version` 不是 1 拒绝加载。
+已签名 → 已启用 → 在有效期 → host 在白名单 → 不超单笔上限 → `limit − spent − pending ≥ amount` → 未超每分钟次数。自动选择的拒绝理由优先级 `host_not_allowed > mandate_expired > per_call_max > mandate_insufficient_budget > rate_limited > mandate_disabled`。
 
-### 8.2 策略闸
+### 8.3 选报价
 
-对每张候选预算按顺序检查，第一条不过就是答案：已签名 → 已启用 → 在有效期 → host 在白名单 → 不超单笔上限 → `limit − spent − pending ≥ amount` → 未超每分钟次数（60s 滑动窗）。自动选择时若无可用预算，按优先级 `host_not_allowed > mandate_expired > per_call_max > mandate_insufficient_budget > rate_limited > mandate_disabled` 给出原因；一张签过的都没有则是 `mandate_required`。另外报价里的 SP 不在 `trustedSps` 中拒 `sp_not_trusted`。
+`accepts` 里必须有：`scheme === 'exact'`、`network` 与钱包一致、`asset` 是钱包的 token、`extra.name/version` **等于钱包配置的域**（不信报价）、`maxTimeoutSeconds ≤ caps.maxAuthorizationValiditySeconds`（默认 300；这就是失败调用的预算会被占用的上限）。否则 `unsupported_offer` / `timeout_too_long`，签名前就拒。
 
-### 8.3 `fetch()` 流程
+### 8.4 `fetch()` 流程
 
-1. Order Mode：先请求，拿 402 报价；`prepay: true` 且有缓存报价时走 Intent Mode，第一次请求就带 mandate。
-2. 策略闸 + 预算预留，**一个同步块**内完成，并发调用不会超支。
-3. 构造并签 mandate；签完立刻在账本追加一行 in_flight（`status: 'unknown', error: 'in_flight', httpStatus: 0`，带签名时刻 `signedAt`，之后的状态更新不改它）。
-4. 带 `PAYMENT-SIGNATURE` 重试；解析 `PAYMENT-RESPONSE`，验收据（默认 `requireReceipt: true`，无有效收据记 `unknown`）。
-5. 账本更新为 `enqueued` / `rejected` / `unknown`；返回可读的 Response。
+1. 首个请求拿 402（`prepay: true` 且有缓存报价则直接带支付）；V2 只读 `PAYMENT-REQUIRED` 头。
+2. 策略闸 + 预留，**一个同步块**内完成。
+3. `client.createPaymentPayload()` 签名（失败 → 释放预留）；签完立刻追加账本行 `in_flight`（`v: 2`，键 `nonce`，记 `validBefore`、`authorization`、`signature`、`signedAt`）。
+4. 带 `PAYMENT-SIGNATURE` 重发。传输错误在 `validBefore − 10 s` 之前**重发同一个头**最多 2 次（同 nonce 至多结算一次），仍失败 → `unknown`（httpStatus 0）并抛出，预留保持。
+5. 结果由 `PAYMENT-RESPONSE` 决定：
+   - `success && transaction` → `settled`，`pending −amount, spent +amount`。**任何 HTTP 状态**下都如此：结算后 handler 5xx 记 `settled` + `error: 'paid but http 500'`。
+   - 2xx 但无头/坏头/`success:false` → `unknown`，算已花（是否被扣款不可知，多算是安全方向）。
+   - 非 2xx 且头里 `settlement_pending` → `unknown` 带交易哈希，预留保持。
+   - 其它非 2xx → `rejected`，`error` 取 `PAYMENT-REQUIRED.error`，否则结算的 `errorReason`，否则 body 的 `error`，否则 `http N`；**预留保持**——授权在 `validBefore` 前仍可能被结算。
+6. 返回重包装的 Response，加 `x-agentpay-nonce` / `x-agentpay-ledger-status`。
 
-账本（JSONL）状态：`enqueued`、`settled`、`rejected`（收款方非 2xx，签名已出，预算保持预留）、`unknown`（签完未回的 in_flight 也是它，靠 `error: 'in_flight'` 区分）、`expired-unused`；对账时还会记 `sp_default`（`spDefault: true`，error 也带前缀）/ `payer_revoked` 标记。
+### 8.5 对账
 
-### 8.4 对账与报告
+`reconcile()` **按链时间**判断，不看墙钟：先 `getChainId()`（与配置不符直接抛错）和 `getBlock()`，对 `rejected | unknown` 行在该块读 `authorizationState(payer, nonce)`：已用 → `settled`（交易哈希尽力从 `AuthorizationUsed(authorizer, nonce)` 日志找，范围按 `signedAt` 与 `BLOCK_TIME_SECONDS` 倒推、Hardhat 从 0 起）；未用且 `block.timestamp ≥ validBefore` → `expired-unused`（此后每个块都会 revert，无需宽限），释放预留或退回已花；否则继续 pending。头里报过 `settled` 的行在有效期过后各查一次：链上没用过 → 退回预算并记 `expired-unused`（收款方谎报）。RPC 传输错误 → 该行及之后全部保持 pending；其它错误记在该行 `error` 上继续。`rebuildBudgets` 与 `reservationHeld` 语义不变：`rejected` 与 httpStatus 非 2xx 的 `unknown` 持有预留；`settled` 与 2xx 的 `unknown` 算已花；`expired-unused` 两者都不算。
 
-`reconcile()`：对每条未终态记录查链，nonce 已用且找到指向该摘要的 `Settled` 事件 → `settled`（带 tx）；deadline 过 60s 且 nonce 未用 → `expired-unused`，预算释放；有收据但没结算 → `sp_default`，预算释放；若付款人排定的撤销在收据 `enqueueDeadline` 或之前生效（SP 本来就无法履约）→ 记 `payer_revoked`，不算 SP 失约。`report()` 输出 `SpendReport`：按状态计数、`byHost`、`byResource`、`policyDenials`（签名前被拒的记录，它们不进账本）。
+### 8.6 链上操作
 
-### 8.5 链上操作
-
-`deposit`、`balance`、`debitable`、`authorizeSP` / `revokeSP` / `cancelRevokeSP` / `isSpAuthorized` / `authorizationOf`、`requestWithdraw` / `cancelWithdraw` / `executeWithdraw` / `pendingWithdrawal`。
+只剩 `balance()`（`balanceOf(owner)`；超过 `caps.floatWarnAtomic` 打日志提醒 EOA 只放小额浮动资金）。`rpcUrl` 可选：`pay` 完全离线签名。
 
 ## 9. CLI 与 agent 接入
 
-`agentpay <command>`，每条命令恰好输出一份 JSON。退出码：`0` 成功，`1` 业务拒绝（读 `error` 与 `payment_model_context`），`2` 用法或配置错误。金额参数一律是美元（`5`、`0.25`、`$0.001`）。
+`agentpay <command>`，每条命令恰好输出一份 JSON。退出码：`0` 成功，`1` 业务拒绝（读 `error` 与 `payment_model_context`），`2` 用法或配置错误。金额参数一律是美元。
 
 | 组 | 命令 |
 |---|---|
-| 链上 | `balance` `deposit` `withdraw-request` `withdraw-cancel` `withdraw` `sp-authorize` `sp-revoke`（输出 `revokeAt`：撤销在 `withdrawDelay` 后生效） |
-| 预算 | `mandate-request`（agent 起草）`mandate-create`（人一步建好）`mandate-approve` `mandate-enable` `mandate-disable` `mandate-list` `mandate-status` |
-| 付款 | `offer <url>`（只看报价）`pay <url> [--method --body --header --mandate --prepay --legacy]` `ledger` `reconcile` `report` |
+| 钱包 | `address`（打钱地址，不需要 ETH）`balance` |
+| 预算 | `mandate-request` `mandate-create` `mandate-approve` `mandate-enable` `mandate-disable` `mandate-list` `mandate-status` |
+| 付款 | `offer <url>` `pay <url> [--method --body --header --mandate --prepay]` `ledger` `reconcile` `report` |
 | 设置 | `init [--from-deployment localhost\|base-sepolia\|path.json]` |
 
-配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > `packages/contracts/deployments/<name>.json`。私钥只从 `AGENTPAY_KEY` / `--key` 读，任何输出都不回显。`SKILL.md` 给 agent 的决策流程：先 `offer` 看价 → `mandate-list` 找可用预算 → 没有就 `mandate-request` 起草并停下等人批 → `pay` → 被拒读 `remediation`。
+`pay` 输出 `payment: { transaction, network, payer, nonce, intentMandateId, amount, ledgerStatus }`（按 `x-agentpay-nonce` 找账本行）；`paid` 只在 `ledgerStatus === 'settled'` 时为 true；`unknown` 时附 `payment_model_context`（先 `reconcile` 再付）。配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > 部署记录；token 的域随 token 走（`AGENTPAY_TOKEN_NAME/VERSION`，或部署记录）。`SKILL.md` 的决策流程：`offer` 看价 → `mandate-list` 找预算 → 没有就 `mandate-request` 起草并停下等人批 → `pay` → 被拒读 `remediation`；结果 `unknown` 时先 `reconcile`。
 
 ## 10. 安全模型与信任边界
 
 | 谁信谁 | 内容 | 若失信 |
 |---|---|---|
-| 收款方 → SP | 收据是签名承诺，链上没有强制 | SP 不结算：收款方拿不到钱；钱包对账记 `sp_default` 并释放预算 |
-| 付款方 → 收款方 | 入队后会交付 | 协议不给「没拿到数据就退款」，无追索 |
-| SP / 收款方 → 付款方 | 余额与授权在链上可查 | 余额不足的 mandate 会被跳过；提现和撤销 SP 都在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 不会被付款人自己的提现或撤销作废；但付款人通过另一个（自己控制的）已授权 SP 仍能先消耗其 nonce 或余额（§15） |
-| 用户 → 钱包程序 | 预算只在链下由钱包自己遵守 | 预算凭证合约不校验 |
+| 付款方 → 收款方 | 结算后会交付 | `authorization` 流先 handler 后 settle：handler 失败不收钱；但 settle 成功后 handler 仍可能 5xx（账本 `paid but http 500`），无追索 |
+| 付款方 → 收款方/facilitator | 已签出的授权只在 `validBefore` 前、只按 `to`/`value` 使用 | 被拒的调用其授权仍活着：预算保留到链时间过期，`reconcile` 释放 |
+| 收款方 → facilitator | `success:true` 是真的 | 我们的 facilitator 等回执并验 `Transfer` 事件；收款方不自查链 |
+| 付款方 → 收款方的 `PAYMENT-RESPONSE` | 报的交易是真的 | 有效期过后 `reconcile` 查一次 `authorizationState`，谎报的退回预算 |
+| 用户 → 钱包程序 | 预算只在链下由钱包遵守 | **USDC 在 EOA 里，拿到私钥的人一次 `transfer` 就能转空**；预算约束 agent，不约束密钥 |
 
-评审后已合入的修复：
-
-1. 链下验证只接受规范签名（低 `s`，`v ∈ {27,28}`），与合约 ECDSA 的接受集合一致。
-2. SP 的传输失败不进终态、不计次数，30s 退避。
-3. SP 接纳读链钉在同一区块，拒绝早于上次结算区块的视图（`getBlockNumber({cacheTime: 0})`）。
-4. `NonceUsed` 只在有指向该摘要的 `Settled` 事件时判 settled。
-5. `/enqueue` 返回 `created` / `enqueuedAt`，收款方据此把跨进程重放判 409（60s 宽限）。
-6. `PAYMENT-RESPONSE` 在 `onEnqueued` 之后设置，避免处理器改写响应时丢头。
-7. 钱包签完立即写 in_flight 账本行（`status: 'unknown', error: 'in_flight'`），崩溃后对账能找回；预算计数器每次加载从账本重算。
-
-未覆盖：合约未经外部审计；SP HTTP API 没有鉴权和限流；私钥以环境变量形式存在。
+设计上的防线：钱包钉住 token 域、封顶授权存活期、签前预留；收款方在途守卫、回显条款校验（官方）；facilitator 白名单、离线验签、Bearer、启动域校验。未覆盖：私钥仍以环境变量/`config.json`（0600）形式存在；没有 KMS seam；facilitator 没有限流。
 
 ## 11. 可靠性与一致性
 
 | 进程在这里崩溃 | 结果 |
 |---|---|
-| 钱包：预留后、账本行写入前 | `mandates.json` 多了一笔 pending 而账本没有对应行；下次加载从账本重算，预留释放 |
-| 钱包：签名后、发请求前 | 账本有 in_flight 行（`status: 'unknown', error: 'in_flight'`），预算已预留；对账后按链上状态收敛 |
-| 钱包：提交后、账本更新前 | `mandates.json` 已记 spent 而账本还是 in_flight；下次加载重算为 pending（只算一次），对账后按链上状态收敛 |
-| 收款方：入队后、交付前 | SP 已有收据会结算；付款人未拿到数据（协议不保证） |
-| SP：入队后、落盘前 | 无记录、无收据：`enq` 事件先 append + fsync 再进内存，写失败则内存不变、请求返回 500；收款方收到错误不交付，可重试 |
-| SP：收据发出后、`kill -9` | 记录已在盘上，重启后 pending 继续结算；丢的最多是一条未 fsync 的 `upd` 事件，启动对账从链上补回 |
-| SP：发送后、收到收据前 | 记录停在 `settling` 带 txHash；启动恢复查收据或按 nonce 决定 |
+| 钱包：预留后、账本行写入前 | `mandates.json` 多一笔 pending 而账本没行；下次加载从账本重算，预留释放 |
+| 钱包：签名后、发请求前 | 账本有 in_flight 行，预算已预留；`reconcile` 按链上状态收敛（用了 → settled；过期 → 释放） |
+| 钱包：提交后、账本更新前 | `mandates.json` 已记 spent 而账本还是 in_flight；重算为 pending（只算一次），对账后收敛 |
+| 收款方：verify 后、settle 前 | 未结算，付款人未被扣款；在途 claim 随 TTL 过期 |
+| 收款方：settle 请求发出后断线 | facilitator 可能已广播：官方 `PendingSettlementStore` 让同一授权的重试拿回同一笔 tx；付款人账本 `unknown`/`rejected` 由 `reconcile` 纠正 |
+| facilitator：广播后、回执前超时 | 答 `settlement_pending` + 交易哈希；收款方回 402，付款人多半已被扣款，`reconcile` 记 settled |
 | 钱包对账时 RPC 不可用 | 快速失败，不改任何状态 |
 
-存储都是本地文件：SP 的 `sp-queue.jsonl`（只追加，每次入队一次 fsync）、钱包的 `mandates.json`（单写者，整文件 tmp+fsync+rename 重写）和 `ledger.jsonl`（只追加，每行 fsync；状态更新同样 tmp+fsync+rename 重写，所以崩溃或断电后只会是旧账本或新账本；只容忍被截断的最后一行，其余坏行报错；读取只忽略这样的尾行，追加前才把它截掉——纯读取的进程如 `agentpay report` 不会碰文件，也就不会毁掉另一个进程正在写的行。预算计数器从账本重算，所以账本和 `mandates.json` 的耐久性必须一致，否则丢账本会放开预算）、收款方的幂等存储在内存。CLI 把钱包的修复日志（丢弃的尾行、重算的计数器）写到 stderr，stdout 仍只有一个 JSON 文档。
+存储：钱包 `mandates.json`（单写者，tmp+fsync+rename）与 `ledger.jsonl`（只追加、每行 fsync；状态更新 tmp+fsync+rename；只容忍截断的尾行；`v: 2` 行，AEP2 时代的行拒绝加载并提示归档），收款方在途守卫在内存（带 TTL），facilitator 无存储。
 
 ## 12. 测试与验证
 
 | 工作区 | 测试数 | 覆盖 |
 |---|---|---|
-| core | 22 | 摘要与合约逐字节一致、签名规范化、头部编解码、收据校验、金额解析 |
-| contracts | 17 | 存取、授权、延迟撤销、提现延迟、fee-on-transfer 存款、`settle` 各错误、`settleBatch` 跳过语义 |
-| sp | 60 | 接纳各拒绝码、幂等、区块钉住、并发接纳（HTTP 级与 `Queue.claim` 单 tick 级）、撤销待生效、store 耐久（入队 fsync 可观测）与写失败回滚、`:memory:` 选入、withdrawDelay 余量、worker 状态机、启动恢复、传输失败 |
-| payee | 28 | 八步顺序、重放（含并发）、SP 各种坏响应（stub SP 多种模式）、链上预检 |
-| wallet | 63 | 策略闸、预算并发预留、账本状态、账本尾行/原子重写（fsync 与 tmp+rename 序列本身可观测）、计数器重算、对账（含 SP 违约、付款人撤销及其 `revokeAt == enqueueDeadline` 边界、双花 nonce） |
-| cli | 10 | 命令 JSON 契约、配置优先级、美元金额、stderr 修复日志 |
+| core | 10 | 金额、CAIP、nonce 格式、ABI 切片、每个原因码都有提示 |
+| contracts | 12 | MockUSDC 元数据与域、EIP-3009 转账/重放/过期/未生效/错签名/余额不足（整笔 revert、nonce 不消耗）、`receiveWithAuthorization` 调用者、Multicall3 已就位 |
+| facilitator | 35 | verify 各原因（含 Multicall3 精确诊断）、settle 转账/去重/12 并发 nonce 连续/不广播的拒绝/RPC 故障 503 与恢复、HTTP 面（400/401/404/405/413、V1 拒绝）、配置、启动检查（链 id、非 EIP-3009、域错、无 ETH、RPC 不可达） |
+| payee | 22 | 402 形状与提示、支付流程、本地重放、并发同授权（同路由与跨路由）、回显篡改、facilitator 拒绝/宕机/超时/5xx/`settlement_pending`、handler 失败不结算、settle 失败 402；真 facilitator + 官方 `@x402/fetch` 客户端上链付通 |
+| wallet | 59 | 策略闸每个理由（含域不匹配、`timeout_too_long`）、并发预留、账本（v2、拒绝 AEP2 行、耐久序列）、结算报告各分支、传输错误重发同头、崩溃窗口重算、prepay、report；链上：真 facilitator 付款、链下结算后对账、链 id 守卫、链时间过期释放与谎报退款 |
+| cli | 12 | 命令 JSON 契约、配置（token 域必填、无 RPC 时 `pay` 可用）、`offer`/`pay`/拒绝/`unknown` 提示、stderr 修复日志 |
 | demo | 3 | 端到端 |
 
-测试基础设施：每个需要链的包在 vitest global-setup 里各起一个 Hardhat 节点（端口 8546 contracts、8547 sp、8548 payee、8549 wallet），用 Hardhat 公开开发账户（#0 部署者、#1 付款人、#2 收款人、#3 SP、#4 陌生人）。demo 用 8545 / 3001 / 4021。
+测试基础设施：每个需要链的包在 vitest global-setup 里各起一个 Hardhat 节点（8546 contracts、8547 facilitator、8548 payee、8549 wallet），`deployLocalFixture` 部署 MockUSDC + Multicall3；账户 #0 部署者、#1 付款人、#2 收款人、#3 facilitator、#4 陌生人。demo 用 8545 / 3001 / 4021。
 
-demo 的 7 个场景：正常付款；无头 402 报价；预算 $0.003 付三次拒第四次；重放已用 mandate；SP 拒绝；20 次调用一笔结算；提现延迟保护在途 mandate。
+demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示；预算拒绝；重放（payee 本地拒 + facilitator 报 nonce 已用）；facilitator 拒绝（无余额、回显篡改）；handler 失败不扣款；20 并发 = 20 笔交易、nonce 连续；延迟采样（本地约 45 ms/次）；官方 `@x402/fetch` 客户端付通；**最后**时间旅行：链时间过期释放预留、早先结算被确认。
 
-命令：`npm test`、`npm run demo`、`npm run typecheck`。
+命令：`npm test`、`npm run demo`、`npm run typecheck`、`npm run gen-abi && git diff --exit-code packages/contracts/src/abi.ts`。
 
 ## 13. 部署与运维
 
-- **本地**：`npm run deploy:local` 部署 `MockUSDC` + `AEP2DebitWallet`（`withdrawDelay` 21600，SP 默认结算窗口 10800 的两倍），写 `packages/contracts/deployments/localhost.json`（`chainId`、`network`、`wallet`、`usdc`、`withdrawDelay`、`deployer`、`txHash`、`blockNumber`、`deployedAt`）；然后 `npm run sp`、`npm run payee`、`npm run cli -- …`。
-- **Base Sepolia**：`npm run deploy:base-sepolia`，需要有测试币的 `DEPLOYER_PK`；默认 RPC `https://sepolia.base.org`，USDC 用 Circle 的 `0x036CbD53842c5426634e7929541eC2318f3dCF7e`，`WITHDRAW_DELAY` 默认 86400；写 `deployments/base-sepolia.json`。SP 还需要一个有 gas 的 `SP_PK`。
-- **约束**：`WITHDRAW_DELAY` ≥ 每个 SP 的 `SETTLE_WINDOW` + 60（SP 启动时检查；收据承诺的最后一秒是闭区间，而 `revokeAt`/`unlockAt` 是开区间，再加 SP 时钟相对链的偏差）；本地 hardhat 重启并 `deploy:local` 后要删掉 `packages/sp/data/sp-queue.jsonl`（或用 `STORE_PATH=:memory:`），否则上一条链的队列会被重放；SP 单进程单存储；收款方多实例需外部幂等存储；同一 `AGENTPAY_HOME` 只跑一个钱包进程。
+- **本地**：`npx hardhat node` → `npm run deploy:local`（MockUSDC + Multicall3，写 `localhost.json` 含 `usdcDomain`）→ `FACILITATOR_PK=… npm run facilitator` → `npm run payee` → `npm run cli -- …`。
+- **Base Sepolia**：不部署任何东西。payee 指向 `FACILITATOR_URL=https://x402.org/facilitator`（`/supported` 已确认含 `{x402Version:2, scheme:'exact', network:'eip155:84532'}`），付款 EOA 只需测试 USDC；自建 facilitator 需要有 Sepolia ETH 的 `FACILITATOR_PK` 并设置 `PAYEES`。
+- **约束**：facilitator 的 `RECEIPT_TIMEOUT_MS` < payee 的 `facilitator.timeoutMs`；payee 的 `maxTimeoutSeconds` ≤ 付款方钱包的 `maxAuthorizationValiditySeconds`（默认 60 vs 300）；同一 `AGENTPAY_HOME` 只跑一个钱包进程；AEP2 时代的 `ledger.jsonl` / 旧部署记录要归档重来。
 
-## 14. 与 FluxA 的差异（有意为之）
+## 14. 与 x402 参考实现的差异（有意为之）
 
-1. `deadline` 用 `uint64`，`usedNonces` 按 `(owner, nonce)` 而非 `(owner, token, nonce)`；签名与 FluxA 已部署合约不互通。
-2. SP 收据是 EIP-712 typed data，FluxA 是 `personal_sign` 打包字节。
-3. 安全修复：`settle` 按**全部**余额检查，FluxA 参考合约的 `requestWithdraw` 立即扣减，付款人可先被服务再申请全额提现饿死结算。
-4. 安全修复：SP 由每个付款人 `authorizeSP` 授权，而非部署者的全局 `setSP`；撤销（`revokeSP`）在 `withdrawDelay` 后生效，撤销前 SP 已签收的 mandate 不会被付款人自己的撤销或提现作废（另一个已授权 SP 仍可，见 §15）；合约没有 admin。
-5. 没有 ZK 批量证明：`settleBatch` 逐张链上验签；批量只摊薄交易开销。
+1. **客户端前面有预算**：官方客户端叫签就签；`MandateWallet` 只在已批准的 intent mandate 内签，签前预留，记账并对账。官方 spend controls 关闭，由策略闸替代。
+2. **钱包钉住 token 域**，不信报价里的 `extra.name/version`。
+3. **收款方在途守卫**：参考中间件在首次结算未完成时会把同一授权服务两次（同路由或同条款的另一路由）；`createPaywall` 在 verify 前 claim `from:nonce`。
+4. **facilitator 加固**：白名单、Bearer、EOA 离线验签、RPC 故障答 503 而不是 `invalid_exact_evm_signature`、发送锁。
+5. **只做 V2、`exact`、EIP-3009**。
 
 ## 15. 已知限制
 
-- MVP，未审计；`MockUSDC` 可随意 mint；合约无手续费、无升级、无暂停。
-- 一个付款人授权多个 SP 时，每个 SP 各自按同一个 `debitableBalance` 预留，合计接纳额可能超出余额，后结算的一方会 `InsufficientBalance`；一次只授权一个 SP。同一机制也让付款人能故意作废已签收的 mandate：`authorizeSP` 接受任何地址（包括付款人自己），链上 nonce 的消耗和余额都不与 SP 签收的那张 mandate 绑定，所以付款人拿到数据后可在下一块通过自己控制的 SP 结算一张同 nonce 的 1 单位 mandate（`NonceUsed`）或一张付给自己的全额 mandate（`InsufficientBalance`）。延迟撤销和延迟提现只防付款人自己的 `revokeSP` / `requestWithdraw`；收据最终靠付款人只授权了签收它的那个 SP，而合约既不能枚举授权也不强制这一点。
-- SP 单进程 + JSONL；队列文件只追加、不压缩，随历史线性增长，需要在 SP 停止时手动轮转；收款方幂等存储在内存；跨收款方重启的重放只在 60s 宽限期外被 SP 的 `created:false` 抓住。
-- 钱包预算文件单写者，两个进程共用一个 `AGENTPAY_HOME` 会互相覆盖计数。
-- 没有 KYC/KYB/KYA、争议处理、支付链接、卡、市场、UI。
-- 信任模型如第 10 节：SP 失约无链上强制；收款方交付无追索。
-- 钱包对账不自动运行，需要显式 `reconcile`。
+- **托管风险变了**：USDC 在 EOA，私钥即全部余额；预算卡只约束 agent。建议小额浮动 + 冷钱包补充。
+- handler 跑完但 settle 失败 → 客户端 402、工作已做完（`authorization` 流固有）；settle 成功后 handler 5xx → 付了没拿到货，无追索。
+- 被拒/丢失的调用把预算占到授权过期（`maxTimeoutSeconds`，钱包封顶 300 s）；收款方在此窗口内仍能结算它。
+- facilitator 广播后超时 → `settlement_pending`，付款方多半被扣、收款方已回 402；账本靠 `reconcile` 纠正；pending 去重只在 facilitator 进程内。
+- 自建 facilitator 在真实网络上没有卡住交易的替换逻辑（nonce manager 会排队；重启重同步）。
+- 多进程共用一个 `AGENTPAY_HOME` 的预算竞争未改；链上支付图公开；USDC 可被发行方冻结；MockUSDC 开放 mint。
+- 没有 KYC、争议、支付链接、UI。
 
 ## 16. 与 Kairos 的集成现状
 
-- agentpay 仓库：`https://github.com/linqizhe07/agentpay`（私有，`main` 常绿，改动走 PR）。
-- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：PR #1（`feat/payment` → `develop`）把 agentpay 作为子模块 `payment/` 钉在 `d86070f`，并加入 `docs/design/kairos-intro.html`（四处钱包界面的静态样例）与 `CLAUDE.md` 两行索引。
+- agentpay 仓库：`https://github.com/linqizhe07/agentpay`（`main` 常绿，改动走 PR）；本次迁移在分支 `x402`，AEP2 最后一版是 tag `aep2-final`。
+- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：子模块 `payment/` 仍钉在 AEP2 版本；合并 `x402` 后需要升级子模块指针，并按 §13 的约束配置（付款 EOA 放 USDC、payee 指向 facilitator）。
 - Kairos 是付款方。agent 的接入面是 `agentpay` CLI + `SKILL.md`；`face/` 与 `dsh/` 尚未调用它。
-- 分支约定：Kairos `main` 成品、`develop` 集成、每人从 develop 切分支；agentpay 只有 `main`，Kairos 的子模块指针即版本号。
 
 ## 17. 建议的后续工作
 
-1. 在 Kairos 里真正接入：给 face 加一个持钥后端或 MCP server 包装 CLI，人批预算的卡片复用现有 `orders.ts` 审批模式。
-2. Base Sepolia 部署并跑一遍 demo 场景，记录真实 gas 与结算延迟。
-3. SP：加请求体大小限制与基本鉴权/限流；把 JSONL 换成可并发的存储；暴露指标。
-4. 钱包：预算文件加锁或改为单进程守护；对账定时执行。
-5. 合约：外部审计；考虑手续费与多 SP 场景的事件索引需求。
+1. Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率；再用自建 facilitator 跑一遍，证明两种 facilitator 吃同一份 `PAYMENT-SIGNATURE`。
+2. 在 Kairos 里真正接入：MCP server 包装 CLI，人批预算的卡片复用现有审批模式；付款 EOA 的浮动资金策略。
+3. 钱包：预算文件加锁或改为单进程守护；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
+4. facilitator：限流；Base 上卡住交易的替换；指标。
+5. 若单价降到亚分级、频率高到每笔一块等不起：x402 也有 `batch-settlement` scheme 槽位，`aep2-final` 的代码可作为其 network binding 复活。
 
 ## 附录 A：文件索引
 
 | 路径 | 内容 |
 |---|---|
-| `packages/core/src/{types,mandate,sp-receipt,headers,errors,hints,money,caip,ids}.ts` | 协议底座 |
-| `packages/contracts/contracts/AEP2DebitWallet.sol` | 合约 |
-| `packages/contracts/src/{abi,deploy,deployments}.ts` | 生成的 ABI、部署工具、部署记录 |
-| `packages/sp/src/{server,validate,queue,store,worker,chain,receipt,config,index,main}.ts` | SP |
-| `packages/payee/src/{paywall,sp-client,offer,store,chain}.ts`，`examples/express.ts` | 收款方 |
-| `packages/wallet/src/{wallet,policy,mandate-store,ledger,hosts}.ts` | 钱包 |
+| `packages/core/src/{types,errors,hints,money,caip,ids,eip3009}.ts` | 底座：类型再导出、错误码与提示、金额、CAIP、EIP-3009 ABI 切片 |
+| `packages/contracts/contracts/MockUSDC.sol`，`src/{deploy,deployments,multicall3,abi}.ts`，`deployments/base-sepolia.json` | 测试 token、本地夹具、部署记录 |
+| `packages/facilitator/src/{facilitator,server,chain,config,index,main}.ts` | facilitator |
+| `packages/payee/src/{paywall,store,types}.ts`，`examples/express.ts` | 收款方 |
+| `packages/wallet/src/{wallet,policy,mandate-store,ledger,durable,hosts}.ts` | 钱包 |
 | `packages/cli/src/{cli,config,amounts,output,context}.ts`，`commands/*`，`SKILL.md` | CLI |
-| `demo/src/run-demo.ts` | 端到端演示 |
+| `demo/src/{run-demo,facilitator,payee,chain,accounts,util}.ts` | 端到端演示 |
 | `README.md`、`.env.example` | 用法与配置 |
 
 ## 附录 B：术语
 
 | 术语 | 含义 |
 |---|---|
-| AEP2 | FluxA 的 Agent Embedded Payment Protocol：先授权后结算 |
-| x402 | Coinbase 的 HTTP 402 支付协议；本项目复用其 V2 信封形状 |
-| mandate | 一次性、EIP-712 签名的付款授权 |
+| x402 | Coinbase 的 HTTP 402 支付协议；本项目用 V2、`exact` scheme |
+| exact / EIP-3009 | 付款人签 `TransferWithAuthorization`，任何人可替他广播，转账精确等于 `amount` |
+| facilitator | 验证授权并广播结算、付 gas 的服务；可自建或用托管的 |
+| authorization | 一次性、EIP-712 签名的转账授权；`(from, nonce)` 链上只能用一次 |
 | intent mandate | 用户批准的链下预算 |
-| SP | Settlement Processor，结算处理器 |
-| 收据 | SP 签名的结算承诺（`enqueueDeadline`） |
-| debitable | `balance − 待提现`，SP 接纳新 mandate 的依据 |
-| settleBatch | 一笔交易结算多张 mandate，单张失败跳过 |
+| validBefore | 授权过期的 unix 秒；等于 `now + maxTimeoutSeconds` |
+| settled / rejected / unknown / expired-unused | 钱包账本四态：已结算 / 被拒（预留保持）/ 不知是否被扣 / 链时间过期未用 |
+| Multicall3 | facilitator 用来诊断模拟失败原因的合约；本地用 `hardhat_setCode` 放入 |

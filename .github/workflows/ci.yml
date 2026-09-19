@@ -1,5 +1,5 @@
 # One job, same commands a developer runs locally: type-check every workspace,
-# run every workspace's tests (contract / SP / payee / wallet suites and the
+# run every workspace's tests (contract / facilitator / payee / wallet suites and the
 # demo e2e each spawn their own hardhat node), then regenerate the ABI and fail
 # if the committed packages/contracts/src/abi.ts differs from the compiled
 # artifacts — a .sol change without `npm run gen-abi` goes red here.
