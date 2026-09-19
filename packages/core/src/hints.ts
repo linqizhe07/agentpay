@@ -1,5 +1,5 @@
-import type { PayeeReason, PolicyReason, SpErrorCode } from './errors.js';
-import { AEP2_SCHEME, type PaymentModelContext } from './types.js';
+import type { PayeeReason, PolicyReason } from './errors.js';
+import type { PaymentModelContext } from './types.js';
 
 export const POLICY_REASONS = [
   'mandate_required',
@@ -11,43 +11,36 @@ export const POLICY_REASONS = [
   'host_not_allowed',
   'per_call_max',
   'rate_limited',
-  'sp_not_trusted',
   'unsupported_offer',
+  'timeout_too_long',
 ] as const satisfies readonly PolicyReason[];
 
 export const PAYEE_REASONS = [
-  'invalid_payment',
-  'offer_mismatch',
-  'invalid_payee',
-  'invalid_token',
-  'invalid_amount',
-  'mandate_expired',
-  'mandate_deadline_too_short',
-  'invalid_ref',
-  'invalid_signature',
+  'payment_required',
   'replay',
-  'insufficient_balance',
-  'nonce_used',
-  'chain_unavailable',
-  'settlement_unavailable',
-  'invalid_sp_receipt',
+  'settlement_failed',
+  'invalid_exact_evm_scheme',
+  'invalid_exact_evm_network_mismatch',
+  'invalid_exact_evm_missing_eip712_domain',
+  'invalid_exact_evm_recipient_mismatch',
+  'invalid_exact_evm_signature',
+  'invalid_exact_evm_payload_authorization_valid_before',
+  'invalid_exact_evm_payload_authorization_valid_after',
+  'invalid_exact_evm_payload_authorization_value_mismatch',
+  'invalid_exact_evm_insufficient_balance',
+  'invalid_exact_evm_nonce_already_used',
+  'invalid_exact_evm_transaction_simulation_failed',
+  'invalid_exact_evm_transaction_failed',
+  'invalid_exact_evm_eip3009_not_supported',
+  'invalid_exact_evm_token_name_mismatch',
+  'invalid_exact_evm_token_version_mismatch',
+  'asset_not_deployed_contract',
+  'unexpected_verify_error',
+  'unexpected_settle_error',
 ] as const satisfies readonly PayeeReason[];
 
-export const SP_ERROR_CODES = [
-  'invalid_body',
-  'unsupported_chain',
-  'unsupported_token',
-  'bad_params',
-  'deadline_too_soon',
-  'deadline_too_far',
-  'invalid_signature',
-  'mandate_terminal',
-  'nonce_used',
-  'sp_not_authorized',
-  'sp_revocation_pending',
-  'rpc_error',
-  'insufficient_balance',
-] as const satisfies readonly SpErrorCode[];
+/** Wallet-side outcomes that are not refusals but still need guidance. */
+export const OUTCOME_REASONS = ['unknown', 'settlement_unavailable'] as const;
 
 interface Hint {
   summary: string;
@@ -59,6 +52,9 @@ const fmt = (detail: Record<string, unknown> | undefined, key: string, fallback 
   const v = detail?.[key];
   return v === undefined || v === null ? fallback : String(v);
 };
+
+const RETRY_FRESH = 'Just call `agentpay pay` again: every attempt signs a fresh, single-use authorization.';
+const PAYEE_MISCONFIGURED = 'Do not retry: the service is misconfigured. Report the reason to the user.';
 
 const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
   // ---- payer-side policy ----
@@ -90,7 +86,7 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
   }),
   mandate_expired: (d) => ({
     summary: `Mandate ${fmt(d, 'mandateId', '')} is outside its validity window.`.replace('  ', ' '),
-    remediation: ['Request a fresh intent mandate (or, for a one-time mandate, sign a new one with a later deadline).'],
+    remediation: ['Request a fresh intent mandate.'],
     commands: ['agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>'],
   }),
   mandate_disabled: (d) => ({
@@ -111,122 +107,117 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
     summary: `Too many payment attempts in the last minute (limit ${fmt(d, 'maxCallsPerMinute')}).`,
     remediation: ['Wait a minute before retrying, or batch the work into fewer paid calls.'],
   }),
-  sp_not_trusted: (d) => ({
-    summary: `The offer names settlement processor ${fmt(d, 'spAddress')}, which this wallet does not trust.`,
-    remediation: ['Ask the user to add the SP to the trusted list (AGENTPAY_SP) or use another service.'],
-  }),
   unsupported_offer: () => ({
-    summary: 'The 402 offer has no aep2 option for this wallet\'s network, token and debit-wallet contract.',
+    summary: "The 402 offer has no x402 `exact` option for this wallet's network and USDC (or names a different token domain).",
     remediation: ['This service cannot be paid with this wallet; report the offer to the user.'],
   }),
+  timeout_too_long: (d) => ({
+    summary: `The offer wants an authorization valid for ${fmt(d, 'maxTimeoutSeconds')}s, above this wallet's cap of ${fmt(d, 'cap')}s.`,
+    remediation: [
+      'Do not retry: a long-lived authorization would tie up budget for that long if the call fails.',
+      'Ask the user to raise maxAuthorizationValiditySeconds only if they trust this service.',
+    ],
+  }),
 
-  // ---- payee-side ----
-  invalid_payment: () => ({
-    summary: 'The payment header could not be decoded.',
-    remediation: ['Re-send with a base64 JSON PAYMENT-SIGNATURE header produced by the wallet SDK.'],
-  }),
-  offer_mismatch: () => ({
-    summary: 'The echoed offer does not match what this resource currently charges.',
-    remediation: ['Fetch a fresh 402 offer and sign a mandate against it (prices or terms changed).'],
-  }),
-  invalid_payee: () => ({
-    summary: 'mandate.payee is not this resource\'s payTo address.',
-    remediation: ['Sign the mandate with payee = offer.payTo.'],
-  }),
-  invalid_token: () => ({
-    summary: 'mandate.token is not the asset this resource accepts.',
-    remediation: ['Sign the mandate with token = offer.asset.'],
-  }),
-  invalid_amount: () => ({
-    summary: 'mandate.amount is below the price.',
-    remediation: ['Sign the mandate with amount >= offer.amount.'],
-  }),
-  mandate_deadline_too_short: (d) => ({
-    summary: `mandate.deadline must be at least ${fmt(d, 'settleWindowSeconds')}s in the future so the settlement processor can settle.`,
-    remediation: ['Sign with deadline = now + settleWindowSeconds + request timeout.'],
-  }),
-  invalid_ref: () => ({
-    summary: 'mandate.ref does not commit to this resource (and quote id, if any).',
-    remediation: ['Set ref = keccak256("METHOD /path") or keccak256("METHOD /path#quoteId") from the offer.'],
-  }),
-  invalid_signature: () => ({
-    summary: 'The mandate signature does not recover to mandate.owner.',
-    remediation: ['Sign the exact mandate fields with the owner key under the AEP2DebitWallet EIP-712 domain.'],
+  // ---- payee / facilitator ----
+  payment_required: () => ({
+    summary: 'The resource is paid; no payment was attached.',
+    remediation: ['Pay it with `agentpay pay <url>` (the wallet answers the 402 automatically).'],
+    commands: ['agentpay offer <url>', 'agentpay pay <url>'],
   }),
   replay: () => ({
-    summary: 'This exact mandate was already presented; a mandate pays for one delivery.',
-    remediation: ['Sign a new mandate (new nonce) for another call.'],
+    summary: 'This exact authorization was already presented; an authorization pays for one delivery.',
+    remediation: [RETRY_FRESH],
   }),
-  insufficient_balance: (d) => ({
-    summary: `Debitable balance ${fmt(d, 'debitable')} is below the amount ${fmt(d, 'amount')} plus pending settlements.`,
-    remediation: ['Deposit more USDC into the debit wallet (`agentpay deposit <usd>`) or cancel a pending withdrawal.'],
-    commands: ['agentpay balance', 'agentpay deposit <usd>'],
+  settlement_failed: (d) => ({
+    summary: `The payee served the call but the on-chain settlement failed: ${fmt(d, 'reason', 'unknown')}.`,
+    remediation: ['Nothing was charged.', RETRY_FRESH],
   }),
-  nonce_used: () => ({
-    summary: 'This mandate nonce was already settled or enqueued.',
-    remediation: ['Sign a new mandate with a fresh nonce.'],
+  invalid_exact_evm_scheme: () => ({ summary: 'The payment does not use the `exact` scheme.', remediation: [RETRY_FRESH] }),
+  invalid_exact_evm_network_mismatch: () => ({
+    summary: "The authorization's network does not match the offer's.",
+    remediation: ['Check the wallet is configured for the network the service charges on (AGENTPAY_NETWORK).'],
   }),
-  chain_unavailable: () => ({
-    summary: 'The payee could not reach the chain to pre-check the mandate.',
-    remediation: ['Retry shortly; the signed mandate is still valid until its deadline.'],
+  invalid_exact_evm_missing_eip712_domain: () => ({
+    summary: 'The offer does not carry the token EIP-712 domain (extra.name/version).',
+    remediation: [PAYEE_MISCONFIGURED],
   }),
-  settlement_unavailable: (d) => ({
-    summary: `The settlement processor refused or was unreachable: ${fmt(d, 'spReason', 'unknown')}.`,
-    remediation: [
-      'If the reason is insufficient_balance, sp_not_authorized or sp_revocation_pending, fix the wallet state (deposit, or `agentpay sp-authorize <sp>`).',
-      'Otherwise retry shortly with a new mandate.',
-    ],
-    commands: ['agentpay balance', 'agentpay sp-authorize <sp>'],
+  invalid_exact_evm_recipient_mismatch: () => ({
+    summary: 'authorization.to is not the offer payTo address.',
+    remediation: [RETRY_FRESH],
   }),
-  invalid_sp_receipt: () => ({
-    summary: 'The settlement processor returned a receipt that does not verify.',
-    remediation: ['Retry; if it persists the service is misconfigured. Nothing has been settled.'],
+  invalid_exact_evm_signature: () => ({
+    summary: 'The authorization signature does not recover to the payer.',
+    remediation: ['Check AGENTPAY_KEY belongs to the payer address and the token domain in the deployment record is right.'],
+    commands: ['agentpay address'],
+  }),
+  invalid_exact_evm_payload_authorization_valid_before: () => ({
+    summary: 'The authorization expired before it could be settled.',
+    remediation: [RETRY_FRESH, 'If it keeps happening the service settles too slowly for its own maxTimeoutSeconds.'],
+  }),
+  invalid_exact_evm_payload_authorization_valid_after: () => ({
+    summary: 'The authorization is not valid yet (clock skew).',
+    remediation: ['Check the machine clock, then retry.'],
+  }),
+  invalid_exact_evm_payload_authorization_value_mismatch: () => ({
+    summary: 'authorization.value differs from the offer amount.',
+    remediation: ['Fetch a fresh 402 (the price changed) and pay again.'],
+    commands: ['agentpay offer <url>', 'agentpay pay <url>'],
+  }),
+  invalid_exact_evm_insufficient_balance: () => ({
+    summary: "The payer's USDC balance does not cover the price.",
+    remediation: ['Ask the user to send USDC to the wallet address (`agentpay address`); no ETH is needed.'],
+    commands: ['agentpay address', 'agentpay balance'],
+  }),
+  invalid_exact_evm_nonce_already_used: () => ({
+    summary: 'This authorization was already settled on chain.',
+    remediation: ['If you did not get the response, run `agentpay reconcile` to record the payment, then pay again.'],
+    commands: ['agentpay reconcile', 'agentpay pay <url>'],
+  }),
+  invalid_exact_evm_transaction_simulation_failed: () => ({
+    summary: 'The facilitator could not simulate the transfer (and could not tell why).',
+    remediation: [RETRY_FRESH, 'If it persists, check the balance with `agentpay balance`.'],
+    commands: ['agentpay balance'],
+  }),
+  invalid_exact_evm_transaction_failed: () => ({
+    summary: 'The settlement transaction reverted on chain.',
+    remediation: ['Nothing was charged.', RETRY_FRESH],
+  }),
+  invalid_exact_evm_eip3009_not_supported: () => ({
+    summary: 'The offered asset does not implement EIP-3009.',
+    remediation: [PAYEE_MISCONFIGURED],
+  }),
+  invalid_exact_evm_token_name_mismatch: () => ({
+    summary: "The offer's token domain name does not match the token contract.",
+    remediation: [PAYEE_MISCONFIGURED],
+  }),
+  invalid_exact_evm_token_version_mismatch: () => ({
+    summary: "The offer's token domain version does not match the token contract.",
+    remediation: [PAYEE_MISCONFIGURED],
+  }),
+  asset_not_deployed_contract: () => ({
+    summary: 'The offered asset address has no code on this network.',
+    remediation: [PAYEE_MISCONFIGURED],
+  }),
+  unexpected_verify_error: () => ({
+    summary: 'The facilitator hit an internal error while verifying.',
+    remediation: ['Retry shortly.'],
+  }),
+  unexpected_settle_error: () => ({
+    summary: 'The facilitator hit an internal error while settling.',
+    remediation: ['Run `agentpay reconcile` first: the transfer may still have landed. Then retry.'],
+    commands: ['agentpay reconcile'],
   }),
 
-  // ---- settlement processor ----
-  invalid_body: () => ({
-    summary: 'POST /enqueue body is not {mandate, payerSig}.',
-    remediation: ['Send JSON {mandate:{owner,token,payee,amount,nonce,deadline,ref}, payerSig}.'],
+  // ---- wallet-side outcomes ----
+  unknown: () => ({
+    summary: 'The payee answered without a usable PAYMENT-RESPONSE, so the wallet cannot tell whether it was charged.',
+    remediation: ['Run `agentpay reconcile` before paying again, or the same call may be paid twice.'],
+    commands: ['agentpay reconcile'],
   }),
-  unsupported_chain: () => ({
-    summary: 'The settlement processor serves a different chain.',
-    remediation: ['Use the SP advertised in the 402 offer for this network.'],
-  }),
-  unsupported_token: () => ({
-    summary: 'The settlement processor does not settle this token.',
-    remediation: ['Check GET /supported on the SP and pay with a listed token.'],
-  }),
-  bad_params: () => ({
-    summary: 'The mandate has a zero amount or zero payee.',
-    remediation: ['Sign a mandate with amount > 0 and a real payee address.'],
-  }),
-  deadline_too_soon: (d) => ({
-    summary: `mandate.deadline leaves less than ${fmt(d, 'minDeadlineMarginSeconds')}s for settlement.`,
-    remediation: ['Sign with a later deadline (now + settleWindowSeconds + margin).'],
-  }),
-  deadline_too_far: (d) => ({
-    summary: `mandate.deadline is more than ${fmt(d, 'maxDeadlineHorizonSeconds')}s away.`,
-    remediation: ['Sign with a shorter validity; long-lived mandates are refused to bound the queue.'],
-  }),
-  mandate_terminal: (d) => ({
-    summary: `This mandate already reached a terminal state: ${fmt(d, 'previous')}.`,
-    remediation: ['Sign a new mandate; the old one cannot be re-enqueued.'],
-  }),
-  sp_not_authorized: (d) => ({
-    summary: `The payer has not authorized settlement processor ${fmt(d, 'sp')} on the debit wallet.`,
-    remediation: ['Authorize it once from the payer account: `agentpay sp-authorize <sp>`.'],
-    commands: ['agentpay sp-authorize <sp>'],
-  }),
-  sp_revocation_pending: (d) => ({
-    summary: `The payer is revoking settlement processor ${fmt(d, 'sp')} at ${fmt(d, 'revokeAt')} (unix seconds), before this mandate could be settled (${fmt(d, 'enqueueDeadline')}).`,
-    remediation: [
-      'Do not retry: the processor refuses new mandates until the payer re-authorizes it (`agentpay sp-authorize <sp>`, which also cancels the revocation).',
-    ],
-    commands: ['agentpay sp-authorize <sp>'],
-  }),
-  rpc_error: () => ({
-    summary: 'The settlement processor could not reach the chain.',
-    remediation: ['Retry shortly.'],
+  settlement_unavailable: () => ({
+    summary: 'The payee could not reach its facilitator.',
+    remediation: ['Retry shortly; nothing was charged.'],
   }),
 };
 
@@ -236,7 +227,7 @@ export const HINT_REASONS = Object.keys(HINTS);
 export function paymentModelContext(reason: string, detail?: Record<string, unknown>): PaymentModelContext {
   const hint = HINTS[reason]?.(detail) ?? {
     summary: `Payment refused: ${reason}.`,
-    remediation: ['Read the error detail, fix the cause, and retry with a fresh mandate if appropriate.'],
+    remediation: ['Read the error detail, fix the cause, and retry with a fresh authorization if appropriate.'],
   };
-  return { protocol: AEP2_SCHEME, reason, ...hint };
+  return { protocol: 'x402', reason, ...hint };
 }
