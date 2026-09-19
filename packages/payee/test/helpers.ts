@@ -1,31 +1,17 @@
 import type { Server } from 'node:http';
 import type { Express } from 'express';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
-import {
-  HEADER,
-  decodeHeader,
-  encodeHeader,
-  mandateDigest,
-  randomNonce,
-  resourceRef,
-  signMandate,
-  type Hex,
-  type Mandate,
-  type MandateDomain,
-  type MandatePayload,
-  type PaymentPayload,
-  type PaymentRequiredBody,
-  type PaymentRequirements,
-  type SettlementInfo,
-} from '@agentpay/core';
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from '@x402/core/http';
+import type { PaymentPayload, PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
+import { randomBytes32, type Hex } from '@agentpay/core';
 
 // Hardhat's famous PUBLIC dev-mnemonic accounts ("test test ... junk") — never
-// real funds. 0=deployer, 1=payer agent, 2=payee, 3=settlement processor, 4=stranger.
+// real funds. 0=deployer, 1=payer agent, 2=payee, 3=facilitator, 4=stranger.
 export const KEYS = {
   deployer: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
   payer: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
   payee: '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a',
-  sp: '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6',
+  facilitator: '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6',
   stranger: '0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a',
 } as const;
 
@@ -33,7 +19,7 @@ export const accounts = {
   deployer: privateKeyToAccount(KEYS.deployer),
   payer: privateKeyToAccount(KEYS.payer),
   payee: privateKeyToAccount(KEYS.payee),
-  sp: privateKeyToAccount(KEYS.sp),
+  facilitator: privateKeyToAccount(KEYS.facilitator),
   stranger: privateKeyToAccount(KEYS.stranger),
 };
 
@@ -59,82 +45,97 @@ export async function closeServer(server: Server | undefined): Promise<void> {
   });
 }
 
-/** Fetches the bare 402 and returns its (first) offer from the PAYMENT-REQUIRED header. */
-export async function getOffer(base: string, path: string, method = 'GET'): Promise<PaymentRequirements> {
-  const res = await fetch(`${base}${path}`, { method });
-  await res.arrayBuffer();
-  if (res.status !== 402) throw new Error(`expected a 402 offer for ${method} ${path}, got ${res.status}`);
-  const header = res.headers.get(HEADER.required);
-  if (!header) throw new Error('402 without PAYMENT-REQUIRED header');
-  return decodeHeader<PaymentRequiredBody>(header).accepts[0];
+/** GET the resource without paying and decode the PAYMENT-REQUIRED header. */
+export async function getOffer(url: string, init: RequestInit = {}): Promise<{ res: Response; required: PaymentRequired; body: any }> {
+  const res = await fetch(url, init);
+  const header = res.headers.get('PAYMENT-REQUIRED');
+  if (!header) throw new Error(`no PAYMENT-REQUIRED header (status ${res.status})`);
+  const text = await res.text();
+  return { res, required: decodePaymentRequiredHeader(header), body: text ? JSON.parse(text) : undefined };
 }
 
-export interface Signed {
-  mandate: Mandate;
-  payerSig: Hex;
-  digest: Hex;
-  payload: MandatePayload;
+export interface Authorization {
+  from: Hex;
+  to: Hex;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: Hex;
 }
 
-/**
- * Signs a mandate for `offer` with hardhat key #1 (payer) unless another signer
- * is given. `overrides` are applied after the defaults (so owner can differ from
- * the signer to produce an invalid signature).
- */
+/** Signs an EIP-3009 authorization for `req` the way the official client does, with `over` applied first. */
 export async function signFor(
-  domain: MandateDomain,
-  offer: PaymentRequirements,
-  overrides: Partial<Mandate> = {},
+  req: PaymentRequirements,
+  over: Partial<Authorization> = {},
   signer: PrivateKeyAccount = accounts.payer,
-): Promise<Signed> {
-  const mandate: Mandate = {
-    owner: signer.address,
-    token: offer.asset,
-    payee: offer.payTo,
-    amount: offer.amount,
-    nonce: randomNonce(),
-    deadline: nowSec() + offer.extra.settleWindowSeconds + 600,
-    ref: resourceRef(offer.resource, offer.extra.quoteId),
-    ...overrides,
+): Promise<{ authorization: Authorization; signature: Hex }> {
+  const authorization: Authorization = {
+    from: signer.address,
+    to: req.payTo as Hex,
+    value: req.amount,
+    validAfter: '0',
+    validBefore: String(nowSec() + req.maxTimeoutSeconds),
+    nonce: randomBytes32(),
+    ...over,
   };
-  const payerSig = await signMandate(signer, domain, mandate);
-  return { mandate, payerSig, digest: mandateDigest(domain, mandate), payload: { mandate, payerSig } };
-}
-
-/** x402 V2 envelope for PAYMENT-SIGNATURE: echoes the offer the payer accepted. */
-export function x402Header(offer: PaymentRequirements, payload: MandatePayload): string {
-  const envelope: PaymentPayload = { x402Version: 2, accepted: offer, payload };
-  return encodeHeader(envelope);
-}
-
-/** FluxA-style bare {mandate, payerSig} for X-Payment-Mandate. */
-export function legacyHeader(payload: MandatePayload): string {
-  return encodeHeader(payload);
-}
-
-export interface CallInit {
-  method?: string;
-  /** Value for PAYMENT-SIGNATURE (or X-Payment-Mandate when `legacy`). */
-  header?: string;
-  legacy?: boolean;
-  /** JSON body. */
-  body?: unknown;
-  extraHeaders?: Record<string, string>;
-}
-
-export async function call(base: string, path: string, init: CallInit = {}): Promise<Response> {
-  const headers: Record<string, string> = { ...(init.extraHeaders ?? {}) };
-  if (init.header !== undefined) headers[init.legacy ? HEADER.legacyMandate : HEADER.signature] = init.header;
-  if (init.body !== undefined) headers['content-type'] = 'application/json';
-  return fetch(`${base}${path}`, {
-    method: init.method ?? 'GET',
-    headers,
-    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  const signature = await signer.signTypedData({
+    domain: {
+      name: String(req.extra.name),
+      version: String(req.extra.version),
+      chainId: Number(req.network.split(':')[1]),
+      verifyingContract: req.asset as Hex,
+    },
+    types: {
+      TransferWithAuthorization: [
+        { name: 'from', type: 'address' },
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'validAfter', type: 'uint256' },
+        { name: 'validBefore', type: 'uint256' },
+        { name: 'nonce', type: 'bytes32' },
+      ],
+    },
+    primaryType: 'TransferWithAuthorization',
+    message: {
+      from: authorization.from,
+      to: authorization.to,
+      value: BigInt(authorization.value),
+      validAfter: BigInt(authorization.validAfter),
+      validBefore: BigInt(authorization.validBefore),
+      nonce: authorization.nonce,
+    },
   });
+  return { authorization, signature };
 }
 
-export function readSettlement(res: Response): SettlementInfo {
-  const header = res.headers.get(HEADER.response);
-  if (!header) throw new Error('response carries no PAYMENT-RESPONSE header');
-  return decodeHeader<SettlementInfo>(header);
+/** A complete PAYMENT-SIGNATURE payload for the first accept of `required`. */
+export async function paymentFor(
+  required: PaymentRequired,
+  over: Partial<Authorization> = {},
+  signer: PrivateKeyAccount = accounts.payer,
+  acceptedOverride?: Partial<PaymentRequirements>,
+): Promise<PaymentPayload> {
+  const accepted = { ...required.accepts[0]!, ...(acceptedOverride ?? {}) };
+  const { authorization, signature } = await signFor(required.accepts[0]!, over, signer);
+  return { x402Version: 2, resource: required.resource, accepted, payload: { signature, authorization } };
+}
+
+export function paymentHeaders(payload: PaymentPayload): Record<string, string> {
+  return { 'PAYMENT-SIGNATURE': encodePaymentSignatureHeader(payload) };
+}
+
+/** Calls the resource with a payment attached. */
+export async function pay(url: string, payload: PaymentPayload, init: RequestInit = {}): Promise<Response> {
+  return fetch(url, { ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...paymentHeaders(payload) } });
+}
+
+export function readSettlement(res: Response): SettleResponse | undefined {
+  const header = res.headers.get('PAYMENT-RESPONSE');
+  return header ? decodePaymentResponseHeader(header) : undefined;
+}
+
+/** The `error` a 402 carries in its PAYMENT-REQUIRED header. */
+export function refusalReason(res: Response): string | undefined {
+  const header = res.headers.get('PAYMENT-REQUIRED');
+  return header ? decodePaymentRequiredHeader(header).error : undefined;
 }
