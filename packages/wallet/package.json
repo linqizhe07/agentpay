@@ -12,6 +12,12 @@
   "dependencies": {
     "@agentpay/contracts": "*",
     "@agentpay/core": "*",
+    "@x402/core": "~2.26.0",
+    "@x402/evm": "~2.26.0",
     "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@agentpay/facilitator": "*",
+    "@agentpay/payee": "*"
   }
 }

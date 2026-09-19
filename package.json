@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Authorize-first, settle-later payments for AI agents: an AEP2-style debit wallet, settlement processor, payee middleware, agent wallet SDK and CLI.",
+  "description": "x402 payments for AI agents: a budgeted agent wallet (intent mandates, policy gate, durable ledger), payee middleware, a self-hostable facilitator and a CLI, built on the official @x402/* packages.",
   "workspaces": [
     "packages/core",
     "packages/contracts",
-    "packages/sp",
+    "packages/facilitator",
     "packages/payee",
     "packages/wallet",
     "packages/cli",
@@ -18,11 +18,10 @@
     "test": "npm run test --workspaces --if-present",
     "gen-abi": "npm run gen:abi --workspace @agentpay/contracts",
     "demo": "npm run gen-abi && npm run demo --workspace @agentpay/demo",
-    "sp": "npm run start --workspace @agentpay/sp",
+    "facilitator": "npm run start --workspace @agentpay/facilitator",
     "payee": "npm run start --workspace @agentpay/payee",
     "cli": "tsx packages/cli/src/cli.ts",
-    "deploy:local": "npm run deploy:local --workspace @agentpay/contracts",
-    "deploy:base-sepolia": "npm run deploy:base-sepolia --workspace @agentpay/contracts"
+    "deploy:local": "npm run deploy:local --workspace @agentpay/contracts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

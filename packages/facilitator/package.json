@@ -1,5 +1,5 @@
 {
-  "name": "@agentpay/sp",
+  "name": "@agentpay/facilitator",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -13,6 +13,8 @@
   "dependencies": {
     "@agentpay/contracts": "*",
     "@agentpay/core": "*",
+    "@x402/core": "~2.26.0",
+    "@x402/evm": "~2.26.0",
     "viem": "^2.21.0"
   }
 }
