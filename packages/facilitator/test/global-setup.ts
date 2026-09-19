@@ -1,21 +1,20 @@
 // vitest globalSetup: spawns a dedicated hardhat node on port 8547 (cwd =
-// contracts/, so its hardhat.config.cjs applies), deploys MockUSDC +
-// AEP2DebitWallet(withdrawDelay 900) from the committed bytecode, mints test
-// USDC to the payer and stranger accounts and provides the addresses to the
-// test workers. A node already answering on the port is reused and left alone.
+// contracts/, so its hardhat.config.cjs applies), deploys MockUSDC + Multicall3
+// from the committed bytecode, mints test USDC to the payer and stranger
+// accounts and provides the addresses to the test workers. A node already
+// answering on the port is reused and left alone.
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { GlobalSetupContext } from 'vitest/node';
-import { createPublicClient, createWalletClient, http, parseUnits } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, http, parseUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
-import { MOCK_USDC_ABI, deployAll } from '@agentpay/contracts';
+import { MOCK_USDC_ABI, deployLocalFixture } from '@agentpay/contracts';
 
 const RPC_PORT = 8547;
 const RPC_URL = `http://127.0.0.1:${RPC_PORT}`;
 const CONTRACTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'contracts');
-const WITHDRAW_DELAY = 900; // SETTLE_WINDOW (600) + more than the startup margin
 
 // Hardhat's PUBLIC dev-mnemonic accounts — never real funds.
 const DEPLOYER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
@@ -61,7 +60,7 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     }
     if (!ready) {
       kill();
-      throw new Error(`sp tests: hardhat node did not become ready on :${RPC_PORT}`);
+      throw new Error(`facilitator tests: hardhat node did not become ready on :${RPC_PORT}`);
     }
   }
 
@@ -70,7 +69,8 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     const transport = http(RPC_URL, { retryCount: 0 });
     const publicClient = createPublicClient({ chain: hardhat, transport, pollingInterval: 50 });
     const walletClient = createWalletClient({ chain: hardhat, transport, account: deployer, pollingInterval: 50 });
-    const { usdc, wallet } = await deployAll(walletClient, publicClient, { withdrawDelay: WITHDRAW_DELAY });
+    const testClient = createTestClient({ chain: hardhat, mode: 'hardhat', transport, pollingInterval: 50 });
+    const { usdc } = await deployLocalFixture(walletClient, publicClient, testClient);
     for (const to of [PAYER, STRANGER] as const) {
       const hash = await walletClient.writeContract({
         address: usdc,
@@ -83,11 +83,9 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     provide('rpcUrl', RPC_URL);
     provide('chainId', hardhat.id);
     provide('usdc', usdc);
-    provide('wallet', wallet);
-    provide('withdrawDelay', WITHDRAW_DELAY);
   } catch (err) {
     kill();
-    throw new Error(`sp tests: deploying contracts failed: ${(err as Error).message}`);
+    throw new Error(`facilitator tests: deploying contracts failed: ${(err as Error).message}`);
   }
 
   return async () => {

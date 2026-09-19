@@ -1,30 +1,24 @@
 import {
   BaseError,
-  ContractFunctionRevertedError,
-  ExecutionRevertedError,
-  TransactionReceiptNotFoundError,
-  createPublicClient,
+  HttpRequestError,
+  TimeoutError,
   createWalletClient,
   defineChain,
+  domainSeparator,
   http,
+  nonceManager,
   parseAbi,
-  parseEventLogs,
+  publicActions,
+  verifyTypedData as verifyTypedDataOffline,
   type Chain,
   type HttpTransport,
-  type PublicClient,
-  type TransactionReceipt,
+  type PublicActions,
   type WalletClient,
 } from 'viem';
-import type { PrivateKeyAccount } from 'viem/accounts';
-import { AEP2_DEBIT_WALLET_ABI, SETTLE_STATUS } from '@agentpay/contracts';
-import { mandateToTuple, type Address, type Hex, type Mandate } from '@agentpay/core';
-import type { ResolvedSPConfig } from './config.js';
-
-/** What the worker needs from a record to build a settle call. */
-export interface SettleItem {
-  mandate: Mandate;
-  payerSig: Hex;
-}
+import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
+import { toFacilitatorEvmSigner, type FacilitatorEvmSigner } from '@x402/evm';
+import { EIP3009_ABI, type Address, type AssetDomain } from '@agentpay/core';
+import type { ResolvedFacilitatorConfig } from './config.js';
 
 export interface TokenInfo {
   address: Address;
@@ -32,41 +26,12 @@ export interface TokenInfo {
   decimals: number;
 }
 
-/** The wallet's authorization record for (payer, this SP): `revokeAt` is 0 or the unix second the SP loses the right to settle. */
-export interface SpAuthorization {
-  enabled: boolean;
-  revokeAt: number;
-}
-
-/** The contract's `authorizedSP` predicate evaluated at `now` (unix seconds). */
-export function authorizedAt(a: SpAuthorization, now: number): boolean {
-  return a.enabled && (a.revokeAt === 0 || now < a.revokeAt);
-}
-
 const ERC20_META_ABI = parseAbi([
   'function decimals() view returns (uint8)',
   'function symbol() view returns (string)',
+  'function DOMAIN_SEPARATOR() view returns (bytes32)',
+  'function eip712Domain() view returns (bytes1 fields, string name, string version, uint256 chainId, address verifyingContract, bytes32 salt, uint256[] extensions)',
 ]);
-
-/** Named revert (custom error) -> contract SettleStatus index. */
-export const REVERT_STATUS: Record<string, number> = {
-  SPNotAuthorized: 1,
-  Expired: 2,
-  NonceUsed: 3,
-  InsufficientBalance: 4,
-  BadSignature: 5,
-  BadParams: 6,
-};
-
-export function statusName(status: number): string {
-  return SETTLE_STATUS[status] ?? `status_${status}`;
-}
-
-export type ErrorKind =
-  /** The EVM rejected the call: deterministic, retrying changes nothing. */
-  | { kind: 'revert'; errorName?: string; message: string }
-  /** Transport / node / signing trouble: worth retrying later. */
-  | { kind: 'transport'; message: string };
 
 export function errorMessage(err: unknown): string {
   if (err instanceof BaseError) return err.shortMessage;
@@ -74,221 +39,162 @@ export function errorMessage(err: unknown): string {
   return String(err);
 }
 
-export function classifyError(err: unknown): ErrorKind {
+/** True for RPC transport trouble (worth a retry), false for anything the chain decided. */
+export function isTransportError(err: unknown): boolean {
   if (err instanceof BaseError) {
-    const reverted = err.walk((e) => e instanceof ContractFunctionRevertedError);
-    if (reverted instanceof ContractFunctionRevertedError) {
-      return { kind: 'revert', errorName: reverted.data?.errorName, message: reverted.shortMessage };
-    }
-    if (err.walk((e) => e instanceof ExecutionRevertedError)) return { kind: 'revert', message: err.shortMessage };
+    return err.walk((e) => e instanceof HttpRequestError || e instanceof TimeoutError) !== null;
   }
-  return { kind: 'transport', message: errorMessage(err) };
+  return err instanceof TypeError && /fetch failed/i.test(err.message);
 }
 
-export interface SettleLogs {
-  /** Lowercased digests with a Settled event in the receipt. */
-  settled: Set<string>;
-  /** Lowercased digest -> SettleStatus index, from SettleSkipped events. */
-  skipped: Map<string, number>;
+/**
+ * Serialises the sign-and-broadcast step. viem's nonce manager hands out
+ * sequential nonces, but it does so before gas estimation and resets on any
+ * failure, and Hardhat's automine rejects a transaction whose nonce is ahead
+ * of the expected one: two settlements racing through writeContract can hit
+ * "Nonce too high". Receipts are awaited outside the lock, so throughput is
+ * still one broadcast per RPC round trip, not one per block.
+ */
+export function createSendLock(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = tail.then(fn, fn);
+    tail = run.catch(() => undefined);
+    return run;
+  };
 }
 
-export function parseSettleLogs(receipt: TransactionReceipt): SettleLogs {
-  const settled = new Set<string>();
-  const skipped = new Map<string, number>();
-  for (const log of parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'Settled' })) {
-    settled.add(log.args.mandateDigest.toLowerCase());
-  }
-  for (const log of parseEventLogs({ abi: AEP2_DEBIT_WALLET_ABI, logs: receipt.logs, eventName: 'SettleSkipped' })) {
-    skipped.set(log.args.mandateDigest.toLowerCase(), Number(log.args.status));
-  }
-  return { settled, skipped };
-}
+export type ChainConfig = Pick<ResolvedFacilitatorConfig, 'rpcUrl' | 'chainId' | 'pollingIntervalMs' | 'receiptTimeoutMs'>;
 
-export type ChainConfig = Pick<ResolvedSPConfig, 'rpcUrl' | 'chainId' | 'wallet' | 'pollingIntervalMs'>;
+type Client = WalletClient<HttpTransport, Chain, PrivateKeyAccount> & PublicActions<HttpTransport, Chain, PrivateKeyAccount>;
 
-/** viem clients plus the handful of wallet-contract calls the SP makes. */
+/** viem clients, the facilitator account, and the signer object @x402/evm settles through. */
 export class ChainClient {
-  readonly publicClient: PublicClient<HttpTransport, Chain>;
-  readonly walletClient: WalletClient<HttpTransport, Chain, PrivateKeyAccount>;
+  readonly account: PrivateKeyAccount;
+  readonly client: Client;
+  readonly signer: FacilitatorEvmSigner;
+  /**
+   * Bumped whenever a chain call fails for transport reasons. @x402/evm folds
+   * every failed read into a refusal reason, so the HTTP layer compares this
+   * counter before and after a verify/settle to tell "the chain said no"
+   * from "the chain could not be reached".
+   */
+  transportErrors = 0;
 
-  constructor(
-    readonly cfg: ChainConfig,
-    readonly account: PrivateKeyAccount,
-  ) {
+  constructor(readonly cfg: ChainConfig, key: `0x${string}`) {
+    this.account = privateKeyToAccount(key, { nonceManager });
     const chain = defineChain({
       id: cfg.chainId,
       name: `eip155:${cfg.chainId}`,
       nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
       rpcUrls: { default: { http: [cfg.rpcUrl] } },
     });
-    // No transport retries: the worker has its own backoff, and dev nodes report
-    // deterministic reverts with a retryable-looking JSON-RPC code.
+    // No transport retries: dev nodes report deterministic reverts with a
+    // retryable-looking JSON-RPC code, and a settle must not be re-broadcast
+    // blindly. pollingInterval matters: without it viem polls every
+    // blockTime/3 with blockTime defaulting to 12 s, i.e. 4 s per receipt check.
     const transport = http(cfg.rpcUrl, { retryCount: 0 });
-    this.publicClient = createPublicClient({ chain, transport, pollingInterval: cfg.pollingIntervalMs });
-    this.walletClient = createWalletClient({ chain, transport, account, pollingInterval: cfg.pollingIntervalMs });
+    this.client = createWalletClient({
+      chain,
+      transport,
+      account: this.account,
+      pollingInterval: cfg.pollingIntervalMs,
+    }).extend(publicActions) as Client;
+
+    const lock = createSendLock();
+    const c = this.client;
+    const counted = <T>(p: Promise<T>): Promise<T> =>
+      p.catch((err: unknown) => {
+        if (isTransportError(err)) this.transportErrors++;
+        throw err;
+      });
+    this.signer = toFacilitatorEvmSigner(
+      {
+        address: this.account.address,
+        readContract: (args) => counted(c.readContract(args as never)),
+        // An EOA signature verifies offline; only a contract wallet's needs the
+        // chain (EIP-1271 / 6492), so an RPC outage cannot turn a good
+        // signature into invalid_exact_evm_signature.
+        verifyTypedData: async (args) =>
+          (await verifyTypedDataOffline(args as never).catch(() => false)) || counted(c.verifyTypedData(args as never)),
+        writeContract: (args) => counted(lock(() => c.writeContract(args as never))),
+        sendTransaction: (args) => counted(lock(() => c.sendTransaction(args as never))),
+        waitForTransactionReceipt: (args) => counted(c.waitForTransactionReceipt(args)),
+        getCode: (args) => counted(c.getCode(args)),
+      },
+      { confirmationTimeoutMs: cfg.receiptTimeoutMs },
+    );
   }
 
   chainId(): Promise<number> {
-    return this.publicClient.getChainId();
+    return this.client.getChainId();
   }
 
-  /** Uncached: admission reads are pinned to this block, so it must be the node's real head. */
-  async blockNumber(): Promise<number> {
-    return Number(await this.publicClient.getBlockNumber({ cacheTime: 0 }));
+  ethBalance(): Promise<bigint> {
+    return this.client.getBalance({ address: this.account.address });
   }
 
-  async withdrawDelay(): Promise<number> {
-    const delay = await this.publicClient.readContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'withdrawDelay',
-    });
-    return Number(delay);
-  }
-
-  /** decimals() must answer; a missing/odd symbol() is tolerated. */
   async tokenInfo(token: Address): Promise<TokenInfo> {
-    const decimals = await this.publicClient.readContract({ address: token, abi: ERC20_META_ABI, functionName: 'decimals' });
-    let symbol = 'UNKNOWN';
+    const decimals = await this.client.readContract({ address: token, abi: ERC20_META_ABI, functionName: 'decimals' });
+    let symbol = '?';
     try {
-      symbol = await this.publicClient.readContract({ address: token, abi: ERC20_META_ABI, functionName: 'symbol' });
+      symbol = await this.client.readContract({ address: token, abi: ERC20_META_ABI, functionName: 'symbol' });
     } catch {
-      /* non-standard symbol() */
+      /* symbol() is optional in ERC-20 */
     }
-    return { address: token, symbol, decimals: Number(decimals) };
+    return { address: token, symbol, decimals };
+  }
+
+  /** Proves `token` is an EIP-3009 contract: authorizationState() answers for a never-used nonce. */
+  async assertEip3009(token: Address): Promise<void> {
+    const used = await this.client.readContract({
+      address: token,
+      abi: EIP3009_ABI,
+      functionName: 'authorizationState',
+      args: [this.account.address, `0x${'00'.repeat(32)}`],
+    });
+    if (used !== false) throw new Error('authorizationState() did not answer false for an unused nonce');
   }
 
   /**
-   * Admission reads accept an explicit block so all three facts come from the
-   * same chain view, and so a lagging RPC replica can be refused (see server.ts).
+   * Checks that `domain` is what the token signs under: via eip712Domain()
+   * (ERC-5267, what OpenZeppelin exposes) or, for Circle's FiatToken, by
+   * recomputing DOMAIN_SEPARATOR() from name/version. A wrong domain would
+   * otherwise fail every payment as invalid_exact_evm_signature.
    */
-  async authorizationOf(owner: Address, at?: bigint): Promise<SpAuthorization> {
-    const [enabled, revokeAt] = await this.publicClient.readContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'authorizationOf',
-      args: [owner, this.account.address],
-      ...(at !== undefined ? { blockNumber: at } : {}),
+  async assertAssetDomain(token: Address, domain: AssetDomain): Promise<void> {
+    const expected = domainSeparator({
+      domain: { name: domain.name, version: domain.version, chainId: this.cfg.chainId, verifyingContract: token },
     });
-    return { enabled, revokeAt: Number(revokeAt) };
-  }
-
-  nonceUsed(owner: Address, nonce: string, at?: bigint): Promise<boolean> {
-    return this.publicClient.readContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'usedNonces',
-      args: [owner, BigInt(nonce)],
-      ...(at !== undefined ? { blockNumber: at } : {}),
-    });
-  }
-
-  debitable(owner: Address, token: Address, at?: bigint): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'debitableBalance',
-      args: [owner, token],
-      ...(at !== undefined ? { blockNumber: at } : {}),
-    });
-  }
-
-  balance(owner: Address, token: Address): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'balances',
-      args: [owner, token],
-    });
-  }
-
-  private batchArgs(items: readonly SettleItem[]) {
-    return [items.map((i) => mandateToTuple(i.mandate)), items.map((i) => i.payerSig)] as const;
-  }
-
-  /** eth_call of settleBatch as the SP: per-item SettleStatus without spending gas. */
-  async simulateSettleBatch(items: readonly SettleItem[]): Promise<number[]> {
-    const { result } = await this.publicClient.simulateContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'settleBatch',
-      args: this.batchArgs(items),
-      account: this.account,
-    });
-    return [...result].map(Number);
-  }
-
-  sendSettleBatch(items: readonly SettleItem[]): Promise<Hex> {
-    return this.walletClient.writeContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'settleBatch',
-      args: this.batchArgs(items),
-    });
-  }
-
-  sendSettle(item: SettleItem): Promise<Hex> {
-    return this.walletClient.writeContract({
-      address: this.cfg.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'settle',
-      args: [mandateToTuple(item.mandate), item.payerSig],
-    });
-  }
-
-  waitForReceipt(hash: Hex): Promise<TransactionReceipt> {
-    return this.publicClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
-  }
-
-  /** undefined when the transaction is not (yet) mined. */
-  async getReceipt(hash: Hex): Promise<TransactionReceipt | undefined> {
+    let actual: `0x${string}` | undefined;
     try {
-      return await this.publicClient.getTransactionReceipt({ hash });
-    } catch (err) {
-      if (err instanceof BaseError && err.walk((e) => e instanceof TransactionReceiptNotFoundError)) return undefined;
-      throw err;
-    }
-  }
-
-  /** Hash of the transaction that emitted Settled for this digest at or after fromBlock, if any. */
-  async findSettledTx(owner: Address, digest: Hex, fromBlock: number): Promise<Hex | undefined> {
-    try {
-      const logs = await this.publicClient.getContractEvents({
-        address: this.cfg.wallet,
-        abi: AEP2_DEBIT_WALLET_ABI,
-        eventName: 'Settled',
-        args: { owner },
-        fromBlock: BigInt(fromBlock),
-        toBlock: 'latest',
+      const [, name, version, chainId, verifyingContract] = await this.client.readContract({
+        address: token,
+        abi: ERC20_META_ABI,
+        functionName: 'eip712Domain',
       });
-      const hit = logs.find((l) => (l.args.mandateDigest ?? '').toLowerCase() === digest.toLowerCase());
-      return hit?.transactionHash ?? undefined;
+      actual = domainSeparator({ domain: { name, version, chainId: Number(chainId), verifyingContract } });
     } catch {
-      return undefined;
+      actual = await this.client.readContract({ address: token, abi: ERC20_META_ABI, functionName: 'DOMAIN_SEPARATOR' });
+    }
+    if (actual !== expected) {
+      throw new Error(
+        `token ${token} does not sign under { name: ${JSON.stringify(domain.name)}, version: ${JSON.stringify(domain.version)} } ` +
+          `(separator ${actual} vs expected ${expected})`,
+      );
     }
   }
 }
 
 export interface StartupInfo {
-  withdrawDelay: number;
   tokens: TokenInfo[];
+  ethBalance: bigint;
 }
-
-/**
- * How much longer than the settle window `withdrawDelay` must be. A receipt
- * issued at SP clock T promises settlement through T + window inclusive, while
- * a revocation or withdrawal mined at chain time T' >= T unlocks at T' +
- * withdrawDelay, where the SP is already refused (`block.timestamp < revokeAt`
- * is strict). Equality would leave the promise's last second unkeepable, and
- * an SP clock ahead of the chain widens that tail; 60 s is the skew grace the
- * wallet's receipt checks use.
- */
-export const WITHDRAW_DELAY_MARGIN_SECONDS = 60;
 
 /** Startup invariants; throws an Error whose message says exactly what is wrong. */
 export async function assertStartup(
   chain: ChainClient,
-  cfg: Pick<ResolvedSPConfig, 'rpcUrl' | 'chainId' | 'wallet' | 'tokens' | 'settleWindowSeconds'>,
+  cfg: Pick<ResolvedFacilitatorConfig, 'rpcUrl' | 'chainId' | 'tokens' | 'assetDomain'>,
 ): Promise<StartupInfo> {
   let chainId: number;
   try {
@@ -299,28 +205,19 @@ export async function assertStartup(
   if (chainId !== cfg.chainId) {
     throw new Error(`RPC ${cfg.rpcUrl} serves chain ${chainId} but the configuration says ${cfg.chainId}`);
   }
-  let withdrawDelay: number;
-  try {
-    withdrawDelay = await chain.withdrawDelay();
-  } catch (err) {
-    throw new Error(
-      `wallet ${cfg.wallet} does not answer withdrawDelay() (is it an AEP2DebitWallet on chain ${chainId}?): ${errorMessage(err)}`,
-    );
-  }
-  if (withdrawDelay < cfg.settleWindowSeconds + WITHDRAW_DELAY_MARGIN_SECONDS) {
-    throw new Error(
-      `wallet withdrawDelay is ${withdrawDelay}s but settleWindowSeconds is ${cfg.settleWindowSeconds}s ` +
-        `(needs at least ${WITHDRAW_DELAY_MARGIN_SECONDS}s more than the window): ` +
-        'enqueued mandates could outlive the withdrawal lock; lower SETTLE_WINDOW',
-    );
-  }
   const tokens: TokenInfo[] = [];
   for (const token of cfg.tokens) {
     try {
       tokens.push(await chain.tokenInfo(token));
+      await chain.assertEip3009(token);
     } catch (err) {
-      throw new Error(`token ${token} does not answer decimals(): ${errorMessage(err)}`);
+      throw new Error(`token ${token} is not an EIP-3009 ERC-20 on chain ${chainId}: ${errorMessage(err)}`);
     }
   }
-  return { withdrawDelay, tokens };
+  if (cfg.assetDomain) await chain.assertAssetDomain(cfg.tokens[0]!, cfg.assetDomain);
+  const ethBalance = await chain.ethBalance();
+  if (ethBalance === 0n) {
+    throw new Error(`facilitator ${chain.account.address} has no ETH on chain ${chainId}: it cannot pay for settlements`);
+  }
+  return { tokens, ethBalance };
 }

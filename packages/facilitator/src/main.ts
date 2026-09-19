@@ -1,13 +1,13 @@
-// `npm start` / `npm run sp`: env-configured Settlement Processor process.
-import { createSP, loadConfigFromEnv } from './index.js';
+// `npm start` / `npm run facilitator`: env-configured facilitator process.
+import { createFacilitator, loadConfigFromEnv } from './index.js';
 
 async function main(): Promise<void> {
-  let sp: ReturnType<typeof createSP>;
+  let facilitator: ReturnType<typeof createFacilitator>;
   try {
-    sp = createSP(loadConfigFromEnv());
-    await sp.start();
+    facilitator = createFacilitator(loadConfigFromEnv());
+    await facilitator.start();
   } catch (err) {
-    console.error(`sp: startup failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`facilitator: startup failed: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
 
@@ -15,11 +15,12 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     if (stopping) return;
     stopping = true;
-    console.error(`sp: ${signal} received, stopping`);
-    sp.stop()
+    console.error(`facilitator: ${signal} received, stopping`);
+    facilitator
+      .stop()
       .then(() => process.exit(0))
       .catch((err) => {
-        console.error(`sp: stop failed: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`facilitator: stop failed: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
       });
   };

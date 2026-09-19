@@ -1,79 +1,58 @@
-import { fileURLToPath } from 'node:url';
 import { getAddress, isAddress } from 'viem';
 import { readDeployment } from '@agentpay/contracts';
-import type { Address, Hex } from '@agentpay/core';
+import type { Address, AssetDomain, Hex } from '@agentpay/core';
 
-/** `storePath` value that keeps the queue in memory only: receipts do not survive a restart. */
-export const MEMORY_STORE_PATH = ':memory:';
-
-/** Everything a Settlement Processor instance needs; see SP_DEFAULTS for the optional knobs. */
-export interface SPConfig {
+/** Everything a facilitator instance needs; see FACILITATOR_DEFAULTS for the optional knobs. */
+export interface FacilitatorConfig {
   rpcUrl: string;
   chainId: number;
-  /** SP signing key (settles on-chain and signs enqueue receipts). */
+  /** Pays gas for every settlement it broadcasts; needs ETH. */
   key: Hex;
-  /** AEP2DebitWallet contract address. */
-  wallet: Address;
-  /** ERC-20s this SP settles; the first is the default for GET /queue. */
+  /** EIP-3009 assets this facilitator settles (anything else is refused before touching the chain). */
   tokens: Address[];
+  /** Expected EIP-712 domain of `tokens[0]`; checked against the contract at startup when set. */
+  assetDomain?: AssetDomain;
+  /**
+   * payTo allowlist. Unset = settle for any recipient, which on a public network
+   * lets anyone spend this facilitator's gas; set it for anything but a dev chain.
+   */
+  payees?: Address[];
   /** 0 = ephemeral port. */
   port: number;
-  /**
-   * Append-only JSONL file the queue is persisted to and replayed from on open.
-   * Default (unset or empty): `packages/sp/data/sp-queue.jsonl` next to this package.
-   * MEMORY_STORE_PATH (':memory:') opts out of persistence: receipts are then lost on restart.
-   */
-  storePath?: string;
-  /** The SP promises to settle within this many seconds of enqueueing (default 10800). */
-  settleWindowSeconds?: number;
-  /** Reject mandates whose deadline is closer than this (default 120). */
-  minDeadlineMarginSeconds?: number;
-  /** Reject mandates whose deadline is further out than this (default 86400). */
-  maxDeadlineHorizonSeconds?: number;
-  /** Worker period; 0 = never auto-tick (tests/demo call tick()). Default 5000. */
-  batchIntervalMs?: number;
-  /** Max mandates per settleBatch (default 50); reaching it triggers an immediate tick. */
-  batchMax?: number;
-  /** Pending mandates with less than this many seconds to their deadline are expired, never sent (default 30). */
-  sendMarginSeconds?: number;
-  /** Send failures tolerated per mandate before failed:send_failed (default 8). */
-  maxAttempts?: number;
-  /** Unix seconds; injectable for tests. */
-  clock?: () => number;
-  /** Log sink; default console.error. */
-  log?: (line: string) => void;
   /** Interface to bind (default 127.0.0.1). */
   host?: string;
-  /** Receipt polling interval in ms (default 1000; tests use ~50 against an automining node). */
+  /** How long a settlement waits for its receipt before answering settlement_pending (default 30000). */
+  receiptTimeoutMs?: number;
+  /** Receipt polling interval in ms (default 500: Base blocks every 2 s; tests use ~50 against an automining node). */
   pollingIntervalMs?: number;
+  /** When set, /verify and /settle require `authorization: Bearer <token>`. */
+  authToken?: string;
+  /** Log sink; default console.error. */
+  log?: (line: string) => void;
 }
 
-export type ResolvedSPConfig = Required<SPConfig>;
+export interface ResolvedFacilitatorConfig extends Required<Omit<FacilitatorConfig, 'assetDomain' | 'payees' | 'authToken'>> {
+  assetDomain?: AssetDomain;
+  payees?: Address[];
+  authToken?: string;
+  /** CAIP-2 id derived from chainId. */
+  network: `eip155:${number}`;
+}
 
-export const SP_DEFAULTS = {
-  settleWindowSeconds: 10_800,
-  minDeadlineMarginSeconds: 120,
-  maxDeadlineHorizonSeconds: 86_400,
-  batchIntervalMs: 5_000,
-  batchMax: 50,
-  sendMarginSeconds: 30,
-  maxAttempts: 8,
+export const FACILITATOR_DEFAULTS = {
   host: '127.0.0.1',
-  pollingIntervalMs: 1_000,
   port: 3001,
   rpcUrl: 'http://127.0.0.1:8545',
-  storePath: fileURLToPath(new URL('../data/sp-queue.jsonl', import.meta.url)),
+  receiptTimeoutMs: 30_000,
+  pollingIntervalMs: 500,
 } as const;
 
 const PRIVATE_KEY_RE = /^0x[0-9a-fA-F]{64}$/;
 
-export function defaultClock(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function checkNumber(name: string, value: number, opts: { min: number; integer?: boolean }): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`config.${name} must be a number`);
-  if (opts.integer !== false && !Number.isInteger(value)) throw new Error(`config.${name} must be an integer`);
+function checkNumber(name: string, value: number, opts: { min: number }): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error(`config.${name} must be an integer`);
+  }
   if (value < opts.min) throw new Error(`config.${name} must be >= ${opts.min}`);
   return value;
 }
@@ -85,14 +64,8 @@ function checkAddress(name: string, value: string): Address {
   return getAddress(value);
 }
 
-/** Unset/blank -> the package-anchored default file; ':memory:' and explicit paths pass through. */
-function storePathOf(raw: string | undefined): string {
-  const trimmed = raw?.trim() ?? '';
-  return trimmed === '' ? SP_DEFAULTS.storePath : trimmed;
-}
-
 /** Applies defaults and validates; throws Error with a clear message. */
-export function resolveConfig(cfg: SPConfig): ResolvedSPConfig {
+export function resolveConfig(cfg: FacilitatorConfig): ResolvedFacilitatorConfig {
   if (typeof cfg.key !== 'string' || !PRIVATE_KEY_RE.test(cfg.key)) {
     throw new Error('config.key must be a 0x-prefixed 32-byte hex private key');
   }
@@ -102,38 +75,28 @@ export function resolveConfig(cfg: SPConfig): ResolvedSPConfig {
   if (!Array.isArray(cfg.tokens) || cfg.tokens.length === 0) {
     throw new Error('config.tokens must list at least one token address');
   }
-  const resolved: ResolvedSPConfig = {
-    rpcUrl: cfg.rpcUrl,
-    chainId: checkNumber('chainId', cfg.chainId, { min: 1 }),
-    key: cfg.key,
-    wallet: checkAddress('wallet', cfg.wallet),
-    tokens: cfg.tokens.map((t, i) => checkAddress(`tokens[${i}]`, t)),
-    port: checkNumber('port', cfg.port, { min: 0 }),
-    settleWindowSeconds: checkNumber('settleWindowSeconds', cfg.settleWindowSeconds ?? SP_DEFAULTS.settleWindowSeconds, { min: 1 }),
-    minDeadlineMarginSeconds: checkNumber(
-      'minDeadlineMarginSeconds',
-      cfg.minDeadlineMarginSeconds ?? SP_DEFAULTS.minDeadlineMarginSeconds,
-      { min: 0 },
-    ),
-    maxDeadlineHorizonSeconds: checkNumber(
-      'maxDeadlineHorizonSeconds',
-      cfg.maxDeadlineHorizonSeconds ?? SP_DEFAULTS.maxDeadlineHorizonSeconds,
-      { min: 1 },
-    ),
-    batchIntervalMs: checkNumber('batchIntervalMs', cfg.batchIntervalMs ?? SP_DEFAULTS.batchIntervalMs, { min: 0 }),
-    batchMax: checkNumber('batchMax', cfg.batchMax ?? SP_DEFAULTS.batchMax, { min: 1 }),
-    sendMarginSeconds: checkNumber('sendMarginSeconds', cfg.sendMarginSeconds ?? SP_DEFAULTS.sendMarginSeconds, { min: 0 }),
-    maxAttempts: checkNumber('maxAttempts', cfg.maxAttempts ?? SP_DEFAULTS.maxAttempts, { min: 1 }),
-    clock: cfg.clock ?? defaultClock,
-    log: cfg.log ?? ((line: string) => console.error(line)),
-    host: cfg.host ?? SP_DEFAULTS.host,
-    pollingIntervalMs: checkNumber('pollingIntervalMs', cfg.pollingIntervalMs ?? SP_DEFAULTS.pollingIntervalMs, { min: 1 }),
-    storePath: storePathOf(cfg.storePath),
-  };
-  if (resolved.minDeadlineMarginSeconds > resolved.maxDeadlineHorizonSeconds) {
-    throw new Error('config.minDeadlineMarginSeconds must not exceed config.maxDeadlineHorizonSeconds');
+  if (cfg.assetDomain && (typeof cfg.assetDomain.name !== 'string' || typeof cfg.assetDomain.version !== 'string')) {
+    throw new Error('config.assetDomain must be { name, version }');
   }
-  return resolved;
+  if (cfg.authToken !== undefined && (typeof cfg.authToken !== 'string' || cfg.authToken.trim() === '')) {
+    throw new Error('config.authToken must be a non-empty string when set');
+  }
+  const chainId = checkNumber('chainId', cfg.chainId, { min: 1 });
+  return {
+    rpcUrl: cfg.rpcUrl,
+    chainId,
+    network: `eip155:${chainId}`,
+    key: cfg.key,
+    tokens: cfg.tokens.map((t, i) => checkAddress(`tokens[${i}]`, t)),
+    assetDomain: cfg.assetDomain,
+    payees: cfg.payees?.map((p, i) => checkAddress(`payees[${i}]`, p)),
+    port: checkNumber('port', cfg.port, { min: 0 }),
+    host: cfg.host ?? FACILITATOR_DEFAULTS.host,
+    receiptTimeoutMs: checkNumber('receiptTimeoutMs', cfg.receiptTimeoutMs ?? FACILITATOR_DEFAULTS.receiptTimeoutMs, { min: 1 }),
+    pollingIntervalMs: checkNumber('pollingIntervalMs', cfg.pollingIntervalMs ?? FACILITATOR_DEFAULTS.pollingIntervalMs, { min: 1 }),
+    authToken: cfg.authToken,
+    log: cfg.log ?? ((line: string) => console.error(line)),
+  };
 }
 
 function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
@@ -144,40 +107,44 @@ function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
   return n;
 }
 
+function envList(env: NodeJS.ProcessEnv, name: string): string[] | undefined {
+  const items = env[name]?.split(',').map((t) => t.trim()).filter(Boolean);
+  return items && items.length > 0 ? items : undefined;
+}
+
 /**
- * Reads SP_PK, RPC_URL, CHAIN_ID, WALLET_ADDRESS, SUPPORTED_TOKENS, SP_PORT, STORE_PATH,
- * SETTLE_WINDOW, MIN_DEADLINE_MARGIN, MAX_DEADLINE_HORIZON, BATCH_INTERVAL_MS, BATCH_MAX,
- * SEND_MARGIN, MAX_ATTEMPTS. When CHAIN_ID / WALLET_ADDRESS / SUPPORTED_TOKENS are unset the
- * missing ones come from packages/contracts/deployments/<DEPLOYMENT ?? 'localhost'>.json.
+ * Reads FACILITATOR_PK, RPC_URL, CHAIN_ID, SUPPORTED_TOKENS, USDC_DOMAIN_NAME /
+ * USDC_DOMAIN_VERSION, PAYEES, FACILITATOR_PORT, HOST, RECEIPT_TIMEOUT_MS,
+ * FACILITATOR_AUTH_TOKEN. Whatever of CHAIN_ID / SUPPORTED_TOKENS / the domain is
+ * unset comes from packages/contracts/deployments/<DEPLOYMENT ?? 'localhost'>.json.
  */
-export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): SPConfig {
-  const key = env.SP_PK;
+export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): FacilitatorConfig {
+  const key = env.FACILITATOR_PK;
   if (!key || !PRIVATE_KEY_RE.test(key)) {
-    throw new Error('SP_PK must be set to a 0x-prefixed 32-byte hex private key');
+    throw new Error('FACILITATOR_PK must be set to a 0x-prefixed 32-byte hex private key');
   }
   let chainId = envInt(env, 'CHAIN_ID');
-  let wallet = env.WALLET_ADDRESS?.trim() || undefined;
-  let tokens = env.SUPPORTED_TOKENS?.split(',').map((t) => t.trim()).filter(Boolean);
-  if (chainId === undefined || !wallet || !tokens || tokens.length === 0) {
+  let tokens = envList(env, 'SUPPORTED_TOKENS');
+  let assetDomain: AssetDomain | undefined =
+    env.USDC_DOMAIN_NAME && env.USDC_DOMAIN_VERSION
+      ? { name: env.USDC_DOMAIN_NAME, version: env.USDC_DOMAIN_VERSION }
+      : undefined;
+  if (chainId === undefined || !tokens || !assetDomain) {
     const dep = readDeployment(env.DEPLOYMENT ?? 'localhost');
     chainId ??= dep.chainId;
-    wallet ??= dep.wallet;
-    if (!tokens || tokens.length === 0) tokens = [dep.usdc];
+    tokens ??= [dep.usdc];
+    assetDomain ??= dep.usdcDomain;
   }
   return {
-    rpcUrl: env.RPC_URL?.trim() || SP_DEFAULTS.rpcUrl,
+    rpcUrl: env.RPC_URL?.trim() || FACILITATOR_DEFAULTS.rpcUrl,
     chainId,
     key: key as Hex,
-    wallet: checkAddress('wallet', wallet),
     tokens: tokens.map((t, i) => checkAddress(`tokens[${i}]`, t)),
-    port: envInt(env, 'SP_PORT') ?? SP_DEFAULTS.port,
-    storePath: storePathOf(env.STORE_PATH),
-    settleWindowSeconds: envInt(env, 'SETTLE_WINDOW'),
-    minDeadlineMarginSeconds: envInt(env, 'MIN_DEADLINE_MARGIN'),
-    maxDeadlineHorizonSeconds: envInt(env, 'MAX_DEADLINE_HORIZON'),
-    batchIntervalMs: envInt(env, 'BATCH_INTERVAL_MS'),
-    batchMax: envInt(env, 'BATCH_MAX'),
-    sendMarginSeconds: envInt(env, 'SEND_MARGIN'),
-    maxAttempts: envInt(env, 'MAX_ATTEMPTS'),
+    assetDomain,
+    payees: envList(env, 'PAYEES')?.map((p, i) => checkAddress(`payees[${i}]`, p)),
+    port: envInt(env, 'FACILITATOR_PORT') ?? FACILITATOR_DEFAULTS.port,
+    host: env.HOST?.trim() || undefined,
+    receiptTimeoutMs: envInt(env, 'RECEIPT_TIMEOUT_MS'),
+    authToken: env.FACILITATOR_AUTH_TOKEN?.trim() || undefined,
   };
 }

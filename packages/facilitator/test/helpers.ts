@@ -1,11 +1,9 @@
 import { createServer } from 'node:http';
-import { mkdtempSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { inject } from 'vitest';
 import {
   createPublicClient,
+  createTestClient,
   createWalletClient,
   getAddress,
   http,
@@ -16,25 +14,18 @@ import {
 } from 'viem';
 import { mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
-import { AEP2_DEBIT_WALLET_ABI, MOCK_USDC_ABI } from '@agentpay/contracts';
-import {
-  mandateDigest,
-  mandateToTuple,
-  randomNonce,
-  resourceRef,
-  signMandate,
-  type Mandate,
-  type MandateDomain,
-} from '@agentpay/core';
-import { MEMORY_STORE_PATH, createSP, type SPConfig, type SPHandle } from '../src/index.js';
+import type { PaymentPayload, PaymentRequirements } from '@x402/core/types';
+import { MOCK_USDC_ABI, MOCK_USDC_DOMAIN } from '@agentpay/contracts';
+import { EIP3009_ABI, randomBytes32 } from '@agentpay/core';
+import { createFacilitator, type FacilitatorConfig, type FacilitatorHandle } from '../src/index.js';
 
 // Hardhat's PUBLIC dev-mnemonic accounts — never real funds.
-// 0 deployer, 1 payer, 2 payee, 3 settlement processor, 4 stranger.
+// 0 deployer, 1 payer, 2 payee, 3 facilitator, 4 stranger.
 export const KEYS = {
   deployer: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
   payer: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
   payee: '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a',
-  sp: '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6',
+  facilitator: '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6',
   stranger: '0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a',
 } as const;
 
@@ -42,7 +33,7 @@ export const accounts = {
   deployer: privateKeyToAccount(KEYS.deployer),
   payer: privateKeyToAccount(KEYS.payer),
   payee: privateKeyToAccount(KEYS.payee),
-  sp: privateKeyToAccount(KEYS.sp),
+  facilitator: privateKeyToAccount(KEYS.facilitator),
   stranger: privateKeyToAccount(KEYS.stranger),
 };
 
@@ -59,19 +50,11 @@ export interface Fixture {
   rpcUrl: string;
   chainId: number;
   usdc: Address;
-  wallet: Address;
-  withdrawDelay: number;
 }
 
-/** Deployed addresses, checksummed (the SP reports every address in EIP-55 form). */
+/** Deployed addresses, checksummed. */
 export function fixture(): Fixture {
-  return {
-    rpcUrl: inject('rpcUrl'),
-    chainId: inject('chainId'),
-    usdc: getAddress(inject('usdc')),
-    wallet: getAddress(inject('wallet')),
-    withdrawDelay: inject('withdrawDelay'),
-  };
+  return { rpcUrl: inject('rpcUrl'), chainId: inject('chainId'), usdc: getAddress(inject('usdc')) };
 }
 
 export const USDC = (n: string): bigint => {
@@ -79,23 +62,23 @@ export const USDC = (n: string): bigint => {
   return BigInt(whole) * 1_000_000n + BigInt(frac.padEnd(6, '0').slice(0, 6));
 };
 
-export const RESOURCE = 'GET /predict';
 export const AMOUNT = 50_000n; // $0.05
+export const MAX_TIMEOUT_SECONDS = 60;
 
 const transport = () => http(fixture().rpcUrl, { retryCount: 0 });
 
 export const publicClient = () => createPublicClient({ chain: hardhat, transport: transport(), pollingInterval: 50 });
+export const testClient = () => createTestClient({ chain: hardhat, mode: 'hardhat', transport: transport(), pollingInterval: 50 });
 
 export function walletFor(account: Signer) {
   return createWalletClient({ chain: hardhat, transport: transport(), account, pollingInterval: 50 });
 }
 
-export function domain(): MandateDomain {
-  const f = fixture();
-  return { chainId: f.chainId, verifyingContract: f.wallet };
-}
-
 export const nowSec = (): number => Math.floor(Date.now() / 1000);
+
+export async function chainNow(): Promise<number> {
+  return Number((await publicClient().getBlock()).timestamp);
+}
 
 async function mined(hash: Hex): Promise<TransactionReceipt> {
   return publicClient().waitForTransactionReceipt({ hash });
@@ -113,137 +96,115 @@ export async function mint(to: Address, amount: bigint): Promise<void> {
   );
 }
 
-/** approve + deposit from `account`. */
-export async function deposit(account: Signer, amount: bigint): Promise<void> {
-  const f = fixture();
-  const w = walletFor(account);
-  await mined(
-    await w.writeContract({ address: f.usdc, abi: MOCK_USDC_ABI, functionName: 'approve', args: [f.wallet, amount] }),
-  );
-  await mined(
-    await w.writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'deposit', args: [f.usdc, amount] }),
-  );
-}
-
-export async function authorize(account: Signer, sp: Address): Promise<void> {
-  const f = fixture();
-  await mined(
-    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'authorizeSP', args: [sp] }),
-  );
-}
-
-/** revokeSP from `account`; returns the scheduled revokeAt (unix seconds). */
-export async function revoke(account: Signer, sp: Address): Promise<number> {
-  const f = fixture();
-  await mined(
-    await walletFor(account).writeContract({ address: f.wallet, abi: AEP2_DEBIT_WALLET_ABI, functionName: 'revokeSP', args: [sp] }),
-  );
-  const [, revokeAt] = await publicClient().readContract({
-    address: f.wallet,
-    abi: AEP2_DEBIT_WALLET_ABI,
-    functionName: 'authorizationOf',
-    args: [account.address, sp],
-  });
-  return Number(revokeAt);
-}
-
-/** mint + deposit + authorizeSP: a payer ready to be settled by `sp`. */
-export async function fund(account: Signer, amount: bigint, sp: Address): Promise<void> {
-  await mint(account.address, amount);
-  await deposit(account, amount);
-  await authorize(account, sp);
-}
-
-export async function walletBalance(owner: Address): Promise<bigint> {
-  const f = fixture();
-  return publicClient().readContract({
-    address: f.wallet,
-    abi: AEP2_DEBIT_WALLET_ABI,
-    functionName: 'balances',
-    args: [owner, f.usdc],
-  });
-}
-
-export async function debitable(owner: Address): Promise<bigint> {
-  const f = fixture();
-  return publicClient().readContract({
-    address: f.wallet,
-    abi: AEP2_DEBIT_WALLET_ABI,
-    functionName: 'debitableBalance',
-    args: [owner, f.usdc],
-  });
-}
-
 export async function usdcBalance(who: Address): Promise<bigint> {
-  const f = fixture();
-  return publicClient().readContract({ address: f.usdc, abi: MOCK_USDC_ABI, functionName: 'balanceOf', args: [who] });
+  return publicClient().readContract({ address: fixture().usdc, abi: EIP3009_ABI, functionName: 'balanceOf', args: [who] });
 }
 
-export async function nonceUsed(owner: Address, nonce: string): Promise<boolean> {
-  const f = fixture();
+export async function authorizationState(authorizer: Address, nonce: Hex): Promise<boolean> {
   return publicClient().readContract({
-    address: f.wallet,
-    abi: AEP2_DEBIT_WALLET_ABI,
-    functionName: 'usedNonces',
-    args: [owner, BigInt(nonce)],
+    address: fixture().usdc,
+    abi: EIP3009_ABI,
+    functionName: 'authorizationState',
+    args: [authorizer, nonce],
   });
 }
 
-export interface Signed {
-  mandate: Mandate;
-  payerSig: Hex;
-  digest: Hex;
-}
+// ------------------------------------------------------------ x402 payloads
 
-export function mandateFor(over: Partial<Mandate> = {}, owner: Address = accounts.payer.address): Mandate {
+/** What a payee would advertise for one paid call. */
+export function requirements(over: Partial<PaymentRequirements> = {}): PaymentRequirements {
   const f = fixture();
   return {
-    owner,
-    token: f.usdc,
-    payee: accounts.payee.address,
+    scheme: 'exact',
+    network: `eip155:${f.chainId}`,
+    asset: f.usdc,
     amount: AMOUNT.toString(),
-    nonce: randomNonce(),
-    deadline: nowSec() + 3600,
-    ref: resourceRef(RESOURCE),
+    payTo: accounts.payee.address,
+    maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
+    extra: { ...MOCK_USDC_DOMAIN, assetTransferMethod: 'eip3009' },
     ...over,
   };
 }
 
-/** A mandate signed by `signer` (owner defaults to the signer's address). */
-export async function signed(over: Partial<Mandate> = {}, signer: Signer = accounts.payer): Promise<Signed> {
-  const mandate = mandateFor(over, over.owner ?? signer.address);
-  const payerSig = await signMandate(signer, domain(), mandate);
-  return { mandate, payerSig, digest: mandateDigest(domain(), mandate) };
+export interface Authorization {
+  from: Address;
+  to: Address;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: Hex;
 }
 
-/** Out-of-band settle(m, sig) as `as` (default: the SP account itself). */
-export async function settleDirect(s: Pick<Signed, 'mandate' | 'payerSig'>, as: Signer = accounts.sp): Promise<TransactionReceipt> {
-  const f = fixture();
-  return mined(
-    await walletFor(as).writeContract({
-      address: f.wallet,
-      abi: AEP2_DEBIT_WALLET_ABI,
-      functionName: 'settle',
-      args: [mandateToTuple(s.mandate), s.payerSig],
-    }),
-  );
+export interface SignedPayment {
+  requirements: PaymentRequirements;
+  authorization: Authorization;
+  signature: Hex;
+  payload: PaymentPayload;
 }
 
-export const SETTLE_WINDOW = 600;
-
-export function mkSP(over: Partial<SPConfig> = {}): SPHandle {
+/**
+ * Builds and signs an EIP-3009 authorization for `req` the way the official
+ * client does (validAfter 0, validBefore now + maxTimeoutSeconds, random nonce),
+ * with `over` applied to the authorization and `signer` producing the signature.
+ */
+export async function signedPayment(
+  req: PaymentRequirements = requirements(),
+  over: Partial<Authorization> = {},
+  signer: Signer = accounts.payer,
+): Promise<SignedPayment> {
   const f = fixture();
-  return createSP({
+  const authorization: Authorization = {
+    from: signer.address,
+    to: req.payTo as Address,
+    value: req.amount,
+    validAfter: '0',
+    validBefore: String(nowSec() + req.maxTimeoutSeconds),
+    nonce: randomBytes32(),
+    ...over,
+  };
+  const signature = await signer.signTypedData({
+    domain: { name: String(req.extra.name), version: String(req.extra.version), chainId: f.chainId, verifyingContract: req.asset as Address },
+    types: {
+      TransferWithAuthorization: [
+        { name: 'from', type: 'address' },
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'validAfter', type: 'uint256' },
+        { name: 'validBefore', type: 'uint256' },
+        { name: 'nonce', type: 'bytes32' },
+      ],
+    },
+    primaryType: 'TransferWithAuthorization',
+    message: {
+      from: authorization.from,
+      to: authorization.to,
+      value: BigInt(authorization.value),
+      validAfter: BigInt(authorization.validAfter),
+      validBefore: BigInt(authorization.validBefore),
+      nonce: authorization.nonce,
+    },
+  });
+  const payload: PaymentPayload = {
+    x402Version: 2,
+    accepted: req,
+    payload: { signature, authorization },
+  };
+  return { requirements: req, authorization, signature, payload };
+}
+
+// ------------------------------------------------------------ facilitator
+
+export function mkFacilitator(over: Partial<FacilitatorConfig> = {}): FacilitatorHandle {
+  const f = fixture();
+  return createFacilitator({
     rpcUrl: f.rpcUrl,
     chainId: f.chainId,
-    key: KEYS.sp,
-    wallet: f.wallet,
+    key: KEYS.facilitator,
     tokens: [f.usdc],
+    assetDomain: { ...MOCK_USDC_DOMAIN },
     port: 0,
-    storePath: MEMORY_STORE_PATH, // the default would be the package's data/ file
-    batchIntervalMs: 0,
-    settleWindowSeconds: SETTLE_WINDOW,
     pollingIntervalMs: 50,
+    receiptTimeoutMs: 10_000,
     log: () => {},
     ...over,
   });
@@ -255,11 +216,11 @@ export interface Reply<T = any> {
   headers: Headers;
 }
 
-export async function post(url: string, body: unknown, raw = false): Promise<Reply> {
+export async function post(url: string, body: unknown, opts: { raw?: boolean; headers?: Record<string, string> } = {}): Promise<Reply> {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: raw ? (body as string) : JSON.stringify(body),
+    headers: { 'content-type': 'application/json', ...(opts.headers ?? {}) },
+    body: opts.raw ? (body as string) : JSON.stringify(body),
   });
   return { status: res.status, json: await res.json(), headers: res.headers };
 }
@@ -269,8 +230,16 @@ export async function get(url: string, method = 'GET'): Promise<Reply> {
   return { status: res.status, json: await res.json(), headers: res.headers };
 }
 
-export function enqueue(sp: SPHandle, s: Pick<Signed, 'mandate' | 'payerSig'>, extra: Record<string, unknown> = {}): Promise<Reply> {
-  return post(`${sp.url}/enqueue`, { mandate: s.mandate, payerSig: s.payerSig, ...extra });
+export function facilitatorBody(s: SignedPayment, requirementsOverride?: PaymentRequirements) {
+  return { x402Version: 2, paymentPayload: s.payload, paymentRequirements: requirementsOverride ?? s.requirements };
+}
+
+export function verify(fac: FacilitatorHandle, s: SignedPayment, requirementsOverride?: PaymentRequirements): Promise<Reply> {
+  return post(`${fac.url}/verify`, facilitatorBody(s, requirementsOverride));
+}
+
+export function settle(fac: FacilitatorHandle, s: SignedPayment, requirementsOverride?: PaymentRequirements): Promise<Reply> {
+  return post(`${fac.url}/settle`, facilitatorBody(s, requirementsOverride));
 }
 
 export async function waitFor(cond: () => boolean | Promise<boolean>, timeoutMs = 15_000, everyMs = 25): Promise<void> {
@@ -282,10 +251,6 @@ export async function waitFor(cond: () => boolean | Promise<boolean>, timeoutMs 
   throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
 }
 
-export function tmpStorePath(name: string): string {
-  return path.join(mkdtempSync(path.join(tmpdir(), 'agentpay-sp-')), `${name}.jsonl`);
-}
-
 export interface RpcProxy {
   url: string;
   dead: boolean;
@@ -294,7 +259,7 @@ export interface RpcProxy {
 
 /**
  * A JSON-RPC pass-through the test can kill: while `dead`, every request gets a
- * 503, which is what a vanished RPC provider looks like to the SP.
+ * 503, which is what a vanished RPC provider looks like to the facilitator.
  */
 export async function rpcProxy(target: string): Promise<RpcProxy> {
   const state = { dead: false };
