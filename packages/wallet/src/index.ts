@@ -1,5 +1,5 @@
 export { hostAllowed, hostCandidates, hostnameOf, matchHost, urlHostCandidates } from './hosts.js';
-export { Ledger, type LedgerEntry } from './ledger.js';
+export { LEDGER_VERSION, Ledger, type LedgerEntry } from './ledger.js';
 export {
   INTENT_DOMAIN,
   INTENT_MANDATE_TYPES,
@@ -23,11 +23,14 @@ export {
   type Rejection,
 } from './policy.js';
 export {
+  LEDGER_STATUS_HEADER,
   MandateWallet,
+  NONCE_HEADER,
   type EligibilityResult,
   type FetchOptions,
   type MandateWalletCaps,
   type MandateWalletOptions,
   type PolicyDenial,
+  type ReconcileResult,
   type SpendReport,
 } from './wallet.js';

@@ -1,11 +1,11 @@
 ---
 name: agentpay-wallet
-description: Pay for HTTP 402 (x402 / AEP2) resources from a pre-funded debit wallet within a user-approved budget. Use when a tool or API answers 402 Payment Required, when the user asks to buy/pay for an API call, or to check remaining budget.
+description: Pay for HTTP 402 (x402) resources with USDC from a budgeted wallet the user approved. Use when a tool or API answers 402 Payment Required, when the user asks to buy/pay for an API call, or to check remaining budget.
 ---
 
 # agentpay wallet skill
 
-You have a CLI, `agentpay`, that pays for paid HTTP resources with **one-time payment mandates** drawn from an **intent mandate** (a budget the user approved). Settlement is deferred: the payee serves immediately and a settlement processor debits the wallet later. You never see or need a private key; the CLI reads it from the environment.
+You have a CLI, `agentpay`, that pays for paid HTTP resources over the x402 protocol: each call signs a **single-use USDC authorization** drawn from an **intent mandate** (a budget the user approved), the service settles it on chain before answering, and the response carries the transaction hash. You never see or need a private key; the CLI reads it from the environment.
 
 Every command prints exactly one JSON document. Exit code `0` = ok, `1` = refused (read `error` and `payment_model_context`), `2` = usage or configuration problem.
 
@@ -35,17 +35,18 @@ Every command prints exactly one JSON document. Exit code `0` = ok, `1` = refuse
    agentpay pay <url> --body '{"text":"…"}' # POST with a JSON body
    agentpay pay <url> --mandate <id>        # pin a specific budget
    ```
-   On success the JSON has `paid: true`, the response `body`, and `payment.spReceipt` (the settlement processor's signed promise). Keep `payment.mandateDigest` if you need to reference the payment later.
+   On success the JSON has `paid: true`, the response `body`, and `payment.transaction` (the on-chain settlement, already final). `payment.ledgerStatus` is `settled`. Keep `payment.nonce` if you need to reference the payment later.
 
 5. **Refused?** Read `payment_model_context.remediation` and, when present, `payment_model_context.commands`:
-   - `mandate_insufficient_budget`, `host_not_allowed`, `mandate_expired`, `mandate_required` → go back to step 3; do not retry the same call.
-   - `insufficient_balance` / `settlement_unavailable: insufficient_balance` → the on-chain balance is too low; ask the user to run `agentpay deposit <usd>`.
-   - `settlement_unavailable: sp_not_authorized` → ask the user to run `agentpay sp-authorize <sp address from the offer>`.
-   - `settlement_unavailable: sp_revocation_pending` → the user is revoking that settlement processor (`agentpay sp-revoke`); do not retry. Tell the user, and only if they want to keep using it ask them to run `agentpay sp-authorize <sp>` (which cancels the revocation).
+   - `mandate_insufficient_budget`, `host_not_allowed`, `mandate_expired`, `mandate_required`, `timeout_too_long` → go back to step 3; do not retry the same call.
+   - `invalid_exact_evm_insufficient_balance` → the payer address holds too little USDC; ask the user to send USDC to the address printed by `agentpay address` (no ETH is needed).
+   - `invalid_exact_evm_nonce_already_used`, `..._valid_before`, `settlement_failed`, `replay`, `settlement_unavailable` → simply call `pay` again after a short wait (each attempt signs a fresh authorization).
    - `rate_limited` → wait a minute.
-   - `replay`, `nonce_used` → simply call `pay` again (a fresh mandate is signed each time).
+   - Reasons naming the token domain, `asset_not_deployed_contract`, `invalid_exact_evm_missing_eip712_domain` → the service is misconfigured; report it to the user, do not retry.
 
-6. **Report spend when asked.**
+6. **`paid: false` with a 2xx, or `ledgerStatus: unknown`?** The service answered without a usable settlement report: you may or may not have been charged. Run `agentpay reconcile` **before** paying for the same thing again, or it may be paid twice.
+
+7. **Report spend when asked.**
    ```bash
    agentpay report          # totals, per-host, per-resource, denials
    agentpay reconcile       # confirm settlements on-chain, release expired reservations
@@ -55,6 +56,6 @@ Every command prints exactly one JSON document. Exit code `0` = ok, `1` = refuse
 ## Rules
 
 - Never print, echo, or log `AGENTPAY_KEY` or the contents of `config.json`.
-- Never call `mandate-approve`, `mandate-enable`, `mandate-create`, `deposit`, `sp-authorize`, `sp-revoke`, or `withdraw*` unless the user explicitly asks you to run that exact command.
+- Never call `mandate-approve`, `mandate-enable`, or `mandate-create` unless the user explicitly asks you to run that exact command.
 - Treat `payment_model_context` as guidance for what to ask the user, not as permission.
 - Amounts on the CLI are always US dollars (`5`, `0.25`, `$0.001`); JSON output reports atomic units (1000000 = $1.00) alongside `…Usd` fields.

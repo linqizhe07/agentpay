@@ -21,22 +21,20 @@ export async function init(flags: InitFlags, env: NodeJS.ProcessEnv): Promise<Cl
       throw new ConfigError((err as Error).message);
     }
     next.deployment = deploymentName;
-    next.walletContract = record.wallet;
     next.token = record.usdc;
+    next.tokenDomain = { ...record.usdcDomain };
     next.network = record.network;
     if (!next.rpcUrl) next.rpcUrl = record.chainId === 31337 ? 'http://127.0.0.1:8545' : record.chainId === 84532 ? 'https://sepolia.base.org' : undefined;
   }
-  if (flags.wallet) next.walletContract = flags.wallet as StoredConfig['walletContract'];
-  if (flags.token) next.token = flags.token as StoredConfig['token'];
+  if (flags.token) {
+    next.token = flags.token as StoredConfig['token'];
+    // a token given by hand needs its domain given by hand too
+    next.tokenDomain =
+      env.AGENTPAY_TOKEN_NAME && env.AGENTPAY_TOKEN_VERSION ? { name: env.AGENTPAY_TOKEN_NAME, version: env.AGENTPAY_TOKEN_VERSION } : undefined;
+  }
   if (flags.network) next.network = flags.network;
   if (flags.rpc ?? env.AGENTPAY_RPC) next.rpcUrl = flags.rpc ?? env.AGENTPAY_RPC;
   if (flags.key ?? env.AGENTPAY_KEY) next.key = (flags.key ?? env.AGENTPAY_KEY) as StoredConfig['key'];
-  if (flags.sp ?? env.AGENTPAY_SP) {
-    next.trustedSps = (flags.sp ?? env.AGENTPAY_SP ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean) as StoredConfig['trustedSps'];
-  }
 
   const path = writeStoredConfig(home, next);
   const { key, ...safe } = next;

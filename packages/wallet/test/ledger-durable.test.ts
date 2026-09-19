@@ -22,8 +22,10 @@ afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 const ADDR = ('0x' + '11'.repeat(20)) as `0x${string}`;
 
-function entry(digest: string, over: Partial<LedgerEntry> = {}): LedgerEntry {
+function entry(nonce: string, over: Partial<LedgerEntry> = {}): LedgerEntry {
+  const n = ('0x' + nonce.repeat(32)) as Hex;
   return {
+    v: 2,
     kind: 'payment',
     timestamp: 1,
     url: 'http://x/y',
@@ -34,13 +36,13 @@ function entry(digest: string, over: Partial<LedgerEntry> = {}): LedgerEntry {
     amount: '5',
     payer: ADDR,
     payee: ADDR,
-    walletContract: ADDR,
     intentMandateId: 'im_1',
-    mandate: { owner: ADDR, token: ADDR, payee: ADDR, amount: '5', nonce: '1', deadline: 2, ref: ('0x' + '00'.repeat(32)) as Hex },
-    payerSig: '0x' as Hex,
-    mandateDigest: ('0x' + digest.repeat(32)) as Hex,
+    nonce: n,
+    validBefore: 2,
+    authorization: { from: ADDR, to: ADDR, value: '5', validAfter: '0', validBefore: '2', nonce: n },
+    signature: '0x' as Hex,
     httpStatus: 200,
-    status: 'enqueued',
+    status: 'unknown',
     ...over,
   };
 }
@@ -84,7 +86,7 @@ describe('Ledger durability', () => {
     vi.mocked(fsyncSync).mockClear();
     vi.mocked(renameSync).mockClear();
 
-    ledger.updateStatus(a.mandateDigest, 'settled');
+    ledger.updateStatus(a.nonce, 'settled');
     expect(renameSync).toHaveBeenCalledTimes(1);
     const [tmp, target] = vi.mocked(renameSync).mock.calls[0];
     expect(target).toBe(path);
@@ -109,11 +111,11 @@ describe('Ledger durability', () => {
       tmpContent = readFileSync(src, 'utf8'); // the temp file is complete when the rename is attempted
       throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
     });
-    expect(() => ledger.updateStatus(a.mandateDigest, 'settled')).toThrow(/EIO/);
+    expect(() => ledger.updateStatus(a.nonce, 'settled')).toThrow(/EIO/);
 
     expect(readFileSync(path, 'utf8')).toBe(before); // an in-place rewrite would already show 'settled'
     expect(tmpContent).toContain('"status":"settled"');
     expect(readdirSync(dir)).toEqual(['ledger.jsonl']);
-    expect(ledger.read().map((e) => e.status)).toEqual(['enqueued']);
+    expect(ledger.read().map((e) => e.status)).toEqual(['unknown']);
   });
 });

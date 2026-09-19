@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isAddress } from 'viem';
 import { readDeployment, type DeploymentRecord } from '@agentpay/contracts';
-import type { Address, Hex } from '@agentpay/core';
+import type { Address, AssetDomain, Hex } from '@agentpay/core';
 
 /** Thrown for usage / configuration problems (exit code 2). */
 export class ConfigError extends Error {
@@ -17,10 +17,8 @@ export class ConfigError extends Error {
 export interface CliFlags {
   key?: string;
   rpc?: string;
-  wallet?: string;
   token?: string;
   network?: string;
-  sp?: string;
   home?: string;
   deployment?: string;
 }
@@ -29,21 +27,21 @@ export interface CliFlags {
 export interface StoredConfig {
   key?: Hex;
   rpcUrl?: string;
-  walletContract?: Address;
   token?: Address;
+  /** EIP-712 domain of `token` (the payer signs under it). */
+  tokenDomain?: AssetDomain;
   network?: string;
-  trustedSps?: Address[];
   /** Deployment record name/path used to fill the blanks above. */
   deployment?: string;
 }
 
 export interface CliConfig {
   key?: Hex;
-  rpcUrl: string;
-  walletContract: Address;
+  /** Optional: `pay` signs offline; `balance` and `reconcile` need it. */
+  rpcUrl?: string;
   token: Address;
+  tokenDomain: AssetDomain;
   network: string;
-  trustedSps: Address[];
   home: string;
   configPath: string;
   mandatesPath: string;
@@ -89,14 +87,10 @@ function tryDeployment(name: string | undefined): DeploymentRecord | undefined {
   }
 }
 
-function parseSps(value: string | undefined): Address[] {
-  if (!value) return [];
-  const list = value
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  for (const a of list) if (!isAddress(a, { strict: false })) throw new ConfigError(`trusted SP is not an address: ${a}`);
-  return list as Address[];
+function domainFromEnv(env: NodeJS.ProcessEnv): AssetDomain | undefined {
+  return env.AGENTPAY_TOKEN_NAME && env.AGENTPAY_TOKEN_VERSION
+    ? { name: env.AGENTPAY_TOKEN_NAME, version: env.AGENTPAY_TOKEN_VERSION }
+    : undefined;
 }
 
 function requireAddress(name: string, value: string | undefined): Address | undefined {
@@ -117,20 +111,20 @@ export function resolveConfig(flags: CliFlags, env: NodeJS.ProcessEnv): CliConfi
     tryDeployment(flags.deployment ?? env.DEPLOYMENT ?? stored.deployment) ??
     (flags.deployment || env.DEPLOYMENT || stored.deployment ? undefined : tryDeployment('localhost'));
 
-  const walletContract = requireAddress('wallet', flags.wallet ?? env.AGENTPAY_WALLET ?? stored.walletContract ?? deployment?.wallet);
   const token = requireAddress('token', flags.token ?? env.AGENTPAY_TOKEN ?? stored.token ?? deployment?.usdc);
+  // The domain follows the token it was recorded with: an explicit token needs an explicit domain.
+  const tokenDomain =
+    domainFromEnv(env) ??
+    (flags.token || env.AGENTPAY_TOKEN ? undefined : stored.token ? stored.tokenDomain : deployment?.usdcDomain) ??
+    (token && deployment && token.toLowerCase() === deployment.usdc.toLowerCase() ? deployment.usdcDomain : undefined);
   const network = flags.network ?? env.AGENTPAY_NETWORK ?? stored.network ?? deployment?.network;
   const rpcUrl = flags.rpc ?? env.AGENTPAY_RPC ?? stored.rpcUrl ?? (network ? DEFAULT_RPC[network] : undefined);
   const key = (flags.key ?? env.AGENTPAY_KEY ?? stored.key) as Hex | undefined;
-  const trustedSps = flags.sp !== undefined || env.AGENTPAY_SP !== undefined
-    ? parseSps(flags.sp ?? env.AGENTPAY_SP)
-    : (stored.trustedSps ?? []);
 
   const missing = [
-    !walletContract && 'wallet (--wallet / AGENTPAY_WALLET)',
     !token && 'token (--token / AGENTPAY_TOKEN)',
+    token && !tokenDomain && 'token domain (AGENTPAY_TOKEN_NAME + AGENTPAY_TOKEN_VERSION, or a deployment record naming this token)',
     !network && 'network (--network / AGENTPAY_NETWORK, e.g. eip155:31337)',
-    !rpcUrl && 'rpc (--rpc / AGENTPAY_RPC)',
   ].filter(Boolean);
   if (missing.length > 0) {
     throw new ConfigError(
@@ -142,11 +136,10 @@ export function resolveConfig(flags: CliFlags, env: NodeJS.ProcessEnv): CliConfi
   }
   return {
     key,
-    rpcUrl: rpcUrl!,
-    walletContract: walletContract!,
+    rpcUrl,
     token: token!,
+    tokenDomain: tokenDomain!,
     network: network!,
-    trustedSps,
     home,
     configPath: configPathIn(home),
     mandatesPath: join(home, 'mandates.json'),

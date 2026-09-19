@@ -1,28 +1,31 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Address, Hex, Mandate, SpReceipt } from '@agentpay/core';
+import type { Address, Eip3009Authorization, Hex } from '@agentpay/core';
 import { appendDurableSync, replaceDurableSync } from './durable.js';
 
+/** Bumped when the row shape changes; rows without the current value are refused, not guessed at. */
+export const LEDGER_VERSION = 2 as const;
+
 /**
- * One payer-side record of a signed mandate that left the wallet: the full
- * mandate and signature (enough to audit or re-present), what the payee
- * answered, and the settlement processor's receipt when one verified.
+ * One payer-side record of a signed authorization that left the wallet: the
+ * authorization and signature (enough to audit or re-present), what the payee
+ * answered, and the settlement transaction when one is known.
  */
 export interface LedgerEntry {
+  v: typeof LEDGER_VERSION;
   kind: 'payment';
   /** Unix seconds, written by the wallet at record time. */
   timestamp: number;
   /**
-   * Unix seconds at which the wallet signed the mandate. Written with the
-   * in_flight line and never patched afterwards (`timestamp` moves with every
-   * status update). Absent on lines written before the field existed.
+   * Unix seconds at which the wallet signed. Written with the in_flight line
+   * and never patched afterwards (`timestamp` moves with every status update).
    */
   signedAt?: number;
   /** Full URL actually called. */
   url: string;
   /** `url.host` (hostname plus port when non-default). */
   host: string;
-  /** 'METHOD /path' offer identifier. */
+  /** 'METHOD /path' (what `report()` groups by). */
   resource: string;
   network: string;
   asset: Address;
@@ -30,26 +33,26 @@ export interface LedgerEntry {
   amount: string;
   payer: Address;
   payee: Address;
-  walletContract: Address;
   /** The intent mandate whose budget this payment was charged to. */
   intentMandateId: string;
-  mandate: Mandate;
-  payerSig: Hex;
-  mandateDigest: Hex;
-  /** Present when the payee returned one (valid or not; see `status`/`error`). */
-  spReceipt?: SpReceipt;
+  /** == authorization.nonce; the key `updateStatus()` patches by and what the chain remembers. */
+  nonce: Hex;
+  /** Unix seconds after which the authorization can no longer be settled. */
+  validBefore: number;
+  authorization: Eip3009Authorization;
+  signature: Hex;
   /** Status of the paid request (0 when the request itself failed). */
   httpStatus: number;
   status:
-    | 'enqueued' // 2xx with a verified SP receipt (or a missing one when receipts are not required)
-    | 'settled' // reconcile() saw the nonce consumed on-chain
+    | 'settled' // PAYMENT-RESPONSE said success, or reconcile() saw the nonce used on chain
     | 'rejected' // payee answered non-2xx; the signature is out in the world, budget stays reserved
-    | 'unknown' // 2xx but the receipt was missing/invalid, or the request errored after signing
-    | 'expired-unused'; // reconcile(): deadline passed without any on-chain use
-  settledTx?: Hex;
+    | 'unknown' // 2xx without a usable PAYMENT-RESPONSE, or the request errored after signing
+    | 'expired-unused'; // reconcile(): validBefore passed (chain time) without any on-chain use
+  /** Settlement transaction hash when known (from PAYMENT-RESPONSE or the AuthorizationUsed log). */
+  transaction?: Hex;
+  /** reconcile() confirmed this row's status against the chain. */
+  verified?: true;
   error?: string;
-  /** reconcile(): the SP receipted this mandate and let it expire unused (an SP default). */
-  spDefault?: true;
 }
 
 function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
@@ -60,6 +63,14 @@ function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
     throw new Error(`malformed ledger line ${lineNo} in ${path}: ${(err as Error).message}`);
   }
   if (typeof parsed !== 'object' || parsed === null) throw new Error(`malformed ledger line ${lineNo} in ${path}: not an object`);
+  const v = (parsed as { v?: unknown }).v;
+  if (v !== LEDGER_VERSION) {
+    const looksAep2 = 'mandateDigest' in (parsed as object);
+    throw new Error(
+      `ledger line ${lineNo} in ${path} is ${looksAep2 ? 'an AEP2-era row (v1)' : `version ${String(v)}`}, this wallet writes v${LEDGER_VERSION}: ` +
+        'archive the old ledger (and mandates.json) and start a fresh AGENTPAY_HOME; old rows are not converted',
+    );
+  }
   return parsed as LedgerEntry;
 }
 
@@ -75,7 +86,7 @@ function parseEntry(line: string, lineNo: number, path: string): LedgerEntry {
  * process is in the middle of. Any other malformed line throws.
  *
  * Every write is fsynced: since the budget counters are rebuilt from this file
- * on load, a line lost to a power cut is not a stale report but a mandate that
+ * on load, a line lost to a power cut is not a stale report but a payment that
  * no longer counts against its limit.
  */
 export class Ledger {
@@ -135,17 +146,17 @@ export class Ledger {
     return entries;
   }
 
-  /** Updates every entry with this mandate digest (status plus optional extra fields); rewrites the file atomically. */
-  updateStatus(digest: Hex, status: LedgerEntry['status'], patch?: Partial<LedgerEntry>): void {
+  /** Updates every entry with this nonce (status plus optional extra fields); rewrites the file atomically. */
+  updateStatus(nonce: Hex, status: LedgerEntry['status'], patch?: Partial<LedgerEntry>): void {
     const entries = this.read();
     let hit = false;
     for (let i = 0; i < entries.length; i++) {
-      if (entries[i].mandateDigest.toLowerCase() === digest.toLowerCase()) {
+      if (entries[i].nonce.toLowerCase() === nonce.toLowerCase()) {
         entries[i] = { ...entries[i], ...patch, status };
         hit = true;
       }
     }
-    if (!hit) throw new Error(`no ledger entry with mandateDigest ${digest} in ${this.path}`);
+    if (!hit) throw new Error(`no ledger entry with nonce ${nonce} in ${this.path}`);
     const tmp = `${this.path}.${process.pid}.${++this.writeSeq}.tmp`;
     replaceDurableSync(this.path, tmp, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
   }

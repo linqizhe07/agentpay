@@ -24,6 +24,16 @@ export interface AssetDomain {
   version: string;
 }
 
+/** The EIP-3009 authorization inside an x402 exact/EVM payload (decimal-string uints, 32-byte hex nonce). */
+export interface Eip3009Authorization {
+  from: Address;
+  to: Address;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: Hex;
+}
+
 /** Remediation hints for LLM agents, attached to policy denials and to the 402 body. */
 export interface PaymentModelContext {
   protocol: 'x402';

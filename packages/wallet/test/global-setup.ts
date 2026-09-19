@@ -1,5 +1,5 @@
 // vitest globalSetup for the chain suite: spawns a dedicated hardhat node on
-// port 8549, deploys MockUSDC + AEP2DebitWallet, mints USDC to the payer and
+// port 8549, deploys MockUSDC + Multicall3, mints USDC to the payer and
 // provide()s the addresses to chain.test.ts. Skipped entirely (nothing
 // spawned, nothing provided) when AGENTPAY_SKIP_CHAIN_TESTS=1; the offline
 // suite never touches a chain.
@@ -7,19 +7,16 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { GlobalSetupContext } from 'vitest/node';
-import { createPublicClient, createWalletClient, http, parseUnits, type Address } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, http, parseUnits, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
-import { MOCK_USDC_ABI, deployAll } from '@agentpay/contracts';
+import { MOCK_USDC_ABI, deployLocalFixture } from '@agentpay/contracts';
 
 export const CHAIN_RPC_URL = 'http://127.0.0.1:8549';
-export const CHAIN_WITHDRAW_DELAY = 600;
 
 export interface ChainFixture {
   rpcUrl: string;
   usdc: Address;
-  wallet: Address;
-  withdrawDelay: number;
 }
 
 declare module 'vitest' {
@@ -74,7 +71,8 @@ async function deployFixture(): Promise<ChainFixture> {
     account: privateKeyToAccount(DEPLOYER_KEY),
     pollingInterval: 50,
   });
-  const { usdc, wallet } = await deployAll(deployer, publicClient, { withdrawDelay: CHAIN_WITHDRAW_DELAY });
+  const testClient = createTestClient({ chain: hardhat, mode: 'hardhat', transport, pollingInterval: 50 });
+  const { usdc } = await deployLocalFixture(deployer, publicClient, testClient);
   const hash = await deployer.writeContract({
     address: usdc,
     abi: MOCK_USDC_ABI,
@@ -82,7 +80,7 @@ async function deployFixture(): Promise<ChainFixture> {
     args: [PAYER_ADDRESS, parseUnits('10000', 6)],
   });
   await publicClient.waitForTransactionReceipt({ hash });
-  return { rpcUrl: CHAIN_RPC_URL, usdc, wallet, withdrawDelay: CHAIN_WITHDRAW_DELAY };
+  return { rpcUrl: CHAIN_RPC_URL, usdc };
 }
 
 export async function setup({ provide }: GlobalSetupContext): Promise<void> {
