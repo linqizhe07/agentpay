@@ -1,31 +1,51 @@
-export { hostAllowed, hostCandidates, hostnameOf, matchHost, urlHostCandidates } from './hosts.js';
-export { LEDGER_VERSION, Ledger, type LedgerEntry } from './ledger.js';
+export { hostAllowed, hostCandidates, hostPatternWithin, hostnameOf, matchHost, urlHostCandidates } from './hosts.js';
 export {
+  LEDGER_VERSION,
+  Ledger,
+  MAX_CONTEXT_FIELD_LENGTH,
+  PAYMENT_CONTEXT_KEYS,
+  validatePaymentContext,
+  type LedgerEntry,
+  type PaymentContext,
+} from './ledger.js';
+export {
+  HOLDER_RE,
   INTENT_DOMAIN,
   INTENT_MANDATE_TYPES,
   IntentMandateStore,
   MAX_VALID_FOR_SECONDS,
+  STORE_VERSION,
   buildIntentMandate,
   intentMandateHash,
   intentMandateTypedData,
+  isHolder,
+  parseHolder,
   recoverIntentMandateSigner,
   signIntentMandate,
+  type Holder,
   type IntentMandate,
   type IntentMandateInput,
   type IntentMandateStruct,
 } from './mandate-store.js';
 export {
   AUTO_SELECT_PRECEDENCE,
+  PRINCIPAL,
+  chainRejection,
+  holderSetFor,
   mandateRejection,
   pickRejection,
   remainingOf,
+  type Caller,
   type PolicyQuery,
   type Rejection,
 } from './policy.js';
 export {
   LEDGER_STATUS_HEADER,
+  LOCK_FILE,
+  MAX_DELEGATED_VALIDITY_SECONDS,
   MandateWallet,
   NONCE_HEADER,
+  lockedBy,
   type EligibilityResult,
   type FetchOptions,
   type MandateWalletCaps,

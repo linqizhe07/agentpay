@@ -19,6 +19,57 @@ export interface Rejection {
   detail: Record<string, unknown>;
 }
 
+/**
+ * Who is paying, as the host process knows it (never as the model claims).
+ * Decides which mandates are in reach at all: the holder set below is a
+ * filter applied before any policy runs, so a caller is never told about a
+ * budget it does not hold.
+ */
+export interface Caller {
+  kind: 'principal' | 'child' | 'session' | 'bot';
+  /** The session id (child, session) or bot id (bot). */
+  id?: string;
+  /** A child's parent session: it may spend what that session delegated to its children. */
+  parentSession?: string;
+}
+
+export const PRINCIPAL: Caller = { kind: 'principal' };
+
+const CALLER_KINDS: readonly Caller['kind'][] = ['principal', 'child', 'session', 'bot'];
+
+/**
+ * The holder strings whose mandates this caller may spend; '' stands for "no
+ * holder" (the principal's own budgets). Principal: unheld mandates only;
+ * child: what its parent delegated to its children plus what was delegated to
+ * it by session id; session: by session id; bot: by bot id. An id that is
+ * missing simply contributes nothing, so a caller the host could not identify
+ * ends up with an empty set and a `no_held_mandate` refusal.
+ */
+export function holderSetFor(caller: Caller): Set<string> {
+  if (typeof caller !== 'object' || caller === null || !CALLER_KINDS.includes(caller.kind)) {
+    throw new TypeError(`caller.kind must be one of ${CALLER_KINDS.join(', ')}`);
+  }
+  const id = typeof caller.id === 'string' && caller.id.length > 0 ? caller.id : undefined;
+  const parent = typeof caller.parentSession === 'string' && caller.parentSession.length > 0 ? caller.parentSession : undefined;
+  const set = new Set<string>();
+  switch (caller.kind) {
+    case 'principal':
+      set.add('');
+      break;
+    case 'child':
+      if (parent !== undefined) set.add(`children:${parent}`);
+      if (id !== undefined) set.add(`session:${id}`);
+      break;
+    case 'session':
+      if (id !== undefined) set.add(`session:${id}`);
+      break;
+    case 'bot':
+      if (id !== undefined) set.add(`bot:${id}`);
+      break;
+  }
+  return set;
+}
+
 export function remainingOf(m: IntentMandate): bigint {
   return BigInt(m.limitAmount) - BigInt(m.spentAmount) - BigInt(m.pendingSpentAmount);
 }
@@ -74,6 +125,23 @@ export function mandateRejection(m: IntentMandate, q: PolicyQuery): Rejection | 
         detail: { mandateId: m.id, maxCallsPerMinute: m.maxCallsPerMinute, attemptsInWindow: n },
       };
     }
+  }
+  return undefined;
+}
+
+/**
+ * The full mandateRejection over a delegation chain (the charged mandate
+ * first, then its ancestors up to the root): a payment must pass every
+ * member's policy, because a child's spend counts against all of them. An
+ * ancestor's failure keeps its own reason code (so precedence and hints work
+ * unchanged) and names the ancestor in `detail.ancestorId`. Redundant for a
+ * validly delegated child — its terms are within its parent's — and what
+ * protects the parent's approved terms from a hand-edited child otherwise.
+ */
+export function chainRejection(chain: readonly IntentMandate[], q: PolicyQuery): Rejection | undefined {
+  for (let i = 0; i < chain.length; i++) {
+    const r = mandateRejection(chain[i], q);
+    if (r) return i === 0 ? r : { reason: r.reason, detail: { ...r.detail, mandateId: chain[0].id, ancestorId: chain[i].id } };
   }
   return undefined;
 }

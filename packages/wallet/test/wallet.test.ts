@@ -15,6 +15,8 @@ import {
   Ledger,
   MandateWallet,
   NONCE_HEADER,
+  STORE_VERSION,
+  hostPatternWithin,
   intentMandateHash,
   matchHost,
   recoverIntentMandateSigner,
@@ -165,6 +167,36 @@ describe('matchHost', () => {
   });
 });
 
+describe('hostPatternWithin (a delegated allowlist may narrow, never widen)', () => {
+  it('parent * admits anything; wildcards admit concrete hosts and deeper wildcards; exact parents admit no wildcard', () => {
+    expect(hostPatternWithin(['*'], 'anything.at.all')).toBe(true);
+    expect(hostPatternWithin(['*'], '*.example.com')).toBe(true);
+    expect(hostPatternWithin(['*'], '*')).toBe(true);
+    expect(hostPatternWithin(['*.example.com'], 'a.example.com')).toBe(true);
+    expect(hostPatternWithin(['*.example.com'], 'a.b.example.com')).toBe(true);
+    expect(hostPatternWithin(['*.example.com'], '*.b.example.com')).toBe(true);
+    expect(hostPatternWithin(['*.example.com'], '*.example.com')).toBe(true);
+    expect(hostPatternWithin(['*.example.com'], 'example.com')).toBe(false); // the apex is not under the wildcard
+    expect(hostPatternWithin(['*.example.com'], '*')).toBe(false);
+    expect(hostPatternWithin(['*.example.com'], '*.example.org')).toBe(false);
+    expect(hostPatternWithin(['*.example.com'], '*.example.com:8080')).toBe(false); // a subset the rule cannot see: refused
+    expect(hostPatternWithin(['api.example.com'], 'api.example.com')).toBe(true);
+    expect(hostPatternWithin(['API.example.com'], 'api.Example.com')).toBe(true);
+    expect(hostPatternWithin(['api.example.com'], '*.example.com')).toBe(false);
+    expect(hostPatternWithin(['api.example.com'], '*')).toBe(false);
+    expect(hostPatternWithin(['api.example.com'], 'other.example.com')).toBe(false);
+    // 'h:port' under 'h': at pay time the parent already admits every port of h
+    expect(hostPatternWithin(['api.example.com'], 'api.example.com:8080')).toBe(true);
+    expect(hostPatternWithin(['api.example.com:8080'], 'api.example.com')).toBe(false);
+    expect(hostPatternWithin(['api.example.com:8080'], 'api.example.com:8080')).toBe(true);
+    expect(hostPatternWithin(['api.example.com:8080'], 'api.example.com:9090')).toBe(false);
+    expect(hostPatternWithin(['*.example.com'], 'a.example.com:8080')).toBe(true);
+    expect(hostPatternWithin(['a.example.com', '*.example.org'], 'b.example.org')).toBe(true);
+    expect(hostPatternWithin([], 'a.example.com')).toBe(false);
+    expect(hostPatternWithin(['*'], '')).toBe(false);
+  });
+});
+
 describe('Ledger', () => {
   it('appends, reads back, and patches status by nonce', () => {
     const ledger = new Ledger(join(root, 'ledger-unit', 'ledger.jsonl'));
@@ -293,13 +325,50 @@ describe('IntentMandateStore', () => {
     expect(new IntentMandateStore().list()).toEqual([]); // memory store
   });
 
-  it('refuses a store file written by another version', () => {
+  it('writes version 2 and refuses a v1 (or version-less) store: its mandates were signed under the old domain', () => {
     const path = join(root, 'store-version', 'mandates.json');
     mkdirSync(dirname(path), { recursive: true });
+    new IntentMandateStore(path).save();
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ version: STORE_VERSION, mandates: [] });
+    expect(STORE_VERSION).toBe(2);
     writeFileSync(path, JSON.stringify({ version: 2, mandates: [] }), 'utf8');
-    expect(() => new IntentMandateStore(path)).toThrow(/unsupported mandate store version 2/);
-    writeFileSync(path, JSON.stringify({ mandates: [] }), 'utf8'); // no version at all is still version 1
     expect(new IntentMandateStore(path).list()).toEqual([]);
+
+    writeFileSync(path, JSON.stringify({ version: 1, mandates: [] }), 'utf8');
+    expect(() => new IntentMandateStore(path)).toThrow(/version 1, which predates the v2 intent domain \(agentpay\/2\).*archive it.*fresh AGENTPAY_HOME.*recreate/);
+    writeFileSync(path, JSON.stringify({ mandates: [] }), 'utf8'); // no version at all was version 1
+    expect(() => new IntentMandateStore(path)).toThrow(/version 1 \(no version field\), which predates the v2 intent domain/);
+    // and the wallet refuses to start on it
+    expect(() => makeWallet({ mandatesPath: path })).toThrow(/predates the v2 intent domain/);
+    writeFileSync(path, JSON.stringify({ version: 3, mandates: [] }), 'utf8');
+    expect(() => new IntentMandateStore(path)).toThrow(/unsupported mandate store version 3 .*\(expected 2\)/);
+  });
+
+  it('a v2 file round-trips parentId and holder', () => {
+    const path = join(root, 'store-v2-roundtrip', 'mandates.json');
+    const store = new IntentMandateStore(path);
+    const child = {
+      id: 'im_child',
+      naturalLanguage: 'x',
+      currency: 'USDC' as const,
+      limitAmount: '10',
+      hostAllowlist: ['a'],
+      validFrom: 1,
+      validUntil: 2,
+      spentAmount: '0',
+      pendingSpentAmount: '0',
+      status: 'signed' as const,
+      isEnabled: true,
+      mandateHash: '0x' as Hex,
+      signature: '0x' as Hex,
+      createdAt: 1,
+      parentId: 'im_root',
+      holder: 'session:s1',
+    };
+    store.upsert(child);
+    store.save();
+    expect(new IntentMandateStore(path).get('im_child')).toEqual(child);
+    expect(JSON.parse(readFileSync(path, 'utf8')).version).toBe(2);
   });
 });
 
@@ -330,9 +399,12 @@ describe('intent mandate lifecycle', () => {
           validUntil: BigInt(draft.validUntil),
           hostAllowlist: '127.0.0.1',
           category: 'data',
+          parentId: '', // a root: both delegation fields are signed as empty
+          holder: '',
         },
       }),
     );
+    expect(INTENT_DOMAIN).toEqual({ name: 'agentpay', version: '2' });
     expect(wallet.eligibleMandates({ host: '127.0.0.1', amount: 1000n })).toEqual({
       eligible: [],
       rejected: [{ id: draft.id, reason: 'mandate_required', detail: expect.anything() }],

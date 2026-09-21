@@ -18,6 +18,33 @@ export interface IntentMandateInput {
   /** Per-payment cap, same formats as limitAmount. */
   perCallMax?: string;
   maxCallsPerMinute?: number;
+  /**
+   * Only through MandateWallet.delegateIntentMandate (which validates both
+   * against the parent); createIntentMandate refuses input carrying them.
+   */
+  parentId?: string;
+  holder?: string;
+}
+
+/**
+ * Who may spend a mandate. Absent = the principal's alone. The vocabulary is
+ * the host's to resolve (it derives the caller from facts it owns, never from
+ * the model's arguments); the wallet only filters on it:
+ *   - 'session:<id>'           one session
+ *   - 'children:<sessionId>'   the direct child sessions of that session
+ *   - 'bot:<id>'               a bot preset (kept for hosts that want it)
+ */
+export const HOLDER_RE = /^(session|children|bot):(\S+)$/;
+
+export type Holder = { kind: 'session' | 'children' | 'bot'; id: string };
+
+export function parseHolder(holder: string): Holder | undefined {
+  const m = HOLDER_RE.exec(holder);
+  return m ? { kind: m[1] as Holder['kind'], id: m[2] } : undefined;
+}
+
+export function isHolder(holder: unknown): holder is string {
+  return typeof holder === 'string' && HOLDER_RE.test(holder);
 }
 
 /**
@@ -27,12 +54,20 @@ export interface IntentMandateInput {
  * signed mandates whose fate is not known yet. Both are persisted so every
  * process sharing the store sees the same remaining budget, but the ledger is
  * the source of truth: MandateWallet recomputes them from it on construction.
+ *
+ * A mandate with a `parentId` is a sub-budget delegated from its parent: its
+ * spend counts against itself and every ancestor (a cap, not a reservation —
+ * siblings compete for the parent's remaining budget), and the gate applies
+ * every ancestor's full policy on each payment. `holder` names who may spend
+ * it (see HOLDER_RE); both are in the signed struct.
  */
 export interface IntentMandate {
   /** 'im_…' */
   id: string;
   naturalLanguage: string;
   category?: string;
+  parentId?: string;
+  holder?: string;
   currency: 'USDC';
   /** Atomic units, decimal string. */
   limitAmount: string;
@@ -57,8 +92,13 @@ export interface IntentMandate {
 
 export const MAX_VALID_FOR_SECONDS = 31_536_000; // one year
 
-/** Off-chain credential: nothing verifies it on-chain, so no verifyingContract. */
-export const INTENT_DOMAIN = { name: 'AEP2AgentWallet', version: '1' } as const;
+/**
+ * Off-chain credential: nothing verifies it on-chain, so no verifyingContract.
+ * Version 2 added parentId and holder to the struct; a v1 signature cannot
+ * verify under it, and re-signing old mandates with the payer key would
+ * manufacture approvals, so a v1 store is refused (see IntentMandateStore).
+ */
+export const INTENT_DOMAIN = { name: 'agentpay', version: '2' } as const;
 
 export const INTENT_MANDATE_TYPES = {
   IntentMandate: [
@@ -69,12 +109,14 @@ export const INTENT_MANDATE_TYPES = {
     { name: 'validUntil', type: 'uint64' },
     { name: 'hostAllowlist', type: 'string' },
     { name: 'category', type: 'string' },
+    { name: 'parentId', type: 'string' },
+    { name: 'holder', type: 'string' },
   ],
 } as const;
 
 export type IntentMandateStruct = Pick<
   IntentMandate,
-  'id' | 'naturalLanguage' | 'limitAmount' | 'validFrom' | 'validUntil' | 'hostAllowlist' | 'category'
+  'id' | 'naturalLanguage' | 'limitAmount' | 'validFrom' | 'validUntil' | 'hostAllowlist' | 'category' | 'parentId' | 'holder'
 >;
 
 export function intentMandateTypedData(chainId: number, m: IntentMandateStruct) {
@@ -90,6 +132,8 @@ export function intentMandateTypedData(chainId: number, m: IntentMandateStruct) 
       validUntil: BigInt(m.validUntil),
       hostAllowlist: m.hostAllowlist.join(','),
       category: m.category ?? '',
+      parentId: m.parentId ?? '',
+      holder: m.holder ?? '',
     },
   };
 }
@@ -148,6 +192,12 @@ export function buildIntentMandate(
   if (input.category !== undefined && typeof input.category !== 'string') {
     throw new TypeError('category must be a string');
   }
+  if (input.parentId !== undefined && (typeof input.parentId !== 'string' || input.parentId.trim().length === 0)) {
+    throw new TypeError('parentId must be a non-empty string');
+  }
+  if (input.holder !== undefined && !isHolder(input.holder)) {
+    throw new TypeError("holder must be 'session:<id>', 'children:<sessionId>' or 'bot:<id>'");
+  }
   const limit = parseAmount(input.limitAmount);
   const perCall = input.perCallMax !== undefined ? parseAmount(input.perCallMax) : undefined;
   if (perCall !== undefined && perCall > limit) {
@@ -157,6 +207,8 @@ export function buildIntentMandate(
     id: newId('im'),
     naturalLanguage: input.naturalLanguage.trim(),
     ...(input.category !== undefined ? { category: input.category } : {}),
+    ...(input.parentId !== undefined ? { parentId: input.parentId.trim() } : {}),
+    ...(input.holder !== undefined ? { holder: input.holder } : {}),
     currency: 'USDC',
     limitAmount: limit.toString(),
     ...(perCall !== undefined ? { perCallMax: perCall.toString() } : {}),
@@ -175,8 +227,11 @@ export function buildIntentMandate(
   return draft;
 }
 
+/** Bumped with INTENT_DOMAIN: a store's mandates are signed under the domain its version names. */
+export const STORE_VERSION = 2 as const;
+
 interface StoreFile {
-  version: 1;
+  version: typeof STORE_VERSION;
   mandates: IntentMandate[];
 }
 
@@ -194,12 +249,22 @@ export class IntentMandateStore {
     if (path && existsSync(path)) {
       const raw = readFileSync(path, 'utf8');
       if (raw.trim().length > 0) {
-        const parsed = JSON.parse(raw) as Partial<StoreFile>;
-        if (parsed.version !== undefined && parsed.version !== 1) {
-          throw new Error(`unsupported mandate store version ${JSON.stringify(parsed.version)} at ${path} (expected 1)`);
+        const parsed = JSON.parse(raw) as { version?: unknown; mandates?: unknown };
+        if (parsed.version === undefined || parsed.version === 1) {
+          // Its mandates were signed under the v1 domain (AEP2AgentWallet/1,
+          // no parentId/holder); nothing here can verify them, and re-signing
+          // with the payer key would manufacture approvals nobody gave.
+          throw new Error(
+            `mandate store ${path} is version ${parsed.version === undefined ? '1 (no version field)' : '1'}, which predates the v${STORE_VERSION} ` +
+              `intent domain (${INTENT_DOMAIN.name}/${INTENT_DOMAIN.version}): archive it (and the ledger) and start a fresh AGENTPAY_HOME; ` +
+              'old mandates are not converted, recreate them',
+          );
+        }
+        if (parsed.version !== STORE_VERSION) {
+          throw new Error(`unsupported mandate store version ${JSON.stringify(parsed.version)} at ${path} (expected ${STORE_VERSION})`);
         }
         if (!Array.isArray(parsed.mandates)) throw new Error(`malformed mandate store at ${path}`);
-        for (const m of parsed.mandates) this.byId.set(m.id, m);
+        for (const m of parsed.mandates as IntentMandate[]) this.byId.set(m.id, m);
       }
     }
   }
@@ -221,7 +286,7 @@ export class IntentMandateStore {
     if (!this.path) return;
     const dir = dirname(this.path);
     if (dir && dir !== '.') mkdirSync(dir, { recursive: true });
-    const file: StoreFile = { version: 1, mandates: this.list() };
+    const file: StoreFile = { version: STORE_VERSION, mandates: this.list() };
     const tmp = `${this.path}.${process.pid}.${++this.saveSeq}.tmp`;
     replaceDurableSync(this.path, tmp, `${JSON.stringify(file, null, 2)}\n`);
   }

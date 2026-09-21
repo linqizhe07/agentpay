@@ -3,8 +3,56 @@ import { dirname } from 'node:path';
 import type { Address, Eip3009Authorization, Hex } from '@agentpay/core';
 import { appendDurableSync, replaceDurableSync } from './durable.js';
 
-/** Bumped when the row shape changes; rows without the current value are refused, not guessed at. */
+/**
+ * Bumped when the row shape changes; rows without the current value are
+ * refused, not guessed at. Still 2 after `context` was added: the field is
+ * optional, parseEntry tolerates its absence, and every consumer of a row
+ * treats a missing context as an unattributed payment, so v2 rows written
+ * before it read exactly as they did.
+ */
 export const LEDGER_VERSION = 2 as const;
+
+/**
+ * Where a payment came from, as the host process knows it (a workspace, a
+ * session, a tool call); the wallet stores it on the row and groups report()
+ * by it, and never derives policy from it. String fields only, each at most
+ * MAX_CONTEXT_FIELD_LENGTH chars: every status update rewrites the whole
+ * ledger file, so a row must stay small.
+ */
+export interface PaymentContext {
+  channel?: string;
+  channelName?: string;
+  session?: string;
+  parentSession?: string;
+  origin?: string;
+  callId?: string;
+  label?: string;
+}
+
+export const PAYMENT_CONTEXT_KEYS = ['channel', 'channelName', 'session', 'parentSession', 'origin', 'callId', 'label'] as const;
+export const MAX_CONTEXT_FIELD_LENGTH = 256;
+
+/**
+ * The context as the wallet will store it: only the known keys, each a string
+ * of bounded length (TypeError otherwise); undefined when nothing is set.
+ */
+export function validatePaymentContext(context: unknown): PaymentContext | undefined {
+  if (context === undefined) return undefined;
+  if (typeof context !== 'object' || context === null || Array.isArray(context)) {
+    throw new TypeError('context must be an object of string fields');
+  }
+  const out: PaymentContext = {};
+  for (const [key, value] of Object.entries(context as Record<string, unknown>)) {
+    if (value === undefined) continue;
+    if (!(PAYMENT_CONTEXT_KEYS as readonly string[]).includes(key)) {
+      throw new TypeError(`context.${key} is not a known field (${PAYMENT_CONTEXT_KEYS.join(', ')})`);
+    }
+    if (typeof value !== 'string') throw new TypeError(`context.${key} must be a string`);
+    if (value.length > MAX_CONTEXT_FIELD_LENGTH) throw new TypeError(`context.${key} exceeds ${MAX_CONTEXT_FIELD_LENGTH} chars`);
+    out[key as keyof PaymentContext] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /**
  * One payer-side record of a signed authorization that left the wallet: the
@@ -33,8 +81,10 @@ export interface LedgerEntry {
   amount: string;
   payer: Address;
   payee: Address;
-  /** The intent mandate whose budget this payment was charged to. */
+  /** The intent mandate whose budget this payment was charged to (its ancestors were charged too). */
   intentMandateId: string;
+  /** Attribution the caller supplied (FetchOptions.context); absent on CLI payments without one. */
+  context?: PaymentContext;
   /** == authorization.nonce; the key `updateStatus()` patches by and what the chain remembers. */
   nonce: Hex;
   /** Unix seconds after which the authorization can no longer be settled. */

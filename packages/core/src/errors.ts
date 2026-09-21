@@ -16,6 +16,8 @@ export type PolicyReason =
   | 'mandate_insufficient_budget'
   | 'mandate_expired'
   | 'mandate_disabled'
+  | 'no_held_mandate'
+  | 'holder_mismatch'
   | 'host_not_allowed'
   | 'per_call_max'
   | 'rate_limited'
@@ -23,7 +25,12 @@ export type PolicyReason =
   | 'timeout_too_long'
   | (string & {});
 
-/** A spend-policy rule blocked an action before any signature was produced. */
+/**
+ * A spend-policy rule blocked an action before any signature was produced.
+ * `detail.mandateId` names the mandate the rule was applied to; when that rule
+ * failed on an ancestor of the mandate being charged (a delegated budget
+ * counts against its whole chain), `detail.ancestorId` names the ancestor.
+ */
 export class PolicyViolation extends Error {
   constructor(
     public reason: PolicyReason,

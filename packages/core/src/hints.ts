@@ -8,6 +8,8 @@ export const POLICY_REASONS = [
   'mandate_insufficient_budget',
   'mandate_expired',
   'mandate_disabled',
+  'no_held_mandate',
+  'holder_mismatch',
   'host_not_allowed',
   'per_call_max',
   'rate_limited',
@@ -56,6 +58,10 @@ const fmt = (detail: Record<string, unknown> | undefined, key: string, fallback 
 const RETRY_FRESH = 'Just call `agentpay pay` again: every attempt signs a fresh, single-use authorization.';
 const PAYEE_MISCONFIGURED = 'Do not retry: the service is misconfigured. Report the reason to the user.';
 
+/** `detail.ancestorId` set: the rule failed on an ancestor of the charged mandate, so the remedy is the ancestor's. */
+const onAncestor = (d: Record<string, unknown> | undefined, summary: string): string =>
+  d?.ancestorId === undefined ? summary : `${summary} (on ancestor mandate ${String(d.ancestorId)} of the delegated budget)`;
+
 const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
   // ---- payer-side policy ----
   mandate_required: () => ({
@@ -77,7 +83,7 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
     commands: ['agentpay mandate-list', 'agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>'],
   }),
   mandate_insufficient_budget: (d) => ({
-    summary: `Remaining budget ${fmt(d, 'remaining')} is below the price ${fmt(d, 'amount')} (atomic units).`,
+    summary: onAncestor(d, `Remaining budget ${fmt(d, 'remaining')} is below the price ${fmt(d, 'amount')} (atomic units).`),
     remediation: [
       'Do not retry: the same call will be refused until the budget changes.',
       'Ask the user to approve a larger or additional intent mandate.',
@@ -85,26 +91,44 @@ const HINTS: Record<string, (d?: Record<string, unknown>) => Hint> = {
     commands: ['agentpay mandate-status <id>', 'agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>'],
   }),
   mandate_expired: (d) => ({
-    summary: `Mandate ${fmt(d, 'mandateId', '')} is outside its validity window.`.replace('  ', ' '),
+    summary: onAncestor(d, `Mandate ${fmt(d, 'mandateId', '')} is outside its validity window.`.replace('  ', ' ')),
     remediation: ['Request a fresh intent mandate.'],
     commands: ['agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>'],
   }),
   mandate_disabled: (d) => ({
-    summary: `Mandate ${fmt(d, 'mandateId')} has been disabled by the user.`,
+    summary: onAncestor(d, `Mandate ${fmt(d, 'mandateId')} has been disabled by the user.`),
     remediation: ['Ask the user to re-enable it (`agentpay mandate-enable <id>`) or use another mandate.'],
     commands: ['agentpay mandate-list'],
   }),
+  no_held_mandate: (d) => ({
+    summary: `No budget is held for this caller (${fmt(d, 'caller')}), so nothing can pay host ${fmt(d, 'host')}.`,
+    remediation: [
+      'A principal requests a budget from the host it runs in: create a draft with `agentpay mandate-request` and hand the id to the user to approve.',
+      'A child session cannot request one; ask the parent session to delegate a sub-budget (`agentpay mandate-delegate`) held for you.',
+    ],
+    commands: [
+      'agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>',
+      'agentpay mandate-delegate --parent <id> --holder <holder> --limit <usd>',
+    ],
+  }),
+  holder_mismatch: (d) => ({
+    summary: `Mandate ${fmt(d, 'mandateId')} is held by ${fmt(d, 'holder', 'the principal')}, not by this caller (${fmt(d, 'caller')}).`,
+    remediation: [
+      'Omit the mandate id so the wallet picks among the budgets held for you, or ask the parent session to delegate one to you.',
+    ],
+    commands: ['agentpay mandate-list', 'agentpay mandate-delegate --parent <id> --holder <holder> --limit <usd>'],
+  }),
   host_not_allowed: (d) => ({
-    summary: `Host ${fmt(d, 'host')} is not in the mandate's allowlist.`,
+    summary: onAncestor(d, `Host ${fmt(d, 'host')} is not in the mandate's allowlist.`),
     remediation: ['Use a mandate that allows this host, or ask the user for one that does.'],
     commands: ['agentpay mandate-list', 'agentpay mandate-request --purpose "<why>" --limit <usd> --hosts <host>'],
   }),
   per_call_max: (d) => ({
-    summary: `Price ${fmt(d, 'amount')} exceeds the per-call cap ${fmt(d, 'perCallMax')} (atomic units).`,
+    summary: onAncestor(d, `Price ${fmt(d, 'amount')} exceeds the per-call cap ${fmt(d, 'perCallMax')} (atomic units).`),
     remediation: ['Do not retry the same call; ask the user to raise the per-call cap if the price is legitimate.'],
   }),
   rate_limited: (d) => ({
-    summary: `Too many payment attempts in the last minute (limit ${fmt(d, 'maxCallsPerMinute')}).`,
+    summary: onAncestor(d, `Too many payment attempts in the last minute (limit ${fmt(d, 'maxCallsPerMinute')}).`),
     remediation: ['Wait a minute before retrying, or batch the work into fewer paid calls.'],
   }),
   unsupported_offer: () => ({
