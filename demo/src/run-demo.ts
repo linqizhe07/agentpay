@@ -311,7 +311,7 @@ async function scenarioConcurrency(env: Env): Promise<void> {
 }
 
 async function scenarioLatency(env: Env): Promise<void> {
-  heading('Scenario 8: per-call latency on this machine (hardhat automine; expect ~2-4 s on Base)');
+  heading('Scenario 8: per-call latency on this machine (hardhat automine; measured ~1 s on Base Sepolia, see README)');
   const samples: number[] = [];
   for (let i = 0; i < 10; i++) {
     const started = performance.now();

@@ -4,6 +4,7 @@ artifacts/
 cache/
 *.log
 .env
+.local/
 .DS_Store
 demo/out/
 packages/contracts/deployments/localhost.json

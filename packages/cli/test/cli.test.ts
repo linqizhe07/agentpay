@@ -1,5 +1,5 @@
-import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
+import { LOCK_FILE } from '@agentpay/wallet';
 import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from '../../wallet/test/stub-payee.js';
 import { run } from '../src/cli.js';
 
@@ -252,5 +253,199 @@ describe('agentpay CLI', () => {
     const second = await execFileAsync('npx', ['tsx', 'src/cli.ts', 'mandate-list'], { cwd: CLI_DIR, env });
     expect(rebuildLines(second.stderr)).toEqual([]);
     expect((JSON.parse(second.stdout) as Out).ok).toBe(true);
+  });
+});
+
+/**
+ * The agent surface: sub-budgets, payment attribution, callers and the lock.
+ * A fresh home so the budgets stay deterministic: a parent of $0.004 pays
+ * four $0.001 calls, and every assertion below counts them.
+ */
+describe('agentpay CLI: delegation, attribution, callers, lock', () => {
+  let home: string;
+  let env: NodeJS.ProcessEnv;
+  let payee: StubPayee;
+  let parentId: string;
+  let childId: string;
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), 'agentpay-cli-agent-'));
+    env = baseEnv(home);
+    payee = await startStubPayee(stubOptions());
+    // Two days of validity, so the 24 h delegation cap (not the parent's end) is the bound the test hits.
+    const parent = await run(['mandate-create', '--purpose', 'parent budget', '--limit', '$0.004', '--hosts', '127.0.0.1', '--valid-for', '172800'], env);
+    expect(parent.code).toBe(0);
+    parentId = (parent.output as Out).mandate.id;
+  });
+
+  afterAll(async () => {
+    await payee.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('mandate-delegate refuses a child outside the parent (exit 1, the bound in the message)', async () => {
+    const base = ['mandate-delegate', '--parent', parentId, '--holder', 'children:sess-1'];
+    const overLimit = await run([...base, '--limit', '$0.005'], env);
+    expect(overLimit.code).toBe(1);
+    expect((overLimit.output as Out).message).toMatch(/limitAmount 5000 exceeds the parent's effective remaining budget 4000/);
+
+    const tooLong = await run([...base, '--limit', '$0.001', '--valid-for', '90000'], env);
+    expect(tooLong.code).toBe(1);
+    expect((tooLong.output as Out).message).toMatch(/validForSeconds 90000 exceeds 86400/);
+
+    const outsideHosts = await run([...base, '--limit', '$0.001', '--hosts', 'example.com'], env);
+    expect(outsideHosts.code).toBe(1);
+    expect((outsideHosts.output as Out).message).toMatch(/"example.com" is not within the parent's allowlist \[127\.0\.0\.1\]/);
+
+    // a holder outside the vocabulary is a usage error, before anything is signed
+    const badHolder = await run(['mandate-delegate', '--parent', parentId, '--holder', 'nobody', '--limit', '$0.001'], env);
+    expect(badHolder.code).toBe(2);
+    expect((badHolder.output as Out).error).toBe('usage');
+    expect((await run(['mandate-list'], env)).output).toMatchObject({ count: 1 });
+  });
+
+  it('mandate-delegate creates a signed child; list and status show parentId/holder and the effective remaining', async () => {
+    const r = await run(['mandate-delegate', '--parent', parentId, '--holder', 'children:sess-1', '--limit', '$0.003'], env);
+    expect(r.code).toBe(0);
+    const child = (r.output as Out).mandate;
+    childId = child.id;
+    expect(child.status).toBe('signed');
+    expect(child.signature).toMatch(/^0x/);
+    expect(child.parentId).toBe(parentId);
+    expect(child.holder).toBe('children:sess-1');
+    expect(child.hostAllowlist).toEqual(['127.0.0.1']); // inherited
+    expect(child.naturalLanguage).toBe('parent budget (delegated)');
+    expect(child.limitAmount).toBe('3000');
+    expect(child.remainingAmount).toBe('3000');
+
+    const list = await run(['mandate-list'], env);
+    expect((list.output as Out).count).toBe(2);
+    const listed = (list.output as Out).mandates.find((m: Out) => m.id === childId);
+    expect(listed).toMatchObject({ parentId, holder: 'children:sess-1', remainingAmount: '3000' });
+    const root = (list.output as Out).mandates.find((m: Out) => m.id === parentId);
+    expect(root.parentId).toBeUndefined();
+    expect(root.holder).toBeUndefined();
+
+    const status = await run(['mandate-status', childId], env);
+    expect(status.code).toBe(0);
+    expect((status.output as Out).mandate).toMatchObject({ parentId, holder: 'children:sess-1' });
+    expect((status.output as Out).payments).toBe(0);
+  });
+
+  it('pay --context k=v lands on the ledger row and in the report by channel / session', async () => {
+    const r = await run(['pay', `${payee.url}/predict`, '--context', 'channel=slack', '--context', 'session=sess-1', '--context', 'label=quote 1'], env);
+    expect(r.code).toBe(0);
+    const out = r.output as Out;
+    expect(out.paid).toBe(true);
+    expect(out.payment.intentMandateId).toBe(parentId); // the principal pays from the unheld root
+    expect(out.payment.context).toEqual({ channel: 'slack', session: 'sess-1', label: 'quote 1' });
+
+    const ledger = await run(['ledger'], env);
+    expect((ledger.output as Out).entries[0].context).toEqual({ channel: 'slack', session: 'sess-1', label: 'quote 1' });
+
+    const report = (await run(['report'], env)).output as Out;
+    expect(report.report.byChannel).toEqual({ slack: '1000' });
+    expect(report.report.bySession).toEqual({ 'sess-1': '1000' });
+    expect(report.report.byChannelUsd.slack).toBe('$0.001000');
+
+    // malformed pairs and unknown keys are usage errors, before any request
+    const served = payee.served;
+    const noEq = await run(['pay', `${payee.url}/predict`, '--context', 'channel'], env);
+    expect(noEq.code).toBe(2);
+    expect((noEq.output as Out).message).toMatch(/--context expects k=v/);
+    const unknownKey = await run(['pay', `${payee.url}/predict`, '--context', 'colour=blue'], env);
+    expect(unknownKey.code).toBe(2);
+    expect((unknownKey.output as Out).message).toMatch(/context\.colour is not a known field/);
+    expect(payee.served).toBe(served);
+  });
+
+  it('AGENTPAY_CONTEXT supplies defaults; a --context flag overrides the same key', async () => {
+    const withEnv = { ...env, AGENTPAY_CONTEXT: 'channel=env-channel, label=from env' };
+    const r = await run(['pay', `${payee.url}/predict`, '--context', 'channel=flag-channel'], withEnv);
+    expect(r.code).toBe(0);
+    expect((r.output as Out).payment.context).toEqual({ channel: 'flag-channel', label: 'from env' });
+    const report = (await run(['report'], env)).output as Out;
+    expect(report.report.byChannel).toEqual({ slack: '1000', 'flag-channel': '1000' });
+    expect(report.report.byChannel['env-channel']).toBeUndefined();
+
+    // The parent has now spent 2 of its 4 calls: the child's own counter is untouched
+    // but its EFFECTIVE remaining is the parent's 2000, which is what list/status print.
+    const status = (await run(['mandate-status', childId], env)).output as Out;
+    expect(status.mandate.spentAmount).toBe('0');
+    expect(status.mandate.limitAmount).toBe('3000');
+    expect(status.mandate.remainingAmount).toBe('2000');
+  });
+
+  it('--caller child:<id>@<parent> pays from a children:<parent> mandate; the principal cannot', async () => {
+    const r = await run(['pay', `${payee.url}/predict`, '--caller', 'child:kid-1@sess-1'], env);
+    expect(r.code).toBe(0);
+    expect((r.output as Out).paid).toBe(true);
+    expect((r.output as Out).payment.intentMandateId).toBe(childId);
+    // the child's spend is accounted on the whole chain: its own row and the parent
+    const status = (await run(['mandate-status', childId], env)).output as Out;
+    expect(status.payments).toBe(1);
+    expect(status.mandate.spentAmount).toBe('1000');
+    expect(status.mandate.remainingAmount).toBe('1000'); // min(own 2000, parent 1000)
+    expect((await run(['mandate-status', parentId], env)).output).toMatchObject({ mandate: { spentAmount: '3000', remainingAmount: '1000' } });
+
+    const served = payee.served;
+    // an explicit --mandate the principal does not hold
+    const mismatch = await run(['pay', `${payee.url}/predict`, '--mandate', childId], env);
+    expect(mismatch.code).toBe(1);
+    expect(mismatch.output).toMatchObject({ ok: false, error: 'holder_mismatch', detail: { mandateId: childId, holder: 'children:sess-1', caller: 'principal' } });
+    expect((mismatch.output as Out).payment_model_context.reason).toBe('holder_mismatch');
+    // a caller nothing was delegated to
+    const unheld = await run(['pay', `${payee.url}/predict`, '--caller', 'session:stranger'], env);
+    expect(unheld.code).toBe(1);
+    expect(unheld.output).toMatchObject({ ok: false, error: 'no_held_mandate', detail: { caller: 'session stranger' } });
+    expect((unheld.output as Out).payment_model_context.remediation.length).toBeGreaterThan(0);
+    // a child of another session sees neither budget
+    const otherChild = await run(['pay', `${payee.url}/predict`, '--caller', 'child:kid-9@sess-2'], env);
+    expect(otherChild.code).toBe(1);
+    expect((otherChild.output as Out).error).toBe('no_held_mandate');
+    // and the grammar is enforced before anything is sent
+    const badCaller = await run(['pay', `${payee.url}/predict`, '--caller', 'child:kid-1'], env);
+    expect(badCaller.code).toBe(2);
+    expect((badCaller.output as Out).message).toMatch(/child:<id>@<parentSession>/);
+    expect(payee.served).toBe(served);
+  });
+
+  it('a locked home refuses pay and mandate-* with error "locked" naming the pid; reads still answer', async () => {
+    const lockPath = join(home, LOCK_FILE);
+    writeFileSync(lockPath, `${process.pid}\n`, 'utf8'); // our own pid: alive for as long as the test runs
+    try {
+      const served = payee.served;
+      const paid = await run(['pay', `${payee.url}/predict`], env);
+      expect(paid.code).toBe(2);
+      expect(paid.output).toMatchObject({ ok: false, error: 'locked', pid: process.pid, home });
+      expect((paid.output as Out).message).toContain(`locked by pid ${process.pid}`);
+      expect(payee.served).toBe(served);
+
+      const created = await run(['mandate-create', '--purpose', 'while locked', '--limit', '1', '--hosts', '127.0.0.1'], env);
+      expect(created.code).toBe(2);
+      expect((created.output as Out).error).toBe('locked');
+      expect((await run(['mandate-delegate', '--parent', parentId, '--holder', 'bot:b', '--limit', '$0.001'], env)).output).toMatchObject({ error: 'locked' });
+
+      const list = await run(['mandate-list'], env);
+      expect(list.code).toBe(0);
+      expect((list.output as Out).count).toBe(2);
+      expect((await run(['mandate-status', childId], env)).code).toBe(0);
+      expect((await run(['report'], env)).code).toBe(0);
+      expect(existsSync(lockPath)).toBe(true); // a live lock is never removed by a reader
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+  });
+
+  it('a stale lock (dead pid) is ignored and cleaned up', async () => {
+    const lockPath = join(home, LOCK_FILE);
+    // A process that has already exited: its pid is dead (reuse within the test is not a realistic race).
+    const dead = spawnSync('true').pid;
+    expect(dead).toBeGreaterThan(0);
+    writeFileSync(lockPath, `${dead}\n`, 'utf8');
+    const created = await run(['mandate-create', '--purpose', 'after a crash', '--limit', '1', '--hosts', '127.0.0.1'], env);
+    expect(created.code).toBe(0);
+    expect((created.output as Out).mandate.status).toBe('signed');
+    expect(existsSync(lockPath)).toBe(false);
   });
 });

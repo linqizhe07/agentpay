@@ -91,6 +91,18 @@ Exactly x402 V2 (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`, ba
 
 A human approves an **intent mandate** once — purpose, limit, validity, host allowlist, optional per-call cap and rate — and the agent pays within it with no further prompts. The wallet keeps `spentAmount` and `pendingSpentAmount` per mandate (persisted in `mandates.json`), reserves synchronously *before* signing so concurrent calls cannot overshoot, moves a reservation to spend when the payee reports a settlement, and `reconcile()` settles the rest against the chain. The counters are a cache of the ledger and are rebuilt from it on load, so a crash between the two files heals itself.
 
+The mandate is an EIP-712 credential under the domain `agentpay` / `2`; `parentId` and `holder` are part of the signed struct (empty strings when absent), so a store written under the v1 domain is refused on load with a message that says to archive it and start a fresh home rather than silently re-signed.
+
+**Holders.** A mandate without a `holder` belongs to the *principal* — the top-level agent the user talks to. A delegated one names who may spend it: `session:<id>`, `children:<sessionId>` (every child of that session) or `bot:<id>`. `fetch()` takes a `caller` (`{ kind: 'principal' | 'child' | 'session' | 'bot', id?, parentSession? }`) and first narrows the store to the budgets held for that caller — a child sees what its parent delegated to its children plus what was delegated to it by id — then runs the policy gate over that set only. An empty set is `no_held_mandate` (the principal should request a budget; a child should ask its parent for one); an explicit mandate id outside the set is `holder_mismatch`. The point is that a sub-task never pays from its parent's budget by accident, and the ledger says which session spent what.
+
+**Delegation.** `delegateIntentMandate(parentId, input, holder)` is the only way a child mandate comes to exist. It needs no human step because it can only be narrower than what the human already approved: `limit ≤ effectiveRemaining(parent)`, `validUntil ≤ min(parent.validUntil, now + 24 h)`, every host pattern equal to a parent pattern or a concrete host one of them matches, `perCallMax ≤ the parent's`, the category inherited; it returns the mandate already `signed`. Accounting is **pass-through**: a payment on a child reserves on, and later books to, every mandate on its chain up to the root, so a parent's remaining shrinks with its children's spend and delegating itself reserves nothing (`totals` in `report()` sum the roots only, so nothing is counted twice). What a mandate can actually spend is its **effective remaining** — the smallest remaining on its chain — and that is what `remaining()`, `mandate-list`, `mandate-status` and `report` print; the raw counters stay on the rows. The gate checks every member of the chain (hosts, per-call cap, budget, rate, enabled, window) and a refusal caused by an ancestor carries the usual reason plus `detail.ancestorId`.
+
+**Context.** `fetch()` also takes a `context` — `channel`, `channelName`, `session`, `parentSession`, `origin`, `callId`, `label`, strings of at most 256 chars — copied onto the ledger row, and `report()` adds `byChannel` / `bySession` beside `byHost` / `byResource`. The CLI takes it as `--context k=v` (repeatable) with `AGENTPAY_CONTEXT=k=v,…` as environment defaults, and the caller as `--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>`.
+
+**Host pre-flight.** `requireMandateHost: true` makes `fetch()` refuse `host_not_allowed` before the first request unless a mandate in the caller's set names the host — for a host that embeds the wallet in a tool table, so an agent cannot use a free-looking `offer` round trip to probe hosts it may never pay.
+
+**The lock.** One wallet process per home: `new MandateWallet({ lock: true })` writes `<home>/wallet.lock` (its pid, refreshed on every save) and releases it in `dispose()`; a second process finds a live pid and refuses to start. A long-lived wallet loads `mandates.json` once and rewrites it from memory, so a CLI write beside it would be silently lost — the CLI's mutating commands (`pay`, `mandate-*`, `reconcile`) therefore refuse a locked home with `error: 'locked'` and the pid, while `mandate-list`, `mandate-status`, `report`, `ledger`, `address`, `balance` and `offer` still read it. `lockedBy(home)` answers the question for anyone else.
+
 ## CLI
 
 ```bash
@@ -98,13 +110,18 @@ AGENTPAY_HOME=$TMPDIR/ap npm run cli -- init --from-deployment localhost --key 0
 npm run cli -- address                     # where to send USDC (no ETH needed)
 npm run cli -- balance
 npm run cli -- mandate-create --purpose "market data" --limit 1 --hosts 127.0.0.1
+npm run cli -- mandate-delegate --parent <id> --holder children:sess-1 --limit 0.25 --valid-for 3600   # a signed sub-budget inside it
+npm run cli -- mandate-list                # every mandate with parentId/holder and its EFFECTIVE remaining
 npm run cli -- offer http://127.0.0.1:4021/predict
 npm run cli -- pay   http://127.0.0.1:4021/predict     # signs offline; the payee settles
-npm run cli -- report
+npm run cli -- pay   http://127.0.0.1:4021/predict --caller child:task-7@sess-1 --context session=task-7 --context label="backtest"
+npm run cli -- report                      # totals, byHost, byResource, byChannel, bySession, denials
 npm run cli -- reconcile
 ```
 
-Agents use `mandate-request` (creates a draft) and stop until the human runs `mandate-approve <id>`; see [packages/cli/SKILL.md](packages/cli/SKILL.md) for the decision flow an LLM agent should follow, including "run `reconcile` before paying again when an outcome was `unknown`". Config precedence: flags > `AGENTPAY_*` env > `$AGENTPAY_HOME/config.json` > `contracts/deployments/<name>.json` (which supplies the token and its EIP-712 domain).
+`mandate-delegate --parent <id> --holder <session:<id> | children:<sessionId> | bot:<id>> --limit <usd> [--valid-for s --hosts a,b --per-call usd --category c --purpose "…"]` signs the sub-budget in one step (it can only be narrower than the parent; ≤ 24 h). `offer` and `pay` take `--context k=v` (repeatable; keys `channel channelName session parentSession origin callId label`) and `--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>` (default `principal`: budgets without a holder); `AGENTPAY_CONTEXT=k=v,k=v` supplies context defaults a flag overrides. `pay`, `mandate-*` and `reconcile` refuse a home whose `wallet.lock` names a live process (exit 2, `error: 'locked'`).
+
+Agents use `mandate-request` (creates a draft) and stop until the human runs `mandate-approve <id>`; see [packages/cli/SKILL.md](packages/cli/SKILL.md) for the decision flow an LLM agent should follow, including delegating to child tasks, what `no_held_mandate` / `holder_mismatch` mean, and "run `reconcile` before paying again when an outcome was `unknown`". Config precedence: flags > `AGENTPAY_*` env > `$AGENTPAY_HOME/config.json` > `contracts/deployments/<name>.json` (which supplies the token and its EIP-712 domain).
 
 ## Running the pieces yourself (local)
 
@@ -129,7 +146,13 @@ npm run cli -- address        # send Base Sepolia test USDC here; no ETH needed
 npm run cli -- pay http://127.0.0.1:4021/predict
 ```
 
-To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_PK=… PAYEES=0x… npm run facilitator` (the key needs Base Sepolia ETH). Expect roughly 2–4 s per paid call on Base (one block plus receipt polling), against ~50 ms on an automining hardhat node.
+To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_PK=… PAYEES=0x… npm run facilitator` (the key needs Base Sepolia ETH).
+
+Measured on 2026-09-19 against the hosted facilitator (settler `0xd407…f1bf`) and the public `sepolia.base.org` RPC, with a fresh payer holding faucet USDC and no ETH:
+
+- **Sequential paid calls settle in about a second**: 10 in a row, all `200` + `settled`, min 675 ms · median 934 ms · avg 1.0 s · max 1.8 s per call (402 → sign → verify → handler → settle → receipt), against ~50 ms on an automining hardhat node. First settlement: [`0xe833…c9d`](https://sepolia.basescan.org/tx/0xe833ba2f4468695dc6f3c50cd4c154e13e5f114164eb3910d517b9adf2b84c9d), a `transferWithAuthorization` sent by the facilitator, `Transfer(payer → payee, 1000)`, 102 828 gas paid by the facilitator.
+- **Parallel calls through the hosted facilitator fail more often than not**: 5 concurrent calls from one payee → 2 settled, 3 answered `402 invalid_exact_evm_transaction_failed` (`replacement transaction underpriced`: the hosted settler reused its own account nonce; once `over rate limit` from the public RPC). Reproduced twice. For those three the handler had already run (settle-after-handler), the payer was not charged, the wallet recorded `rejected`, and `reconcile` released the reservations as `expired-unused` once chain time passed `validBefore`. The self-hosted facilitator serializes its sends (demo scenario 7: 20/20 concurrent), so against the hosted one keep an agent's paid calls sequential, or run your own.
+- `balance`, `reconcile` and `report` agree with the chain to the unit: 16 settlements = $0.025 spent, every settled row confirmed through `authorizationState`, every refused one released.
 
 ## Differences from the x402 reference setup (deliberate)
 
@@ -146,5 +169,5 @@ To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_
 - **A refused or lost call keeps its budget reserved until the authorization expires** (`maxTimeoutSeconds`, capped by the wallet); the payee could still settle it in that window. `reconcile()` releases it by chain time.
 - **A facilitator that broadcast but timed out** answers `settlement_pending` with the transaction; the payer was probably charged and the payee already answered 402. The wallet records `unknown` and `reconcile()` corrects it. The pending-settlement dedupe is per facilitator process.
 - **Self-hosted facilitator on a real network:** the key needs ETH, and there is no replacement logic for a stuck or underpriced transaction (the nonce manager will queue behind it; restart to resync).
-- **One wallet process per `AGENTPAY_HOME`** (unchanged): two processes sharing `mandates.json` can overshoot a limit.
+- **One wallet process per `AGENTPAY_HOME`**: two processes sharing `mandates.json` can overshoot a limit. The lock (`wallet.lock`, above) turns that into a refusal when the long-lived process asks for it; a process that does not take the lock is not protected, and a stale lock from a pid that died is simply ignored.
 - On-chain payments are public; USDC can be frozen by its issuer; MockUSDC has an open mint and exists only for local chains.
