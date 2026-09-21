@@ -14,6 +14,10 @@ export type StubMode =
   | { kind: 'ok' }
   | { kind: 'invalid'; reason: string }
   | { kind: 'settle-fail'; reason: string }
+  /** The first settle of each authorization fails with `reason`; later ones fail with `then` when given, else settle honestly. */
+  | { kind: 'settle-fail-once'; reason: string; then?: string }
+  /** /settle takes `ms` (verify is instant): shows whether settles overlap. */
+  | { kind: 'slow-settle'; ms: number }
   | { kind: 'settle-pending' }
   | { kind: 'settle-down' }
   | { kind: 'http-500' }
@@ -33,6 +37,8 @@ export interface StubFacilitator {
   mode: StubMode;
   calls: StubCall[];
   settled: Set<string>;
+  /** Highest number of /settle requests in flight at once since the last reset (assign 0 to reset). */
+  maxConcurrentSettles: number;
   close(): Promise<void>;
 }
 
@@ -56,6 +62,9 @@ export async function startStubFacilitator(opts: { network: string; address: `0x
   const state: { mode: StubMode } = { mode: { kind: 'ok' } };
   const calls: StubCall[] = [];
   const settled = new Set<string>();
+  const failedOnce = new Set<string>();
+  let inFlightSettles = 0;
+  const concurrency = { max: 0 };
 
   async function honestVerify(body: StubCall['body']): Promise<{ isValid: boolean; invalidReason?: string; payer?: string }> {
     const req = body.paymentRequirements;
@@ -116,6 +125,17 @@ export async function startStubFacilitator(opts: { network: string; address: `0x
       const network = body.paymentRequirements.network;
       const a = (body.paymentPayload.payload as { authorization: Record<string, string> }).authorization;
       const key = `${a.from}:${a.nonce}`.toLowerCase();
+      if (route === 'settle') {
+        inFlightSettles++;
+        concurrency.max = Math.max(concurrency.max, inFlightSettles);
+        let done = false; // 'finish' and 'close' both fire on a normal answer; count the settle down once
+        const leave = () => {
+          if (!done) inFlightSettles--;
+          done = true;
+        };
+        res.once('finish', leave);
+        res.once('close', leave);
+      }
       switch (mode.kind) {
         case 'down':
           req.socket.destroy();
@@ -135,6 +155,9 @@ export async function startStubFacilitator(opts: { network: string; address: `0x
         case 'slow':
           await new Promise((r) => setTimeout(r, mode.ms));
           break;
+        case 'slow-settle':
+          if (route === 'settle') await new Promise((r) => setTimeout(r, mode.ms));
+          break;
         default:
           break;
       }
@@ -145,6 +168,13 @@ export async function startStubFacilitator(opts: { network: string; address: `0x
       // settle
       if (mode.kind === 'invalid') return json(200, { success: false, errorReason: mode.reason, transaction: '', network, payer: a.from });
       if (mode.kind === 'settle-fail') return json(200, { success: false, errorReason: mode.reason, transaction: '', network, payer: a.from });
+      if (mode.kind === 'settle-fail-once') {
+        if (!failedOnce.has(key)) {
+          failedOnce.add(key);
+          return json(200, { success: false, errorReason: mode.reason, transaction: '', network, payer: a.from });
+        }
+        if (mode.then) return json(200, { success: false, errorReason: mode.then, transaction: '', network, payer: a.from });
+      }
       if (mode.kind === 'settle-pending') return json(200, { success: false, errorReason: 'settlement_pending', transaction: fakeTx(), network, payer: a.from });
       const v = await honestVerify(body);
       if (!v.isValid) return json(200, { success: false, errorReason: v.invalidReason, transaction: '', network, payer: a.from });
@@ -165,6 +195,12 @@ export async function startStubFacilitator(opts: { network: string; address: `0x
     },
     calls,
     settled,
+    get maxConcurrentSettles() {
+      return concurrency.max;
+    },
+    set maxConcurrentSettles(n: number) {
+      concurrency.max = n;
+    },
     close: () =>
       new Promise<void>((r) => {
         server.closeAllConnections();

@@ -1,6 +1,7 @@
 import type { RequestHandler } from 'express';
 import type { x402ResourceServer, SettleResultContext } from '@x402/core/server';
 import type { Address, AssetDomain, SettleResponse } from '@agentpay/core';
+import type { ChainReader } from './chain-reader.js';
 
 /**
  * In-flight guard keyed by `${from}:${nonce}`: one authorization buys one
@@ -51,6 +52,28 @@ export interface PaywallOptions {
   onSettled?: (result: SettleResponse, ctx: SettleResultContext) => void;
   /** Log sink for settlement failures and cancellations; default console.error. */
   log?: (line: string) => void;
+  /**
+   * Send /settle calls to this facilitator one at a time (process-wide, keyed
+   * by facilitator URL). Default true: a hosted facilitator settles from one
+   * account and its nonce manager loses when two of our settles race. Verify
+   * calls are not serialised. Set false only for a facilitator known to
+   * handle concurrent settles (throughput then follows the chain, not us).
+   */
+  serializeSettle?: boolean;
+  /**
+   * JSON-RPC URL of `network`; builds the ChainReader that gates the one
+   * settle retry (see `chainReader`). Ignored when `chainReader` is given.
+   */
+  rpcUrl?: string;
+  /**
+   * Answers whether an authorization is already used on chain. When set, a
+   * settle refused with invalid_exact_evm_transaction_failed while the nonce
+   * is still unused is retried once after `settleRetryDelayMs`. Without it
+   * (no rpcUrl either) settlement failures are final.
+   */
+  chainReader?: ChainReader;
+  /** Pause before the one settle retry (lets the facilitator's nonce manager and the node catch up). Default 1500. */
+  settleRetryDelayMs?: number;
 }
 
 export interface ChargeOptions {

@@ -9,6 +9,8 @@
  *   FACILITATOR_URL   default http://127.0.0.1:3001, or the deployment record's facilitatorUrl
  *                     (https://x402.org/facilitator for base-sepolia)
  *   FACILITATOR_AUTH_TOKEN  optional bearer token for a self-hosted facilitator
+ *   PAYEE_RPC_URL     JSON-RPC of NETWORK, read (never written) to decide the one settle retry;
+ *                     default per network below (hardhat :8545, sepolia.base.org)
  *   NETWORK, USDC_ADDRESS, USDC_DOMAIN_NAME, USDC_DOMAIN_VERSION
  *                     default: packages/contracts/deployments/${DEPLOYMENT ?? 'localhost'}.json
  */
@@ -19,6 +21,11 @@ import { createPaywall } from '../src/index.js';
 
 // Hardhat public dev account #2 ("payee") — local development only.
 const HARDHAT_PAYEE = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC' as Address;
+// Public read endpoints per network: the paywall only ever calls authorizationState.
+const DEFAULT_RPC: Record<string, string> = {
+  'eip155:31337': 'http://127.0.0.1:8545',
+  'eip155:84532': 'https://sepolia.base.org',
+};
 
 function fail(message: string): never {
   console.error(`payee: ${message}`);
@@ -54,6 +61,8 @@ if (!network || !usdcAddress || !assetDomain || !facilitatorUrl) {
 const asset = asAddress(usdcAddress, 'USDC_ADDRESS');
 const isLocal = network === 'eip155:31337';
 const payTo = asAddress(env.PAYEE_ADDRESS ?? (isLocal ? HARDHAT_PAYEE : undefined), 'PAYEE_ADDRESS');
+const rpcUrl = env.PAYEE_RPC_URL ?? DEFAULT_RPC[network!];
+if (!rpcUrl) console.warn(`payee: no PAYEE_RPC_URL for ${network}; a failed settlement will not be retried`);
 
 // ---- facilitator: warn early when it does not serve this network ----
 try {
@@ -72,6 +81,7 @@ const paywall = createPaywall({
   asset,
   assetDomain: assetDomain!,
   payTo,
+  rpcUrl,
   onSettled: (result, ctx) => {
     const req = (ctx.transportContext as { request?: { method?: string; path?: string } } | undefined)?.request;
     console.log(`[payee] settled ${req?.method ?? '?'} ${req?.path ?? '?'} payer=${result.payer} tx=${result.transaction}`);
@@ -111,6 +121,6 @@ app.post('/analyze', paywall.charge('$0.01', { description: 'text analysis', mim
 
 app.listen(port, () => {
   console.log(`[payee] listening on http://127.0.0.1:${port}  network=${network} payTo=${payTo}`);
-  console.log(`[payee] asset=${asset} (${assetDomain!.name} v${assetDomain!.version}) facilitator=${facilitatorUrl}`);
+  console.log(`[payee] asset=${asset} (${assetDomain!.name} v${assetDomain!.version}) facilitator=${facilitatorUrl} rpc=${rpcUrl ?? '(none)'}`);
   console.log(`[payee] GET /health (free) | GET /predict (${formatUsdc(1_000n)}) | POST /analyze (${formatUsdc(10_000n)}, body {text})`);
 });
