@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -391,6 +391,26 @@ describe('wallet_pay save_to', () => {
     expect((small.output as Out).body).toBeUndefined();
   });
 
+  it('reports a write that fails after the payment on the envelope, never as a throw naming the host', async () => {
+    if (process.getuid?.() === 0) return; // root ignores modes: the EACCES below cannot be produced
+    const ro = join(saveRoot, 'ro');
+    mkdirSync(ro, { recursive: true });
+    chmodSync(ro, 0o500);
+    try {
+      const r = await call('wallet_pay', { url: `${payee.url}/predict`, save_to: 'ro/x.json' }, meta());
+      expect(r.code).toBe(0);
+      const out = r.output as Out;
+      expect(out.paid).toBe(true); // the money moved; the receipt says so
+      expect(out.saved).toMatchObject({ error: 'write_failed', path: 'ro/x.json', code: 'EACCES' });
+      expect(out.preview).toBeTypeOf('string');
+      expect(out.body).toBeUndefined();
+      expect(JSON.stringify(out)).not.toContain(saveRoot); // the failure names no host directory
+      expect(existsSync(join(ro, 'x.json'))).toBe(false);
+    } finally {
+      chmodSync(ro, 0o700);
+    }
+  });
+
   it('refuses every unsafe path and a missing saveRoot with code 2 before any request is sent', async () => {
     const before = payee.requests;
     const refused = async (args: Out, m: Out, why: RegExp) => {
@@ -408,6 +428,7 @@ describe('wallet_pay save_to', () => {
     await refused({ save_to: 'x'.repeat(201) }, meta(), /longer than 200/);
     await refused({ save_to: 'a\0b.json' }, meta(), /NUL/);
     await refused({ save_to: 'massive/AAPL/2016.json' }, meta(), /exists; pass overwrite/);
+    await refused({ save_to: 'massive/AAPL/2016.json/inner.json' }, meta(), /existing file/);
     await refused({ save_to: 'x.json', overwrite: 'yes' }, meta(), /overwrite must be a boolean/);
     await refused({ save_to: 'x.json' }, { caller: PRINCIPAL }, /save directory.*host gave this session none/);
     expect(payee.requests).toBe(before);

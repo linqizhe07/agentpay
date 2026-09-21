@@ -12,7 +12,7 @@
  * the payment.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, posix, relative, resolve, sep, win32 } from 'node:path';
 import { ConfigError } from './config.js';
 
@@ -53,6 +53,17 @@ function realIntent(abs: string): string {
   return tail.length === 0 ? realpathSync(existing) : resolve(realpathSync(existing), ...tail);
 }
 
+/** The nearest existing ancestor of `abs` (itself included), or undefined when nothing on the way exists. */
+function nearestExisting(abs: string): string | undefined {
+  let cur = abs;
+  while (!existsSync(cur)) {
+    const parent = dirname(cur);
+    if (parent === cur) return undefined;
+    cur = parent;
+  }
+  return cur;
+}
+
 /**
  * Where `rel` lands under `saveRoot`, or a ConfigError naming the rule it
  * broke. `rel` is the caller's relative path (`massive/AAPL/2016.json`);
@@ -79,6 +90,12 @@ export function resolveSavePath(saveRoot: string, rel: string, overwrite = false
   if (!within(root, path) || path === root) refuse('it leaves the save directory');
   // Symlink escape: a directory on the way may be a link to somewhere outside the root.
   if (!within(realIntent(root), realIntent(path))) refuse('it resolves (through a symlink) outside the save directory');
+  // An ancestor that exists as a FILE (`massive/x.json/inner.json` after
+  // `massive/x.json` was bought) would make the write's mkdir throw after the
+  // payment, and a thrown fs error names the host's absolute root. Refuse
+  // here, before anything is paid, in the caller's own words.
+  const ancestor = nearestExisting(dirname(path));
+  if (ancestor !== undefined && !statSync(ancestor).isDirectory()) refuse('a directory on the way is an existing file');
   if (existsSync(path) && !overwrite) refuse('the file exists; pass overwrite to replace it');
   return { path, rel: normalised };
 }

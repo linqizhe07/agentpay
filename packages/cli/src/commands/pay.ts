@@ -145,8 +145,16 @@ function saveResult(target: ResolvedSavePath, bytes: Uint8Array, contentType: st
   if (bytes.byteLength > MAX_SAVE_BYTES) {
     return { saved: { error: 'body_too_large', path: target.rel, bytes: bytes.byteLength, limit: MAX_SAVE_BYTES, content_type: contentType }, ...preview };
   }
-  const written = writeSaved(target.path, bytes);
-  return { saved: { path: target.rel, bytes: written.bytes, sha256: written.sha256, content_type: contentType }, ...preview };
+  // The payment already happened: a write that fails (EACCES, ENOSPC, a race
+  // on the path) is reported on the envelope, never thrown - a throw would
+  // lose the receipt and print the host's absolute path to the caller.
+  try {
+    const written = writeSaved(target.path, bytes);
+    return { saved: { path: target.rel, bytes: written.bytes, sha256: written.sha256, content_type: contentType }, ...preview };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? 'unknown';
+    return { saved: { error: 'write_failed', path: target.rel, code, bytes: bytes.byteLength, content_type: contentType }, ...preview };
+  }
 }
 
 /**

@@ -76,6 +76,14 @@ describe('save: resolveSavePath / writeSaved', () => {
     expect(resolveSavePath(root, 'have.json', true).path).toBe(join(root, 'have.json'));
   });
 
+  it('refuses a path whose ancestor is an existing file, before anything is paid', () => {
+    writeFileSync(join(root, 'bought.json'), '{}');
+    // `bought.json/inner.json`: mkdir would throw EEXIST after the payment and name the host's root.
+    expect(() => resolveSavePath(root, 'bought.json/inner.json')).toThrow(/directory on the way is an existing file/);
+    expect(() => resolveSavePath(root, 'bought.json/deeper/inner.json')).toThrow(/directory on the way is an existing file/);
+    expect(resolveSavePath(root, 'fresh/inner.json').path).toBe(join(root, 'fresh', 'inner.json'));
+  });
+
   it('writeSaved creates the directories, writes atomically and returns bytes + sha256', () => {
     const body = Buffer.from('{"hello":"world"}');
     const target = resolve(root, 'deep', 'er', 'file.json');
