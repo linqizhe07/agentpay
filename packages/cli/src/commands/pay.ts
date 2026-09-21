@@ -14,6 +14,7 @@ import { callerLabel, contextFromPairs, parseCaller } from '../attribution.js';
 import { ConfigError } from '../config.js';
 import { ok, type CliResult } from '../output.js';
 import type { CommandContext } from '../context.js';
+import { MAX_SAVE_BYTES, previewOf, resolveSavePath, writeSaved, type ResolvedSavePath } from '../save.js';
 
 export interface PayFlags {
   method?: string;
@@ -25,6 +26,12 @@ export interface PayFlags {
   context?: string[] | PaymentContext;
   /** `--caller` (see CALLER_GRAMMAR), or the Caller a host process derived itself. */
   caller?: string | Caller;
+  /** `--save <rel>`: write a 2xx body under `saveRoot` and answer with a preview instead of the body. */
+  save?: string;
+  /** The directory `save` is relative to: `process.cwd()` for the CLI, whatever the host process decides for a tool call. */
+  saveRoot?: string;
+  /** `--overwrite`: let `save` replace an existing file. */
+  overwrite?: boolean;
 }
 
 function urlArg(positional: string[], what: string): string {
@@ -125,13 +132,40 @@ export async function offer(ctx: CommandContext, positional: string[], flags: Pa
   });
 }
 
-/** Pays for a URL through the wallet (402 -> authorization -> retry) and prints the result. */
+/**
+ * The `saved` / `preview` fields of a `--save` result. Over MAX_SAVE_BYTES
+ * nothing is written and `saved.error` says so: the payment has already
+ * happened, so this is a reported outcome, not a thrown one.
+ */
+function saveResult(target: ResolvedSavePath, bytes: Uint8Array, contentType: string | null): Record<string, unknown> {
+  const preview = previewOf(bytes);
+  if (bytes.byteLength > MAX_SAVE_BYTES) {
+    return { saved: { error: 'body_too_large', path: target.path, bytes: bytes.byteLength, limit: MAX_SAVE_BYTES, content_type: contentType }, ...preview };
+  }
+  const written = writeSaved(target.path, bytes);
+  return { saved: { path: target.path, bytes: written.bytes, sha256: written.sha256, content_type: contentType }, ...preview };
+}
+
+/**
+ * Pays for a URL through the wallet (402 -> authorization -> retry) and
+ * prints the result. With `save`, a 2xx body goes to the file and the
+ * envelope carries `saved` + a ≤1 KB `preview` and no `body`; a refusal
+ * (non-2xx) is reported exactly as without `save`. The path is checked
+ * before the request so a bad one costs nothing.
+ */
 export async function pay(ctx: CommandContext, positional: string[], flags: PayFlags): Promise<CliResult> {
   const url = urlArg(positional, 'pay');
+  let target: ResolvedSavePath | undefined;
+  if (flags.save !== undefined) {
+    if (!flags.saveRoot) throw new ConfigError('--save needs a save directory (saveRoot)');
+    target = resolveSavePath(flags.saveRoot, flags.save, flags.overwrite === true);
+  }
   const wallet = ctx.wallet();
   const fetchOpts = { mandateId: flags.mandate, prepay: flags.prepay === true, ...attributionFrom(flags) };
   const res = await wallet.fetch(url, initFrom(flags), fetchOpts);
-  const body = await bodyOf(res);
+  const saving = target !== undefined && res.status >= 200 && res.status < 300;
+  const rawBody = saving ? new Uint8Array(await res.arrayBuffer()) : undefined;
+  const body = saving ? undefined : await bodyOf(res);
   const nonce = res.headers.get(NONCE_HEADER);
   const entry = nonce ? ctx.ledger().read().find((e) => e.nonce.toLowerCase() === nonce.toLowerCase()) : undefined;
   let settlement: SettleResponse | undefined;
@@ -152,7 +186,7 @@ export async function pay(ctx: CommandContext, positional: string[], flags: PayF
   return ok({
     status: res.status,
     paid,
-    body,
+    ...(rawBody && target ? saveResult(target, rawBody, res.headers.get('content-type')) : { body }),
     payment: entry
       ? {
           transaction: entry.transaction ?? settlement?.transaction ?? null,

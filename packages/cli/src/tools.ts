@@ -78,6 +78,8 @@ export const WALLET_TOOLS: readonly WalletTool[] = [
       'Fetch a paid HTTP resource, paying the x402 price from one of YOUR budgets (a human-approved budget naming the host, ' +
       'with enough remaining, within its per-call cap). Spends real money: use it when the user wants the resource, not to browse. ' +
       'Returns the response body (truncated at 8 KB, body_truncated:true), what was charged (amount_usd) and what the budget has left (remaining_usd). ' +
+      'For data you will process rather than read (anything over a few KB: bars, files, exports) pass save_to: the whole body is written ' +
+      'to that file under the host\'s save directory and the result carries saved {path, bytes, sha256, content_type} plus a 1 KB preview instead of the body. ' +
       'On refusal, payment_model_context says why and what to do (e.g. wallet_budget_request); do not retry the same call blindly.',
     parameters: obj({
       url: { type: 'string', format: 'uri', description: 'The resource URL' },
@@ -85,6 +87,16 @@ export const WALLET_TOOLS: readonly WalletTool[] = [
       body: { type: 'string', description: 'Request body (JSON text); sets content-type application/json unless a header overrides it' },
       headers: { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra request headers' },
       mandate_id: { type: 'string', description: 'Charge this budget instead of auto-selecting one you hold' },
+      save_to: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 200,
+        description:
+          'Relative file path (e.g. "massive/AAPL/2016-01-01_2016-12-31.json") to save the response body to, inside the host\'s save directory. ' +
+          'No absolute paths, no "..", never overwrites unless overwrite is true. The result has saved.sha256 (the receipt) and a preview, not the body. ' +
+          'It also becomes the payment\'s label unless you set one.',
+      },
+      overwrite: { type: 'boolean', description: 'With save_to: replace the file if it already exists (default false)' },
     }, ['url']),
     kind: 'fetch',
     principalOnly: false,
@@ -176,6 +188,13 @@ export interface ToolCallMeta {
   caller: Caller;
   /** The host's id for the calling session: what `for:{children:true}` delegates to (`children:<requesterSession>`). */
   requesterSession?: string;
+  /**
+   * The directory `wallet_pay.save_to` is relative to. The host decides it
+   * per session (a channel's `vendor/` directory, say) and leaves it unset
+   * for a session that may not write files: `save_to` is then a usage error
+   * and no payment happens.
+   */
+  saveRoot?: string;
 }
 
 export type WalletToolHandler = (name: string, args: unknown, meta: ToolCallMeta) => Promise<CliResult>;
@@ -361,17 +380,27 @@ export function createWalletToolHandlers(ctx: CommandContext, opts: WalletToolOp
     async wallet_pay(a, meta) {
       const u = url(a, 'wallet_pay');
       const host = new URL(u).host;
-      const flags = {
-        method: str(a, 'method', 'wallet_pay'),
-        body: str(a, 'body', 'wallet_pay'),
-        header: headersArg(a, 'wallet_pay'),
-        mandate: str(a, 'mandate_id', 'wallet_pay'),
-        caller: meta.caller,
-        ...(meta.context ? { context: meta.context } : {}),
-      };
+      let saveTo: string | undefined;
       let r: CliResult;
       try {
-        r = await pay(ctx, [u], flags);
+        // Inside the try: a refused save (like a refused payment) names the url and host it was for.
+        saveTo = str(a, 'save_to', 'wallet_pay');
+        if (saveTo !== undefined && saveTo.length === 0) usage('wallet_pay: save_to must be a non-empty relative path');
+        if (a.overwrite !== undefined && typeof a.overwrite !== 'boolean') usage('wallet_pay: overwrite must be a boolean');
+        if (saveTo !== undefined && !meta.saveRoot) {
+          usage('wallet_pay: save_to needs a save directory and the host gave this session none (ToolCallMeta.saveRoot); pay without save_to, or ask the operator for a session that may write files');
+        }
+        // The file name is the natural label of a purchase: the ledger row (and the host's spend table) names it unless the host set its own.
+        const context = saveTo !== undefined && !meta.context?.label ? { ...meta.context, label: saveTo } : meta.context;
+        r = await pay(ctx, [u], {
+          method: str(a, 'method', 'wallet_pay'),
+          body: str(a, 'body', 'wallet_pay'),
+          header: headersArg(a, 'wallet_pay'),
+          mandate: str(a, 'mandate_id', 'wallet_pay'),
+          caller: meta.caller,
+          ...(context ? { context } : {}),
+          ...(saveTo !== undefined ? { save: saveTo, saveRoot: meta.saveRoot, overwrite: a.overwrite === true } : {}),
+        });
       } catch (err) {
         const f = failure(err);
         return { code: f.code, output: { ...(f.output as object), url: u, host } };
@@ -379,11 +408,14 @@ export function createWalletToolHandlers(ctx: CommandContext, opts: WalletToolOp
       const out = r.output as {
         status: number;
         paid: boolean;
-        body: unknown;
+        body?: unknown;
+        saved?: unknown;
+        preview?: string;
+        preview_truncated?: boolean;
         payment: { transaction?: string | null; intentMandateId?: string; amount?: string; ledgerStatus?: string; resource?: string; context?: unknown; payment_model_context?: unknown } | null;
       };
       const entry = out.payment;
-      const method = (flags.method ?? (flags.body !== undefined ? 'POST' : 'GET')).toUpperCase();
+      const method = (str(a, 'method', 'wallet_pay') ?? (a.body !== undefined ? 'POST' : 'GET')).toUpperCase();
       const mandate = entry?.intentMandateId;
       return ok({
         status: out.status,
@@ -400,7 +432,8 @@ export function createWalletToolHandlers(ctx: CommandContext, opts: WalletToolOp
         ...(entry?.context ? { context: entry.context } : {}),
         // An `unknown` outcome (2xx without a usable settlement report) keeps the CLI's hint: reconcile before paying again.
         ...(entry?.payment_model_context ? { payment_model_context: entry.payment_model_context } : {}),
-        ...boundBody(out.body),
+        // Saved: the file's receipt and a preview, never the body (the point of save_to is to keep it out of the context).
+        ...(out.saved !== undefined ? { saved: out.saved, preview: out.preview, preview_truncated: out.preview_truncated } : boundBody(out.body)),
       });
     },
 

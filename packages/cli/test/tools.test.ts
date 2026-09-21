@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -9,6 +10,7 @@ import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from '../
 import { resolveConfig } from '../src/config.js';
 import { CommandContext } from '../src/context.js';
 import { WALLET_TOOLS, createWalletToolHandlers, type WalletToolHandler } from '../src/tools.js';
+import { PREVIEW_BYTES } from '../src/save.js';
 
 const TOKEN = '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512';
 const payeeAddress = privateKeyToAccount(KEYS.payee).address;
@@ -67,6 +69,9 @@ describe('wallet tool table', () => {
     }
     const props = (name: string) => (WALLET_TOOLS.find((t) => t.name === name)!.parameters as Out).properties;
     expect(props('wallet_budget_request').limit_usd.type).toBe('string');
+    expect(props('wallet_pay').save_to).toMatchObject({ type: 'string', maxLength: 200 });
+    expect(props('wallet_pay').save_to.description).toMatch(/sha256/);
+    expect(props('wallet_pay').overwrite.type).toBe('boolean');
     expect(props('wallet_budget_delegate').per_call_usd.type).toBe('string');
     expect(WALLET_TOOLS.find((t) => t.name === 'wallet_budget_request')!.principalOnly).toBe(true);
   });
@@ -305,5 +310,128 @@ describe('wallet tool table', () => {
     expect(out.mandate).toBe(id);
     expect(out.payment_model_context.reason).toBe('unknown');
     expect(out.payment_model_context.remediation.join(' ')).toMatch(/reconcile/i);
+  });
+});
+
+describe('wallet_pay save_to', () => {
+  let home: string;
+  let saveRoot: string;
+  let ctx: CommandContext;
+  let call: WalletToolHandler;
+  let payee: StubPayee;
+  const meta = () => ({ caller: PRINCIPAL, context: { session: 'buyer-1' }, saveRoot });
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), 'agentpay-tools-save-'));
+    saveRoot = join(home, 'vendor'); // does not exist yet: the first save creates it
+    payee = await startStubPayee(stubOptions({ bigBytes: 100_000 }));
+    const config = resolveConfig({}, {
+      AGENTPAY_HOME: home,
+      AGENTPAY_KEY: KEYS.payer,
+      AGENTPAY_RPC: 'http://127.0.0.1:1',
+      AGENTPAY_TOKEN: TOKEN,
+      AGENTPAY_TOKEN_NAME: MOCK_USDC_DOMAIN.name,
+      AGENTPAY_TOKEN_VERSION: MOCK_USDC_DOMAIN.version,
+      AGENTPAY_NETWORK: 'eip155:31337',
+    });
+    ctx = new CommandContext(config, globalThis.fetch, () => {}, { requireMandateHost: true });
+    call = createWalletToolHandlers(ctx);
+    const r = await call('wallet_budget_request', { purpose: 'bars', limit_usd: '0.02', hosts: ['127.0.0.1'] }, { caller: PRINCIPAL });
+    expect(r.code).toBe(0);
+  });
+
+  afterAll(async () => {
+    ctx.dispose();
+    await payee.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('writes the whole body to <saveRoot>/<save_to>, answers with saved + a 1 KB preview and no body, and labels the ledger row', async () => {
+    const r = await call('wallet_pay', { url: `${payee.url}/big`, save_to: 'massive/AAPL/2016.json' }, meta());
+    expect(r.code).toBe(0);
+    const out = r.output as Out;
+    expect(out.paid).toBe(true);
+    expect(out.status).toBe(200);
+    expect(out.body).toBeUndefined();
+    expect(out.body_truncated).toBeUndefined();
+    const path = join(saveRoot, 'massive', 'AAPL', '2016.json');
+    expect(out.saved.path).toBe(path);
+    const file = readFileSync(path);
+    expect(file.byteLength).toBe(100_000);
+    expect(out.saved.bytes).toBe(100_000);
+    expect(out.saved.sha256).toBe(createHash('sha256').update(file).digest('hex'));
+    expect(out.saved.content_type).toMatch(/^application\/json/);
+    expect(JSON.parse(file.toString('utf8')).rows[0].o).toBe(1); // the payee's bytes, verbatim
+    expect(out.preview_truncated).toBe(true);
+    expect(Buffer.byteLength(out.preview, 'utf8')).toBeLessThanOrEqual(PREVIEW_BYTES);
+    expect(file.toString('utf8').startsWith(out.preview)).toBe(true);
+    expect(readdirSync(join(saveRoot, 'massive', 'AAPL'))).toEqual(['2016.json']); // no temp file left
+    // The file name is the payment's label: on the envelope and on the ledger row.
+    expect(out.context).toEqual({ session: 'buyer-1', label: 'massive/AAPL/2016.json' });
+    const row = ctx.ledger().read().find((e) => e.context?.label === 'massive/AAPL/2016.json');
+    expect(row?.status).toBe('settled');
+    // A label the host set wins over the file name.
+    const labelled = await call('wallet_pay', { url: `${payee.url}/big`, save_to: 'massive/AAPL/2017.json' }, { ...meta(), context: { session: 'buyer-1', label: 'mine' } });
+    expect((labelled.output as Out).context.label).toBe('mine');
+    // A small body is saved too, previewed whole.
+    const small = await call('wallet_pay', { url: `${payee.url}/predict`, save_to: 'small.json' }, meta());
+    expect(small.code).toBe(0);
+    expect((small.output as Out).preview_truncated).toBe(false);
+    expect(JSON.parse((small.output as Out).preview).resource).toBe('GET /predict');
+    expect((small.output as Out).body).toBeUndefined();
+  });
+
+  it('refuses every unsafe path and a missing saveRoot with code 2 before any request is sent', async () => {
+    const before = payee.requests;
+    const refused = async (args: Out, m: Out, why: RegExp) => {
+      const r = await call('wallet_pay', { url: `${payee.url}/big`, ...args }, m as never);
+      expect(r.code, JSON.stringify(args)).toBe(2);
+      expect((r.output as Out).message, JSON.stringify(args)).toMatch(why);
+      expect((r.output as Out).host).toBe(new URL(payee.url).host);
+    };
+    await refused({ save_to: '../x.json' }, meta(), /"\.\." segment/);
+    await refused({ save_to: 'a/../../x.json' }, meta(), /"\.\." segment/);
+    await refused({ save_to: '/tmp/x.json' }, meta(), /absolute/);
+    await refused({ save_to: 'C:\\x.json' }, meta(), /Windows drive/);
+    await refused({ save_to: '\\\\srv\\share\\x.json' }, meta(), /UNC/);
+    await refused({ save_to: '' }, meta(), /non-empty/);
+    await refused({ save_to: 'x'.repeat(201) }, meta(), /longer than 200/);
+    await refused({ save_to: 'a\0b.json' }, meta(), /NUL/);
+    await refused({ save_to: 'massive/AAPL/2016.json' }, meta(), /exists; pass overwrite/);
+    await refused({ save_to: 'x.json', overwrite: 'yes' }, meta(), /overwrite must be a boolean/);
+    await refused({ save_to: 'x.json' }, { caller: PRINCIPAL }, /save directory.*host gave this session none/);
+    expect(payee.requests).toBe(before);
+    expect(existsSync(join(saveRoot, 'x.json'))).toBe(false);
+    // Outside the root through a symlink: the directory exists inside, its target does not.
+    const outside = join(home, 'elsewhere');
+    mkdirSync(outside);
+    const { symlinkSync } = await import('node:fs');
+    symlinkSync(outside, join(saveRoot, 'link'));
+    await refused({ save_to: 'link/x.json' }, meta(), /symlink/);
+    expect(payee.requests).toBe(before);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it('overwrite:true replaces the file', async () => {
+    const path = join(saveRoot, 'massive', 'AAPL', '2016.json');
+    writeFileSync(path, 'stale');
+    const r = await call('wallet_pay', { url: `${payee.url}/big`, save_to: 'massive/AAPL/2016.json', overwrite: true }, meta());
+    expect(r.code).toBe(0);
+    expect((r.output as Out).saved.bytes).toBe(100_000);
+    expect(readFileSync(path).byteLength).toBe(100_000);
+  });
+
+  it('a handler 500 writes nothing and is reported as without save_to', async () => {
+    const failing = await startStubPayee(stubOptions({ bigBytes: 100_000, handlerStatus: 500 }));
+    try {
+      const r = await call('wallet_pay', { url: `${failing.url}/big`, save_to: 'failed.json' }, meta());
+      expect(r.code).toBe(1);
+      expect((r.output as Out).status).toBe(500); // PayeeRejected, exactly as without save_to
+      expect((r.output as Out).saved).toBeUndefined();
+      expect(existsSync(join(saveRoot, 'failed.json'))).toBe(false);
+      expect(readdirSync(saveRoot).filter((f) => f.includes('tmp-'))).toEqual([]);
+    } finally {
+      await failing.close();
+    }
   });
 });

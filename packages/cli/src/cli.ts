@@ -39,7 +39,9 @@ intent mandates (budgets)
 
 payments
   offer <url> [--method m --body b --header k=v]   print the 402 offer, pay nothing
-  pay <url> [--method m --body b --header k=v --mandate id --prepay]
+  pay <url> [--method m --body b --header k=v --mandate id --prepay] [--save rel/path [--overwrite]]
+                                   --save writes a 2xx body to that path under the current directory (no absolute paths, no ..,
+                                   existing files kept unless --overwrite) and prints saved {path, bytes, sha256} + a 1 KB preview, not the body
   ledger [--status s] | reconcile | report
   offer/pay attribution:  --context k=v (repeatable; keys channel channelName session parentSession origin callId label)
                           AGENTPAY_CONTEXT=k=v,k=v sets defaults a flag overrides
@@ -77,6 +79,8 @@ const OPTIONS = {
   header: { type: 'string', multiple: true },
   mandate: { type: 'string' },
   prepay: { type: 'boolean' },
+  save: { type: 'string' },
+  overwrite: { type: 'boolean' },
   status: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
@@ -152,7 +156,9 @@ export async function run(
     const ctx = new CommandContext(config, fetchImpl);
     // env first: a --context flag overrides the same key
     const withEnv = command === 'pay' || command === 'offer' ? { ...flags, context: [...contextPairsFromEnv(env), ...(flags.context ?? [])] } : flags;
-    return await handler(ctx, positional, withEnv);
+    // --save is relative to where the operator ran the command; a host process passes its own root through PayFlags instead.
+    const withRoot = command === 'pay' ? { ...withEnv, saveRoot: process.cwd() } : withEnv;
+    return await handler(ctx, positional, withRoot);
   } catch (err) {
     return failure(err);
   }

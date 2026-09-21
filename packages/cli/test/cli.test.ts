@@ -1,5 +1,6 @@
 import { execFile, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +11,7 @@ import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
 import { LOCK_FILE } from '@agentpay/wallet';
 import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from '../../wallet/test/stub-payee.js';
 import { run } from '../src/cli.js';
+import { MAX_SAVE_BYTES, PREVIEW_BYTES } from '../src/save.js';
 
 const execFileAsync = promisify(execFile);
 const CLI_DIR = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -436,6 +438,116 @@ describe('agentpay CLI: delegation, attribution, callers, lock', () => {
       rmSync(lockPath, { force: true });
     }
   });
+
+  it('pay --save writes the body under the current directory with its sha256 and prints a preview, not the body', async () => {
+    const big = await startStubPayee(stubOptions({ price: '$0.0001', bigBytes: 100_000 }));
+    const cwd = process.cwd();
+    const saveDir = realpathSync(mkdtempSync(join(tmpdir(), 'agentpay-cli-save-'))); // cwd is a real path (macOS /var -> /private/var)
+    process.chdir(saveDir);
+    try {
+      const created = await run(['mandate-create', '--purpose', 'bars', '--limit', '1', '--hosts', '127.0.0.1'], env);
+      const id = (created.output as Out).mandate.id as string;
+      const r = await run(['pay', `${big.url}/big`, '--mandate', id, '--save', 'massive/AAPL/2016.json'], env);
+      expect(r.code).toBe(0);
+      const out = r.output as Out;
+      expect(out.paid).toBe(true);
+      expect(out.body).toBeUndefined();
+      const path = join(saveDir, 'massive', 'AAPL', '2016.json');
+      expect(out.saved.path).toBe(path);
+      const file = readFileSync(path);
+      expect(file.byteLength).toBe(100_000);
+      expect(out.saved).toEqual({ path, bytes: 100_000, sha256: createHash('sha256').update(file).digest('hex'), content_type: 'application/json; charset=utf-8' });
+      expect(out.preview_truncated).toBe(true);
+      expect(Buffer.byteLength(out.preview, 'utf8')).toBeLessThanOrEqual(PREVIEW_BYTES);
+      expect(readdirSync(join(saveDir, 'massive', 'AAPL'))).toEqual(['2016.json']);
+      // --save without a label: the CLI keeps the context as given (the tool table is where the file name becomes the label).
+      expect(out.payment.context).toBeUndefined();
+
+      // Existing file: refused before the request unless --overwrite; every unsafe path likewise.
+      const served = big.served;
+      const requests = big.requests;
+      const exists = await run(['pay', `${big.url}/big`, '--mandate', id, '--save', 'massive/AAPL/2016.json'], env);
+      expect(exists.code).toBe(2);
+      expect((exists.output as Out).message).toMatch(/exists; pass overwrite/);
+      for (const bad of ['../x.json', '/tmp/x.json', 'C:\\x.json', '', 'a/../../x.json']) {
+        const r2 = await run(['pay', `${big.url}/big`, '--mandate', id, '--save', bad], env);
+        expect(r2.code, bad).toBe(2);
+        expect((r2.output as Out).error).toBe('config');
+      }
+      expect(big.requests).toBe(requests);
+      expect(big.served).toBe(served);
+      writeFileSync(path, 'stale');
+      const over = await run(['pay', `${big.url}/big`, '--mandate', id, '--save', 'massive/AAPL/2016.json', '--overwrite'], env);
+      expect(over.code).toBe(0);
+      expect(readFileSync(path).byteLength).toBe(100_000);
+      // A non-2xx is reported exactly as without --save, and nothing is written.
+      const failing = await startStubPayee(stubOptions({ price: '$0.0001', bigBytes: 100_000, handlerStatus: 500 }));
+      try {
+        const bad = await run(['pay', `${failing.url}/big`, '--mandate', id, '--save', 'failed.json'], env);
+        expect(bad.code).toBe(1);
+        expect((bad.output as Out).status).toBe(500);
+        expect((bad.output as Out).saved).toBeUndefined();
+        expect(existsSync(join(saveDir, 'failed.json'))).toBe(false);
+      } finally {
+        await failing.close();
+      }
+    } finally {
+      process.chdir(cwd);
+      await big.close();
+      rmSync(saveDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pay --save over 32 MiB is paid but not written: saved.error body_too_large, no throw', async () => {
+    const huge = await startStubPayee(stubOptions({ price: '$0.0001', bigBytes: MAX_SAVE_BYTES + 1 }));
+    const cwd = process.cwd();
+    const saveDir = mkdtempSync(join(tmpdir(), 'agentpay-cli-huge-'));
+    process.chdir(saveDir);
+    try {
+      const created = await run(['mandate-create', '--purpose', 'huge', '--limit', '1', '--hosts', '127.0.0.1'], env);
+      const r = await run(['pay', `${huge.url}/big`, '--mandate', (created.output as Out).mandate.id, '--save', 'huge.json'], env);
+      expect(r.code).toBe(0);
+      const out = r.output as Out;
+      expect(out.paid).toBe(true);
+      expect(out.saved.error).toBe('body_too_large');
+      expect(out.saved.bytes).toBe(MAX_SAVE_BYTES + 1);
+      expect(out.saved.limit).toBe(MAX_SAVE_BYTES);
+      expect(out.saved.sha256).toBeUndefined();
+      expect(out.body).toBeUndefined();
+      expect(out.preview_truncated).toBe(true);
+      expect(readdirSync(saveDir)).toEqual([]);
+    } finally {
+      process.chdir(cwd);
+      await huge.close();
+      rmSync(saveDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('runs --save as a process: the file lands relative to the process cwd; ../ exits 2 and pays nothing', async () => {
+    const big = await startStubPayee(stubOptions({ price: '$0.0001', bigBytes: 20_000 }));
+    const saveDir = realpathSync(mkdtempSync(join(tmpdir(), 'agentpay-cli-proc-')));
+    try {
+      const created = await run(['mandate-create', '--purpose', 'proc', '--limit', '1', '--hosts', '127.0.0.1'], env);
+      const id = (created.output as Out).mandate.id as string;
+      const cliPath = join(CLI_DIR, 'src', 'cli.ts');
+      const { stdout } = await execFileAsync('npx', ['tsx', cliPath, 'pay', `${big.url}/big`, '--mandate', id, '--save', 'out/bars.json'], { cwd: saveDir, env });
+      const parsed = JSON.parse(stdout) as Out;
+      expect(parsed.ok).toBe(true);
+      expect(parsed.saved.path).toBe(join(saveDir, 'out', 'bars.json'));
+      expect(parsed.saved.bytes).toBe(20_000);
+      expect(parsed.body).toBeUndefined();
+      const file = readFileSync(join(saveDir, 'out', 'bars.json'));
+      expect(createHash('sha256').update(file).digest('hex')).toBe(parsed.saved.sha256);
+
+      const requests = big.requests;
+      await expect(execFileAsync('npx', ['tsx', cliPath, 'pay', `${big.url}/big`, '--mandate', id, '--save', '../x.json'], { cwd: saveDir, env })).rejects.toMatchObject({ code: 2 });
+      expect(big.requests).toBe(requests);
+      expect(existsSync(join(tmpdir(), 'x.json'))).toBe(false);
+    } finally {
+      await big.close();
+      rmSync(saveDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('a stale lock (dead pid) is ignored and cleaned up', async () => {
     const lockPath = join(home, LOCK_FILE);

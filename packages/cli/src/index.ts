@@ -6,6 +6,8 @@ export { failure, ok, toJson } from './output.js';
 export type { CliResult, ExitCode } from './output.js';
 export { CALLER_GRAMMAR, callerLabel, contextFromPairs, contextPairsFromEnv, parseCaller } from './attribution.js';
 export { WALLET_TOOLS, MAX_BODY_BYTES, budgetView, createWalletToolHandlers } from './tools.js';
+export { MAX_SAVE_BYTES, PREVIEW_BYTES, resolveSavePath, writeSaved } from './save.js';
+export type { ResolvedSavePath, SavedFile } from './save.js';
 export type { JsonSchema, ToolCallMeta, WalletTool, WalletToolHandler, WalletToolOptions } from './tools.js';
 // The handler modules, for a host that wants a command without the tool table around it.
 export * as mandateCommands from './commands/mandate.js';
