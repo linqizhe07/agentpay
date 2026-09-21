@@ -1,0 +1,346 @@
+{
+  "version": 1,
+  "date": "2026-09-21T18:09:19.101Z",
+  "network": "eip155:84532",
+  "rpc": "https://sepolia.base.org",
+  "payer": "0x2455703F48F9437bA491fbEC88B6F3a9aC9f6501",
+  "home": "<scratch wallet home on the operator machine; the payer is the .local/base-sepolia key>",
+  "discovery": {
+    "skipped": false,
+    "query": "market snapshot BTC",
+    "matched": 4,
+    "payable": 4,
+    "top": [
+      {
+        "resource": "https://omniterminal.app/api/x402/v1/market-snapshot/:symbol",
+        "method": "GET",
+        "service": "Omni Terminal",
+        "description": "Omni Terminal provides Hyperliquid price structure with bounded OHLCV candles, current funding/carry, and an optional mark-anchored all-level liquidation and margin-stress overlay.",
+        "price_usd": "0.005000",
+        "network": "eip155:84532",
+        "pay_to": "0x733f40A4FA0cd13d59aBADE04b9eD2e9acAc6457",
+        "max_timeout_s": 300,
+        "payers_30d": 3,
+        "calls_30d": 15,
+        "last_called": "2026-09-05T09:40:52.223Z",
+        "last_updated": "2026-09-05T09:40:52.484Z",
+        "input": {
+          "path": {
+            "symbol": "BTC"
+          },
+          "query": {
+            "include_liquidations": true,
+            "interval": "1h",
+            "limit": 120,
+            "scope": "aggregate"
+          }
+        },
+        "tags": [
+          "omni-terminal",
+          "trading",
+          "market-data",
+          "hyperliquid",
+          "market-snapshot"
+        ]
+      },
+      {
+        "resource": "https://intel.rallylive.ca/data/crypto",
+        "method": "POST",
+        "service": "crypto-price",
+        "description": "Cryptocurrency price: current USD price, 24h change, market cap and 24h volume for a coin by id or symbol (bitcoin, ethereum, solana, usdc and 100+ others) from CoinGecko's free API. $0.01 per lookup.",
+        "price_usd": "0.010000",
+        "network": "eip155:84532",
+        "pay_to": "0x91D568599fB802Cb3f03F067D2063785dBAF0abd",
+        "max_timeout_s": 120,
+        "payers_30d": 2,
+        "calls_30d": 2,
+        "last_called": "2026-09-13T10:26:29.647Z",
+        "last_updated": "2026-09-13T10:26:29.752Z",
+        "tags": [
+          "crypto",
+          "price",
+          "bitcoin",
+          "ethereum",
+          "market"
+        ]
+      },
+      {
+        "resource": "https://intel.rallylive.ca/crypto-price",
+        "method": "GET",
+        "service": "crypto-price-lookup",
+        "description": "Crypto price lookup: current USD price of bitcoin, ethereum, solana, USDC and other major coins by name or symbol, with 24-hour change, high, low and volume from Coinbase public market data (CoinGeck…",
+        "price_usd": "0.010000",
+        "network": "eip155:84532",
+        "pay_to": "0x91D568599fB802Cb3f03F067D2063785dBAF0abd",
+        "max_timeout_s": 120,
+        "payers_30d": 2,
+        "calls_30d": 2,
+        "last_called": "2026-09-13T10:26:24.811Z",
+        "last_updated": "2026-09-13T10:26:24.916Z",
+        "input": {
+          "query": {
+            "query": "bitcoin"
+          }
+        },
+        "tags": [
+          "crypto",
+          "price",
+          "bitcoin",
+          "ethereum",
+          "market"
+        ]
+      },
+      {
+        "resource": "https://seller-b-production.up.railway.app/v1/credit-report",
+        "method": "POST",
+        "service": "Mello Seller B",
+        "description": "mello資本：總經分析、加密市場資訊（Demo；保留 legacy credit report）",
+        "price_usd": "0.050000",
+        "network": "eip155:84532",
+        "pay_to": "0x9e82d7Af834AaCC4777cAf6b00b4104cb661c5a8",
+        "max_timeout_s": 300,
+        "payers_30d": 1,
+        "calls_30d": 15,
+        "last_called": "2026-09-05T22:07:42.233Z",
+        "last_updated": "2026-09-05T22:07:42.479Z",
+        "tags": [
+          "market-analysis",
+          "macro-analysis",
+          "macroeconomic analysis",
+          "crypto-market",
+          "crypto market information"
+        ]
+      }
+    ]
+  },
+  "mandate": {
+    "id": "im_4a0e1fd94ec7",
+    "created": false,
+    "remaining_usd": "$0.040000",
+    "valid_until": "2026-09-21T18:37:14.000Z",
+    "hosts": [
+      "x402.payai.network",
+      "omniterminal.app",
+      "127.0.0.1"
+    ]
+  },
+  "targets": [
+    {
+      "name": "payai-echo",
+      "url": "https://x402.payai.network/api/base-sepolia/paid-content",
+      "method": "GET",
+      "offer": {
+        "status": 402,
+        "latency_ms": 116,
+        "accepts": [
+          {
+            "scheme": "exact",
+            "network": "eip155:84532",
+            "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "amount": "10000",
+            "amount_usd": "$0.010000",
+            "pay_to": "0x2a835A505d4Ea32372Cc420d2663b885cE089453",
+            "max_timeout_s": 300
+          }
+        ],
+        "timeout_ok": true
+      },
+      "pay": {
+        "status": 200,
+        "latency_ms": 857,
+        "amount": "10000",
+        "amount_usd": "$0.010000",
+        "tx": "0x8efe6631b5130933f287cf0d319e0fec40ab40eb3fb3e6cac4cc22840d510829",
+        "ledger_status": "settled",
+        "body_bytes": 467,
+        "saved": {
+          "path": "payai-echo.body",
+          "bytes": 467,
+          "sha256": "fa2158583017126e94af7a04fc09a81390c4738342e19300909f6d2dd2b9aa0f",
+          "content_type": "application/json"
+        },
+        "settlement": {
+          "payer": "0x2455703F48F9437bA491fbEC88B6F3a9aC9f6501",
+          "network": "eip155:84532"
+        }
+      },
+      "chain": {
+        "tx_from": "0xc6699d2aada6c36dfea5c248dd70f9cb0235cb63",
+        "settlement_payer": "0x2455703F48F9437bA491fbEC88B6F3a9aC9f6501",
+        "payer_is_wallet": true
+      }
+    },
+    {
+      "name": "omniterminal-btc",
+      "url": "https://omniterminal.app/api/x402/v1/market-snapshot/BTC",
+      "method": "GET",
+      "offer": {
+        "status": 402,
+        "latency_ms": 950,
+        "accepts": [
+          {
+            "scheme": "exact",
+            "network": "eip155:84532",
+            "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "amount": "5000",
+            "amount_usd": "$0.005000",
+            "pay_to": "0x733f40A4FA0cd13d59aBADE04b9eD2e9acAc6457",
+            "max_timeout_s": 300
+          },
+          {
+            "scheme": "exact",
+            "network": "eip155:8453",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "amount": "5000",
+            "amount_usd": "$0.005000",
+            "pay_to": "0x733f40A4FA0cd13d59aBADE04b9eD2e9acAc6457",
+            "max_timeout_s": 300
+          }
+        ],
+        "timeout_ok": true
+      },
+      "pay": {
+        "status": 503,
+        "latency_ms": 1416,
+        "amount": "5000",
+        "amount_usd": "$0.005000",
+        "tx": null,
+        "ledger_status": "rejected",
+        "error": {
+          "ok": false,
+          "error": "service_unavailable",
+          "status": 503,
+          "body": {
+            "error": "service_unavailable",
+            "message": "Omni Terminal is temporarily unavailable. Please retry shortly."
+          },
+          "payment_model_context": {
+            "protocol": "x402",
+            "reason": "service_unavailable",
+            "summary": "Payment refused: service_unavailable.",
+            "remediation": [
+              "Read the error detail, fix the cause, and retry with a fresh authorization if appropriate."
+            ]
+          }
+        },
+        "body_bytes": null,
+        "settlement": null
+      },
+      "chain": null
+    }
+  ],
+  "concurrent": {
+    "url": "https://omniterminal.app/api/x402/v1/market-snapshot/BTC",
+    "n": 3,
+    "latency_ms": 3338,
+    "results": [
+      {
+        "status": 503,
+        "latency_ms": 1397,
+        "amount": "5000",
+        "amount_usd": "$0.005000",
+        "tx": null,
+        "ledger_status": "rejected",
+        "error": {
+          "ok": false,
+          "error": "service_unavailable",
+          "status": 503,
+          "body": {
+            "error": "service_unavailable",
+            "message": "Omni Terminal is temporarily unavailable. Please retry shortly."
+          },
+          "payment_model_context": {
+            "protocol": "x402",
+            "reason": "service_unavailable",
+            "summary": "Payment refused: service_unavailable.",
+            "remediation": [
+              "Read the error detail, fix the cause, and retry with a fresh authorization if appropriate."
+            ]
+          }
+        },
+        "body_bytes": null,
+        "settlement": null
+      },
+      {
+        "status": 503,
+        "latency_ms": 3336,
+        "amount": null,
+        "amount_usd": null,
+        "tx": null,
+        "ledger_status": null,
+        "error": {
+          "ok": false,
+          "error": "service_unavailable",
+          "status": 503,
+          "body": {
+            "error": "service_unavailable",
+            "message": "Omni Terminal is temporarily unavailable. Please retry shortly."
+          },
+          "payment_model_context": {
+            "protocol": "x402",
+            "reason": "service_unavailable",
+            "summary": "Payment refused: service_unavailable.",
+            "remediation": [
+              "Read the error detail, fix the cause, and retry with a fresh authorization if appropriate."
+            ]
+          }
+        },
+        "body_bytes": null,
+        "settlement": null
+      },
+      {
+        "status": 503,
+        "latency_ms": 3054,
+        "amount": null,
+        "amount_usd": null,
+        "tx": null,
+        "ledger_status": null,
+        "error": {
+          "ok": false,
+          "error": "service_unavailable",
+          "status": 503,
+          "body": {
+            "error": "service_unavailable",
+            "message": "Omni Terminal is temporarily unavailable. Please retry shortly."
+          },
+          "payment_model_context": {
+            "protocol": "x402",
+            "reason": "service_unavailable",
+            "summary": "Payment refused: service_unavailable.",
+            "remediation": [
+              "Read the error detail, fix the cause, and retry with a fresh authorization if appropriate."
+            ]
+          }
+        },
+        "body_bytes": null,
+        "settlement": null
+      }
+    ]
+  },
+  "reconcile": {
+    "counts": {
+      "settled": 0,
+      "expiredUnused": 0,
+      "stillPending": 10,
+      "verified": 0
+    }
+  },
+  "ledger": {
+    "rows_added": 5,
+    "by_status": {
+      "settled": 1,
+      "rejected": 4
+    },
+    "settled_usd": "$0.010000",
+    "reserved_usd": "$0.020000"
+  },
+  "totals": {
+    "paid": 1,
+    "refused": 4,
+    "spent_usd": "$0.010000"
+  },
+  "notes": [
+    "reconcile keeps 10 row(s) pending: settled rows are confirmed and rejected rows released only after their 300 s authorization validity ends; run `agentpay reconcile` on this home later",
+    "omniterminal-btc refused after the authorization was signed (http 503): the budget stays reserved until reconcile sees the nonce unused"
+  ]
+}
