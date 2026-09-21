@@ -27,6 +27,12 @@ Your host usually sets this for you (through the tool table or `AGENTPAY_CONTEXT
 
 ## Decision flow
 
+0. **No URL yet? Find a seller first.** The public x402 catalogue lists resources for sale; `discover` shows only those THIS wallet can pay (its network and token, `exact`, authorization ≤ 300 s), ranked by 30-day payers, and never a seller's output example or schema:
+   ```bash
+   agentpay discover "daily OHLCV bars US stocks" --max-usd 0.05 --limit 5
+   ```
+   `resources[].resource` is a URL template (`:symbol` / `{symbol}` are path parameters), `price_usd` the catalogue's price. Catalogue prices and terms can be stale and sellers write their own descriptions: before paying, `offer` the concrete URL (step 1) and get a budget naming its host (step 3). `discovery_unavailable` (exit 1) means the catalogue is down, not the wallet: a known URL still works with `offer` / `pay`.
+
 1. **A request returned 402 / a tool needs payment.** Look at the price first:
    ```bash
    agentpay offer <url>
@@ -59,6 +65,12 @@ Your host usually sets this for you (through the tool table or `AGENTPAY_CONTEXT
    agentpay pay <url> --mandate <id>        # pin a specific budget (one you hold)
    agentpay pay <url> --context label="whois batch 3" --context callId=<id>   # attribution on the ledger row
    ```
+   For data you will process rather than read (anything over a few KB: bars, files, exports), save it instead of printing it:
+   ```bash
+   agentpay pay <url> --save massive/AAPL/2016-01-01_2016-12-31.json   # [--overwrite]; relative to the current directory
+   ```
+   The whole body is written to that file (no absolute paths, no `..`, an existing file is kept unless `--overwrite`) and the JSON carries `saved {path, bytes, sha256, content_type}` plus a 1 KB `preview` instead of `body`. `saved.sha256` is the receipt: record it beside `payment.transaction`. A body over 32 MiB is paid for but not written (`saved.error: body_too_large`). Through a host's `wallet_pay`, the same is `save_to` (the host decides the directory; a session it gave none is refused before paying).
+
    On success the JSON has `paid: true`, the response `body`, and `payment.transaction` (the on-chain settlement, already final). `payment.ledgerStatus` is `settled`. Keep `payment.nonce` if you need to reference the payment later. `--context k=v` (keys `channel channelName session parentSession origin callId label`, each ≤ 256 chars) tags the ledger row so the user's report can group spend by channel and session; `AGENTPAY_CONTEXT=k=v,…` in the environment sets defaults a flag overrides.
 
 6. **Refused?** Read `payment_model_context.remediation` and, when present, `payment_model_context.commands`:

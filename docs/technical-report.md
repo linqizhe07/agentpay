@@ -319,6 +319,7 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 3. 钱包：~~预算文件加锁或改为单进程守护~~（已做：`lock: true` + `wallet.lock`，见 §8.10）；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
 4. facilitator：限流；Base 上卡住交易的替换；指标。
 5. 若单价降到亚分级、频率高到每笔一块等不起：x402 也有 `batch-settlement` scheme 槽位，`aep2-final` 的代码可作为其 network binding 复活。
+6. `upto`（付款方签上限、收款方按实际结算，Permit2 + `setSettlementOverrides`）：接法已记在 `docs/upto-design.md`（钱包、payee、facilitator 各要改什么，首个目标与验收条件），本轮不做——现有数据卖家全是 `exact`。
 
 ## 附录 A：文件索引
 
