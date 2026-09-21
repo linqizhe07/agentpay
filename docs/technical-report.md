@@ -1,6 +1,6 @@
 # agentpay 技术报告
 
-> 版本：`main`（2026-09-19，PR #4 合并后 + Base Sepolia 实跑），x402 迁移完成后的第一版。适用读者：接入或维护这套支付系统的工程师。AEP2 时代的最后一版代码在 tag `aep2-final`。
+> 版本：分支 `market-surface`（2026-09-21：`discover`、`pay --save`、vendor simulator、payee 结算队列与一次重试、testnet 互通脚本），基于 `main`（2026-09-19，PR #4 合并后 + Base Sepolia 实跑）。适用读者：接入或维护这套支付系统的工程师。AEP2 时代的最后一版代码在 tag `aep2-final`。
 
 ## 1. 摘要
 
@@ -10,12 +10,13 @@ agentpay 是一套给 AI agent 用的支付系统：协议是 Coinbase 的 **x40
 
 | 项目 | 现状 |
 |---|---|
-| 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 只剩测试用 `MockUSDC.sol` |
-| 协议 | x402 V2 / `exact` / EIP-3009，`@x402/core` `@x402/evm` `@x402/express` `@x402/fetch` ~2.26.0 |
-| 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交），2026-09-19 已实跑：串行每笔约 1 s，托管 facilitator 下并发会失败（§13） |
-| 测试 | 7 个工作区共 153 个测试，全绿；demo 10 个场景全过 |
-| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；Kairos 的 face 在进程内把 `packages/cli/src/tools.ts` 的八个工具注册给 agent（2026-09-21，分支 `feat/agent-wallet`） |
-| 不做 | V1、`upto`、Permit2、智能合约钱包签名、批量结算、争议、KYC、前端 |
+| 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 只剩测试用 `MockUSDC.sol`；payee 附带一个 Massive 形状的付费数据源模拟器（`examples/vendor-sim`） |
+| 协议 | x402 V2 / `exact` / EIP-3009，`@x402/core` `@x402/evm` `@x402/express` `@x402/fetch` `@x402/extensions` ~2.26.0 |
+| 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交），2026-09-19 已实跑：串行每笔约 1 s，托管 facilitator 下并发会失败（§13）；2026-09-21 付通了两个不属于本仓库的 payee（§13） |
+| 测试 | 7 个工作区共 262 个测试，全绿；demo 10 个场景全过 |
+| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；Kairos 的 face 在进程内把 `packages/cli/src/tools.ts` 的九个工具注册给 agent，并已经通过 face 从 vendor simulator 买入 Massive 形状的日线（`wallet_pay` + `save_to`，文件落在频道的 `vendor/` 下，再进 PIT bed）（2026-09-21，分支 `feat/bought-data`） |
+| 发现 | `agentpay discover` / `wallet_discover` 查公开的 CDP Bazaar 目录，只列这个钱包付得了的行（§9） |
+| 不做 | V1、`upto`（只有设计稿 `docs/upto-design.md`）、Permit2、智能合约钱包签名、批量结算、争议、KYC、前端 |
 
 ## 2. 目标与范围
 
@@ -162,8 +163,13 @@ agentpay 加的：
 - **在途守卫**（`IdempotencyStore`，键 `from:nonce`，服务端 TTL = `maxTimeoutSeconds + 60`）：`onBeforeVerify` 先 `claim`，重复在途 → abort `replay`；`onAfterVerify`（`isValid:false`）/ `onVerifyFailure` / `onSettleFailure` / `onVerifiedPaymentCanceled` 释放；`onAfterSettle` 成功后 `retain`，重放不再打 facilitator。同一个 paywall 的所有路由共享一个 store，所以同一授权并发打两条同价路由也只服务一次。
 - facilitator 抛出的错误（不可达、超时、5xx）在 `onVerifyFailure` / `onSettleFailure` 里 `recovered` 成干净的原因码：`settlement_unavailable`，或 facilitator 自己 5xx 里给的 `invalidReason` / `errorReason`。否则客户端看到的是异常文本。
 - 首次 402 的 body：`{ x402Version: 2, error: 'payment_required', message, payment_model_context }`（`includeHints: false` 可关）。verify 失败的 402 body 固定 `{}`，原因在头的 `error` 字段——这是官方实现的行为，钱包据此读原因。
+- **结算队列，每个 facilitator 一条**：`/settle` 经 `LockedFacilitatorClient`（继承官方 `HTTPFacilitatorClient`，只覆写 `settle`，所以 core 的 `settleWithPendingRetry` 和我们的重试都从它走）送进 `settleLockFor(url)`——进程级、按 facilitator URL 建的 promise 链锁，与 facilitator 自己的发送锁是同一份实现（payee 不依赖 facilitator 包，`settle-lock.ts` 是一份拷贝）。`/verify` 是读，不排队。为什么按 URL 而不是按 paywall：托管的 x402.org 用一个账户签所有结算，两笔 `/settle` 一起到它那里，它自己的 nonce 管理器就输（§13：5 并发成 2），同一进程里两个 paywall 指向同一个 facilitator 照样会互相撞。`serializeSettle: false` 退回官方客户端（并发结算，吞吐跟链走）。
+- **一次重试**：`onSettleFailure` 里，原因恰好是 `invalid_exact_evm_transaction_failed`、配置了 `chainReader`、且这把 `from:nonce` 还没重试过时，先读链上 `authorizationState(from, nonce)`：**false**（钱没动）→ 等 `settleRetryDelayMs`（默认 1500 ms）再 `settle` 一次；成功则自己做 `onAfterSettle` 的活（`retain` + `onSettled`）并 `recovered` 成正常结算——EIP-3009 的 nonce 保证第二次不会重复扣款。其它情况（别的原因码、没有 RPC、nonce 已用、链读不到、已重试过）照旧释放 claim 并回失败。重试进行中 claim 不释放，同一授权的并发重放插不进来；`retried` 表的条目随授权有效期 + 60 s 过期。这个原因码本身是含糊的：转账真 revert 了，或 facilitator 输掉了自己账户 nonce 的竞争（托管 facilitator 并发时就是后者），链上状态替它分辨。
+- **`rpcUrl` / `chainReader`**：`createChainReader(rpcUrl, { timeoutMs = 5000 })` 用 viem `readContract` 读 `authorizationState`，`retryCount: 0`——决定重不重试要快且诚实，RPC 抖动就当"不知道"、不重试（读挂着等于付款方的响应挂着）。给了 `chainReader` 就忽略 `rpcUrl`；两者都没有，结算失败即终局。示例 payee 读 `PAYEE_RPC_URL`，缺省按网络取（hardhat `:8545` / `sepolia.base.org`），取不到则告警。
+- **`ChargeOptions.discovery`**：一条路由可以向目录（CDP Bazaar）申报自己。`DiscoveryDeclaration { input, inputSchema, pathParams, pathParamsSchema, bodyType, output, routeTemplate }` 经 `@x402/extensions/bazaar` 的 `declareDiscoveryExtension` 变成 402 的 `extensions.bazaar`，`@x402/express` 自己的校验照跑。`routeTemplate` 必须显式给：`charge()` 按路由挂载，扩展看到的模式只有 `*`，推不出模板，不给的话目录会把资源登记在第一次被调用的具体 URL 下。模板在 `charge()` 时就按 `ROUTE_TEMPLATE_RE` + 官方 `isValidRouteTemplate` 校验（写路由的地方报错，而不是第一个请求）；`pathParams` 没给 schema 时派生一个字符串 schema，否则目录会拒绝未申报的字段。示例要小：目录会把它回显给每个搜索者，两根 bar 足够，402 保持在 4 KB 以内。
+- **vendor simulator**（`examples/vendor-sim`，`npm run vendor-sim`，默认 `:4022`）：Kairos 拿到主网 USDC 后要买的真实数据源（Massive，Polygon.io 血统）的形状。`GET /v2/aggs/ticker/:ticker/range/1/day/:from/:to` 答 `{ ticker, adjusted, results: [{ t, o, h, l, c, v, vw, n }], status: 'OK' }`，$0.01 一次，`adjusted` 原样回显且缺省 `true`——与 Polygon 完全一致，所以漏写 `adjusted=false` 的 URL 会被 Kairos 那边拒绝复权 bar 的读取器抓住；`GET /v2/reference/news?ticker=` 答新闻列表，$0.01；`/health` 免费。价格是按 ticker 播种的确定性随机游走（同一天同一根 bar 在每个进程里都一样，跳过周末、无节假日、`request_id` 前缀 `sim-`），没有任何输出能被误认为行情。一个 symbol-年约 28 KB，这就是 `wallet_pay` 长出 `save_to` 的原因。参数错误在 handler 里答 400——paywall 之后，所以付了但失败的调用永远不结算，与真实 vendor 一致。两个示例共用 `examples/env.ts` 解析环境。
 
-配置：`facilitator { url, timeoutMs (默认 35 s ≥ facilitator 的回执超时), authToken? }`、`network`、`asset`、`assetDomain`、`payTo`、`maxTimeoutSeconds`（默认 60）、`onSettled`。
+配置：`facilitator { url, timeoutMs (默认 35 s ≥ facilitator 的回执超时), authToken? }`、`network`、`asset`、`assetDomain`、`payTo`、`maxTimeoutSeconds`（默认 60）、`onSettled`、`serializeSettle`（默认 true）、`rpcUrl` / `chainReader`、`settleRetryDelayMs`（默认 1500）。
 
 ## 8. 付款方钱包
 
@@ -231,10 +237,30 @@ agentpay 加的：
 |---|---|
 | 钱包 | `address`（打钱地址，不需要 ETH）`balance` |
 | 预算 | `mandate-request` `mandate-create` `mandate-approve` `mandate-enable` `mandate-disable` `mandate-delegate --parent <id> --holder <session:<id>\|children:<sessionId>\|bot:<id>> --limit <usd> [--valid-for --hosts --per-call --category --purpose]` `mandate-list`（含 parentId/holder 与**有效**余额）`mandate-status` |
-| 付款 | `offer <url>` `pay <url> [--method --body --header --mandate --prepay --context k=v… --caller …]` `ledger` `reconcile` `report`（含 byChannel/bySession） |
+| 发现 | `discover <query> [--max-usd usd --limit n --bazaar url]` `discover --list [--offset n]` |
+| 付款 | `offer <url>` `pay <url> [--method --body --header --mandate --prepay --context k=v… --caller … --save <rel> [--overwrite]]` `ledger` `reconcile` `report`（含 byChannel/bySession） |
 | 设置 | `init [--from-deployment localhost\|base-sepolia\|path.json]` |
 
-`pay` 输出 `payment: { transaction, network, payer, nonce, intentMandateId, amount, ledgerStatus }`（按 `x-agentpay-nonce` 找账本行）；`paid` 只在 `ledgerStatus === 'settled'` 时为 true；`unknown` 时附 `payment_model_context`（先 `reconcile` 再付）。配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > 部署记录；token 的域随 token 走（`AGENTPAY_TOKEN_NAME/VERSION`，或部署记录）。归因：`--context k=v` 可重复（键 `channel channelName session parentSession origin callId label`），`AGENTPAY_CONTEXT=k=v,…` 给默认值、标志覆盖；`--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>`（默认 principal）决定可见预算集合（§8.7）。锁：`pay`、`mandate-*`、`reconcile` 遇到 `wallet.lock` 指向活进程的 home 直接退出码 2（`error: 'locked'`，报 pid），只读命令照常（§8.10）。`SKILL.md` 的决策流程：申请预算 → 人批 → 在预算内付；`offer` 看价 → `mandate-list` 找自己持有的预算 → 没有就 `mandate-request` 起草并停下等人批（子任务不能申请，找父会话 `mandate-delegate --holder children:<session>` 委托）→ `pay` → 被拒读 `remediation`（`no_held_mandate`：这个调用者名下没有任何预算；`holder_mismatch`：钉住的预算是别人的；`host_not_allowed` / `mandate_insufficient_budget` 带 `detail.ancestorId` 时是祖先卡住，再委托也没用）；永远不申请 `*` 主机；结果 `unknown` 时先 `reconcile`。
+`pay` 输出 `payment: { transaction, network, payer, nonce, intentMandateId, amount, ledgerStatus }`（按 `x-agentpay-nonce` 找账本行）；`paid` 只在 `ledgerStatus === 'settled'` 时为 true；`unknown` 时附 `payment_model_context`（先 `reconcile` 再付）。配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > 部署记录；token 的域随 token 走（`AGENTPAY_TOKEN_NAME/VERSION`，或部署记录）。归因：`--context k=v` 可重复（键 `channel channelName session parentSession origin callId label`），`AGENTPAY_CONTEXT=k=v,…` 给默认值、标志覆盖；`--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>`（默认 principal）决定可见预算集合（§8.7）。锁：`pay`、`mandate-*`、`reconcile` 遇到 `wallet.lock` 指向活进程的 home 直接退出码 2（`error: 'locked'`，报 pid），只读命令照常（§8.10）。`SKILL.md` 的决策流程：申请预算 → 人批 → 在预算内付；第 0 步没有 URL 先 `discover` 找卖家 → `offer` 看价 → `mandate-list` 找自己持有的预算 → 没有就 `mandate-request` 起草并停下等人批（子任务不能申请，找父会话 `mandate-delegate --holder children:<session>` 委托）→ `pay`（几 KB 以上要处理的数据用 `--save`）→ 被拒读 `remediation`（`no_held_mandate`：这个调用者名下没有任何预算；`holder_mismatch`：钉住的预算是别人的；`host_not_allowed` / `mandate_insufficient_budget` 带 `detail.ancestorId` 时是祖先卡住，再委托也没用；`discovery_unavailable` 是目录挂了、不是钱包的问题）；永远不申请 `*` 主机；结果 `unknown` 时先 `reconcile`。
+
+### 9.1 `discover`：公开目录，只列付得了的
+
+`agentpay discover <query>` 和工具表的 `wallet_discover` 查 **CDP Bazaar**（`https://api.cdp.coinbase.com/platform/v2/x402/discovery/search`，公开、无需 key；`--bazaar` > `AGENTPAY_BAZAAR_URL` > `config.json` 的 `bazaarUrl` > 缺省，因为 x402.org 不提供目录）。客户端在 `packages/cli/src/bazaar.ts` 自己写（不用 `@x402/extensions` 的 `withBazaar`：它用全局 fetch、没有超时、没有响应上限、也没有排序要用的 `quality` 类型）。流程：按钱包的网络搜 → 每行的 `accepts` 过 **`isPayableOffer`**——与 `fetch()` 的 402 闸同一个谓词，现在是 `packages/wallet/src/offers.ts` 导出的纯函数（网络、token、`exact`/EIP-3009、钱包配置的域、`maxTimeoutSeconds ≤ 300）——所以模型永远不会看到 `pay` 会以 `unsupported_offer` 拒绝的卖家（主网行、`upto` 行、Permit2 行、900 s 的行都被滤掉）→ 按 30 天内不同付款人数排序 → 投影成模型需要的字段：资源模板（`:symbol` / `{symbol}` 是路径参数）、方法、`price_usd`、网络、`pay_to`、30 天用量、`last_called`、一个 ≤ 500 字符的输入示例、≤ 5 个标签；目录里动辄几 KB 的输出示例、schema、图标**从不回显**。读取有界：10 s 超时、4 MiB 上限；任何失败（不可达、慢、非 2xx、不是目录的 body）都折叠成 `discovery_unavailable`（退出码 1），目录挂了不能长得像钱包坏了。`--list [--offset]` 翻原始目录（客户端过滤：CDP 那条端点忽略 network 和 limit）。每份结果都带固定的 `note`：目录价格会过期、描述是卖家自己写的，付款前先 `offer` 具体 URL，只付 402 要的。2026-09-21 对真目录实跑（Base Sepolia）：4 行匹配、4 行付得了、3.1 KB。目录只列 `https` 资源，所以本机的 vendor-sim 永远搜不到（直接用 URL）。
+
+### 9.2 `pay --save` / `save_to`：把 body 写成文件
+
+一个 symbol-年的 bar 装不进工具回给模型的 8 KB（`MAX_BODY_BYTES`）。`pay --save <rel> [--overwrite]` 把 2xx 的 body 写到文件，信封里带 `saved: { path, bytes, sha256, content_type }` 加 1 KB 的 `preview`（`preview_truncated`），**不带 `body`**；非 2xx 的拒绝与不带 `--save` 时完全一样。规则：
+
+- **相对路径规则**：`rel` 相对于 `saveRoot`——CLI 是 `process.cwd()`，宿主进程在 `ToolCallMeta.saveRoot` 上按会话给（比如频道的 `vendor/`），没给的会话调 `save_to` 是用法错误、**付款不发生**。`resolveSavePath` 拒绝：空、> 200 字符、含 NUL、Windows 盘符或 UNC 前缀、绝对路径、任何 `..` 段（规范化前后都查：`a/b/..` 会归一成 `a`，但写 `..` 的模型不是在写文件名）、目录名（`.` 或以 `/` 结尾）、resolve 后不在 root 之内、最近的已存在祖先 realpath 后（穿过符号链接）不在 root 之内、路上有一个已存在的**文件**当目录（`massive/x.json/inner.json` 在买过 `massive/x.json` 之后——不拦的话付了款 mkdir 才抛 EEXIST），以及文件已存在而没有 `overwrite`。全部在付款**之前**查，坏路径不花钱。
+- **信封形状**：`saved.path` 永远是规范化后的**相对**路径（模型和宿主的钱包页面不能得知宿主的目录布局），账本行的 `context.label` 缺省就是同一个字符串，钱包页能按它叫出文件名。写入是 tmp + rename 的原子写，先建目录。
+- **`write_failed`**：付款之后写失败（EACCES、ENOSPC、路径上的竞争）回 `saved: { error: 'write_failed', path, code, bytes, content_type }` 加 preview，信封仍是 `paid: true`——抛出去会丢掉收据、还把宿主的绝对路径打给调用者。
+- **32 MiB 上界**（`MAX_SAVE_BYTES`）：更大的 body 不写，回 `saved: { error: 'body_too_large', path, bytes, limit }`，付款已经发生所以是报告而不是抛出。
+
+`saved.sha256` 是收据，SKILL 让 agent 把它记在 `payment.transaction` 旁边。
+
+### 9.3 工具表
+
+`packages/cli/src/tools.ts` 现在是**九个**工具：`wallet_offer`、`wallet_pay`（多了 `save_to`、`overwrite`）、`wallet_discover`（`query`、`max_usd`、`limit ≤ 20`）、`wallet_budget_request`（仅主体）、`wallet_budget_delegate`、`wallet_budget_disable`、`wallet_budgets`、`wallet_report`（仅主体）、`wallet_reconcile`（仅主体）。宿主在 `ToolCallMeta { context, caller, requesterSession, saveRoot }` 里给归因、调用者和保存目录；处理器回 CLI 同一份 JSON 信封，模型读同一套 `payment_model_context`。
 
 ## 10. 安全模型与信任边界
 
@@ -269,9 +295,9 @@ agentpay 加的：
 | core | 10 | 金额、CAIP、nonce 格式、ABI 切片、每个原因码都有提示 |
 | contracts | 12 | MockUSDC 元数据与域、EIP-3009 转账/重放/过期/未生效/错签名/余额不足（整笔 revert、nonce 不消耗）、`receiveWithAuthorization` 调用者、Multicall3 已就位 |
 | facilitator | 35 | verify 各原因（含 Multicall3 精确诊断）、settle 转账/去重/12 并发 nonce 连续/不广播的拒绝/RPC 故障 503 与恢复、HTTP 面（400/401/404/405/413、V1 拒绝）、配置、启动检查（链 id、非 EIP-3009、域错、无 ETH、RPC 不可达） |
-| payee | 22 | 402 形状与提示、支付流程、本地重放、并发同授权（同路由与跨路由）、回显篡改、facilitator 拒绝/宕机/超时/5xx/`settlement_pending`、handler 失败不结算、settle 失败 402；真 facilitator + 官方 `@x402/fetch` 客户端上链付通 |
-| wallet | 59 | 策略闸每个理由（含域不匹配、`timeout_too_long`）、并发预留、账本（v2、拒绝 AEP2 行、耐久序列）、结算报告各分支、传输错误重发同头、崩溃窗口重算、prepay、report；链上：真 facilitator 付款、链下结算后对账、链 id 守卫、链时间过期释放与谎报退款 |
-| cli | 12 | 命令 JSON 契约、配置（token 域必填、无 RPC 时 `pay` 可用）、`offer`/`pay`/拒绝/`unknown` 提示、stderr 修复日志 |
+| payee | 53 | 402 形状与提示、支付流程、本地重放、并发同授权（同路由与跨路由）、回显篡改、facilitator 拒绝/宕机/超时/5xx/`settlement_pending`、handler 失败不结算、settle 失败 402；结算队列（同一 URL 串行、`serializeSettle: false` 并发）与一次重试（nonce 未用才重试、只一次、别的原因不重试、无 RPC 不重试、链读失败不重试、重试期间 claim 不放）；`charge()` 的 discovery 透传与坏模板拒绝；vendor-sim（确定性、周末空缺、OHLC 顺序、免费 `/health`、402 的申报与大小、付费调用、失败的付费调用不结算、新闻）；真 facilitator + 官方 `@x402/fetch` 客户端上链付通 |
+| wallet | 86 | 策略闸每个理由（含域不匹配、`timeout_too_long`）、并发预留、账本（v2、拒绝 AEP2 行、耐久序列）、结算报告各分支、传输错误重发同头、崩溃窗口重算、prepay、report、`isPayableOffer` 与 402 闸等价；链上：真 facilitator 付款、链下结算后对账、链 id 守卫、链时间过期释放与谎报退款 |
+| cli | 63 | 命令 JSON 契约、配置（token 域必填、无 RPC 时 `pay` 可用）、`offer`/`pay`/拒绝/`unknown` 提示、stderr 修复日志；`discover`（捕获的 CDP 形状的 stub 目录：双网络行、仅主网行、`upto` 行、900 s 行，7 个用例）；`--save` / `save_to`（路径规则每一条、原子写、`body_too_large`、`write_failed`、`saveRoot` 缺失不付款、相对 `saved.path`）；工具表九个；testnet 互通脚本的报告形状 |
 | demo | 3 | 端到端 |
 
 测试基础设施：每个需要链的包在 vitest global-setup 里各起一个 Hardhat 节点（8546 contracts、8547 facilitator、8548 payee、8549 wallet），`deployLocalFixture` 部署 MockUSDC + Multicall3；账户 #0 部署者、#1 付款人、#2 收款人、#3 facilitator、#4 陌生人。demo 用 8545 / 3001 / 4021。
@@ -284,7 +310,8 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 
 - **本地**：`npx hardhat node` → `npm run deploy:local`（MockUSDC + Multicall3，写 `localhost.json` 含 `usdcDomain`）→ `FACILITATOR_PK=… npm run facilitator` → `npm run payee` → `npm run cli -- …`。
 - **Base Sepolia**：不部署任何东西。payee 指向 `FACILITATOR_URL=https://x402.org/facilitator`（`/supported` 已确认含 `{x402Version:2, scheme:'exact', network:'eip155:84532'}`），付款 EOA 只需测试 USDC；自建 facilitator 需要有 Sepolia ETH 的 `FACILITATOR_PK` 并设置 `PAYEES`。
-- **Base Sepolia 实跑（2026-09-19，托管 facilitator + 公共 `sepolia.base.org`）**：新生成的付款 EOA 只领了水龙头 USDC、没有 ETH。串行 10 笔全部 `200` + `settled`，单笔 675 ms–1.8 s、中位 934 ms；首笔结算 [`0xe833…c9d`](https://sepolia.basescan.org/tx/0xe833ba2f4468695dc6f3c50cd4c154e13e5f114164eb3910d517b9adf2b84c9d) 由托管 facilitator 的签名账户 `0xd407…f1bf` 发出，`Transfer(payer → payee, 1000)`。**并发 5 笔只成 2 笔**：其余 3 笔 `402 invalid_exact_evm_transaction_failed`（托管 facilitator 自己的账户 nonce 撞车 `replacement transaction underpriced`，另有一次公共 RPC `over rate limit`），两轮复现；这 3 笔 handler 已经跑过、付款方未扣款、钱包记 `rejected`，授权按链时间过期后 `reconcile` 释放为 `expired-unused`。自建 facilitator 有发送锁（demo 场景 7 二十并发全成），所以对托管 facilitator 要么让 agent 串行付，要么自建。`balance` / `reconcile` / `report` 与链上分毫不差：16 笔结算 = $0.025。
+- **Base Sepolia 实跑（2026-09-19，托管 facilitator + 公共 `sepolia.base.org`）**：新生成的付款 EOA 只领了水龙头 USDC、没有 ETH。串行 10 笔全部 `200` + `settled`，单笔 675 ms–1.8 s、中位 934 ms；首笔结算 [`0xe833…c9d`](https://sepolia.basescan.org/tx/0xe833ba2f4468695dc6f3c50cd4c154e13e5f114164eb3910d517b9adf2b84c9d) 由托管 facilitator 的签名账户 `0xd407…f1bf` 发出，`Transfer(payer → payee, 1000)`。**并发 5 笔只成 2 笔**：其余 3 笔 `402 invalid_exact_evm_transaction_failed`（托管 facilitator 自己的账户 nonce 撞车 `replacement transaction underpriced`，另有一次公共 RPC `over rate limit`），两轮复现；这 3 笔 handler 已经跑过、付款方未扣款、钱包记 `rejected`，授权按链时间过期后 `reconcile` 释放为 `expired-unused`。自建 facilitator 有发送锁（demo 场景 7 二十并发全成），所以对托管 facilitator 要么让 agent 串行付，要么自建。`balance` / `reconcile` / `report` 与链上分毫不差：16 笔结算 = $0.025。**这之后 payee 加了按 facilitator 排队的结算和一次重试（§7）**：demo 场景 7 的二十并发现在经过队列串行结算，20/20 成功、共 853 ms；对托管 facilitator，并发调用不再撞它的 nonce，代价是并发退化成串行（§15）。
+- **与陌生人的互通（2026-09-21，`npm run interop:testnet -w @agentpay/cli`，报告 `docs/interop/testnet-interop-2026-09-21.json`）**：`packages/cli/scripts/testnet-interop.ts` 只在 Base Sepolia 的钱包主目录上跑，付两个**不属于本仓库**的 payee：先对真目录 `discover "market snapshot BTC"`（4 行匹配、4 行付得了），一个预算点名主机（`x402.payai.network`、`omniterminal.app`），然后每个目标先 `offer` 再 `pay`，再 3 并发，最后 `reconcile`，报告记状态、延迟、交易哈希、账本状态，以及从链上读回的结算方签名账户。结果：**PayAI 的 echo**（`/api/base-sepolia/paid-content`，$0.01）402 在 116 ms 内答复，`pay` 200 + `settled`、857 ms，交易 [`0x8efe…0829`](https://sepolia.basescan.org/tx/0x8efe6631b5130933f287cf0d319e0fec40ab40eb3fb3e6cac4cc22840d510829) 由 x402.org 的签名账户 `0xc669…cb63` 发出、`payer` 是我们的钱包，body 467 字节经 `--save` 逐字节落盘（sha256 在报告里）——两个各自实现的 payee 和 facilitator 吃同一份 `PAYMENT-SIGNATURE`。**Omni Terminal** 的 `/market-snapshot/BTC` 402 答得对（Base Sepolia 与 Base 主网两个报价，钱包选前者），但收下签好的头后答 503 `service_unavailable`（单笔与 3 并发都是），钱包记 `rejected`、预留保持——这是"陌生人不可用"的诚实记录：授权已签出，只有链时间过了 `validBefore`（300 s）之后 `reconcile` 看到 nonce 未用才释放为 `expired-unused`；报告里的 `reconcile` 跑在有效期内，所以 10 行仍 pending，有效期过后在同一个主目录上再跑一次 `agentpay reconcile` 即释放（报告的 `notes` 就是这么写的）。账本：5 行新增（1 settled、4 rejected），花 $0.010、预留 $0.020。报告里机器本地的路径已换成占位符。
 - **约束**：facilitator 的 `RECEIPT_TIMEOUT_MS` < payee 的 `facilitator.timeoutMs`；payee 的 `maxTimeoutSeconds` ≤ 付款方钱包的 `maxAuthorizationValiditySeconds`（默认 60 vs 300）；同一 `AGENTPAY_HOME` 只跑一个钱包进程；AEP2 时代的 `ledger.jsonl` / 旧部署记录要归档重来。
 
 ## 14. 与 x402 参考实现的差异（有意为之）
@@ -293,7 +320,8 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 2. **钱包钉住 token 域**，不信报价里的 `extra.name/version`。
 3. **收款方在途守卫**：参考中间件在首次结算未完成时会把同一授权服务两次（同路由或同条款的另一路由）；`createPaywall` 在 verify 前 claim `from:nonce`。
 4. **facilitator 加固**：白名单、Bearer、EOA 离线验签、RPC 故障答 503 而不是 `invalid_exact_evm_signature`、发送锁。
-5. **只做 V2、`exact`、EIP-3009**。
+5. **收款方的结算队列与一次重试**：参考中间件把每笔 `/settle` 直接并发发给 facilitator；`createPaywall` 按 facilitator URL 串行，并在 `invalid_exact_evm_transaction_failed` 且链上 nonce 未用时重试一次（§7）。
+6. **只做 V2、`exact`、EIP-3009**。
 
 ## 15. 已知限制
 
@@ -303,23 +331,29 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 - facilitator 广播后超时 → `settlement_pending`，付款方多半被扣、收款方已回 402；账本靠 `reconcile` 纠正；pending 去重只在 facilitator 进程内。
 - 自建 facilitator 在真实网络上没有卡住交易的替换逻辑（nonce manager 会排队；重启重同步）。
 - 多进程共用一个 `AGENTPAY_HOME` 的预算竞争未改；链上支付图公开；USDC 可被发行方冻结；MockUSDC 开放 mint。
+- **串行结算有排队延迟**：`/settle` 按 facilitator 排队后，N 个并发调用的第 N 个要等前面 N−1 笔都拿到回执（真网上每笔约 1 s），排队期间授权在向 `validBefore` 老化——队伍长到接近 `maxTimeoutSeconds` 时，后面的结算会以 `..._valid_before` 被拒；吞吐要跟链走的 facilitator 可以 `serializeSettle: false`。
+- **一次重试可能答 `nonce_already_used`**：重试的前提是链上读到 nonce 未用，但第一次广播可能只是**晚到**——读的时候未用、重试到达时已用，facilitator 会答 `invalid_exact_evm_nonce_already_used`，钱包记 `rejected` 而付款人实际已被扣款；`reconcile` 按链上状态改成 `settled`（§8.5）。
+- **`--save` 先整体缓冲再比上限**：body 全部读进内存、付了款，超过 32 MiB 才丢掉；不是流式截断。
+- **`discover` 列不出本机 payee**：目录只收 `https` 资源，loopback 上的 vendor-sim 和示例 payee 永远搜不到，直接用 URL；目录本身也只保证行的形状（`pay` 不会以 `unsupported_offer` 拒绝），不保证卖家还活着、价格没变。
 - 没有 KYC、争议、支付链接、UI。
 
 ## 16. 与 Kairos 的集成现状
 
 - agentpay 仓库：`https://github.com/linqizhe07/agentpay`（`main` 常绿，改动走 PR）；本次迁移是 PR #4（分支 `x402`，已合并），AEP2 最后一版是 tag `aep2-final`。
-- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：分支 `feat/payment`（PR #1，未合并）把子模块钉到 x402 版本；其上的分支 `feat/agent-wallet`（2026-09-21）钉到本仓库 `agent-surface`，face 按相对路径 `../../payment/packages/{cli,wallet}/src/index.ts` 引入（子模块 `npm ci` 后才能通过它的 tsc），`docs/design/kairos-intro.html` 已按 x402 重画。
-- Kairos 是付款方。face 在进程内注册 `tools.ts` 的八个 `wallet_*` 工具，从会话头读出 channel / session / 子任务作为付款 context；`wallet_budget_request` 过 face 的第三道门（审批卡），子预算只给 Kairos 自己的子任务（holder `children:<session>`），bot 没有钱包工具；钱包主目录 `$DSH_HOME/face/agentpay`，face 运行时持 `wallet.lock`，CLI 的写命令会拒绝。设计与评审记录见 Kairos 仓库 `docs/superpowers/specs/2026-09-20-agent-wallet-design.md`。
+- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：分支 `feat/payment`（PR #1，未合并）把子模块钉到 x402 版本；其上的分支 `feat/agent-wallet`（2026-09-21）钉到本仓库 `agent-surface`，face 按相对路径 `../../payment/packages/{cli,wallet}/src/index.ts` 引入（子模块 `npm ci` 后才能通过它的 tsc），`docs/design/kairos-intro.html` 已按 x402 重画；再其上的分支 `feat/bought-data`（2026-09-21）把子模块钉到本分支（最新 `2177984`），接上 `discover` 和 `save_to`。
+- Kairos 是付款方。face 在进程内注册 `tools.ts` 的**九个** `wallet_*` 工具（多了 `wallet_discover`），从会话头读出 channel / session / 子任务作为付款 context；`wallet_budget_request` 过 face 的第三道门（审批卡），子预算只给 Kairos 自己的子任务（holder `children:<session>`），bot 没有钱包工具；钱包主目录 `$DSH_HOME/face/agentpay`，face 运行时持 `wallet.lock`，CLI 的写命令会拒绝。设计与评审记录见 Kairos 仓库 `docs/superpowers/specs/2026-09-20-agent-wallet-design.md`。
+- **买数据的路径**：face 给每个会话的 `ToolCallMeta.saveRoot` 是该策略频道的 `vendor/` 目录，`wallet_pay` 的 `save_to` 写成 `massive/<TICKER>/<from>_<to>.json`（vendor 的字节原样落盘，`saved.path` 只是这个相对路径，卡片和钱包页按它叫出文件名，`tx` 记进 journal）。买来的文件**不是回测输入**：Kairos 的 `bought-data` 机制技能（`dsh/skills/mechanics/bought-data/SKILL.md`）规定它们经 `alpaca_kit` 的 `MassiveFilesSource`（`ALPHA_DATA_SOURCE=massive_files ALPHA_MASSIVE_ROOT=strategies/<name>/vendor/massive`）→ `capture_window` 进 PIT bed → 完整性检查 → 按买入窗口回放；读取器拒绝 `adjusted` 不是 `false` 的文件，THESIS 必须写明这张 bed 没有公司行动。今天喂它的是本仓库的 vendor-sim（`127.0.0.1:4022`，$0.01 一次，Massive 形状）；真 Massive 只在 Base 主网。买来的新闻是交互式证据，没有 PIT 守卫。Kairos 侧对 `save_to` 的验证反过来修了本仓库两处（路径穿过已存在文件、写失败进信封而不是抛出，`2177984`）。
 
 ## 17. 建议的后续工作
 
-1. ~~Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率~~（已做，见 §13）；剩下：用自建 facilitator（`FACILITATOR_PK` 需 Sepolia ETH）再跑一遍，证明两种 facilitator 吃同一份 `PAYMENT-SIGNATURE`，并确认发送锁在真网上也让并发全成。
-1. 托管 facilitator 的并发失败是它那边的 nonce 竞争，我们这边可选的缓解：payee 对同一 facilitator 的 `/settle` 排队串行（代价是并发调用退化成串行 ~1 s/笔），或对 `invalid_exact_evm_transaction_failed` 且授权仍未上链的情况重试一次 `/settle`（EIP-3009 nonce 保证幂等）。
-2. 在 Kairos 里真正接入：MCP server 包装 CLI，人批预算的卡片复用现有审批模式；付款 EOA 的浮动资金策略。
-3. 钱包：~~预算文件加锁或改为单进程守护~~（已做：`lock: true` + `wallet.lock`，见 §8.10）；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
-4. facilitator：限流；Base 上卡住交易的替换；指标。
-5. 若单价降到亚分级、频率高到每笔一块等不起：x402 也有 `batch-settlement` scheme 槽位，`aep2-final` 的代码可作为其 network binding 复活。
-6. `upto`（付款方签上限、收款方按实际结算，Permit2 + `setSettlementOverrides`）：接法已记在 `docs/upto-design.md`（钱包、payee、facilitator 各要改什么，首个目标与验收条件），本轮不做——现有数据卖家全是 `exact`。
+1. ~~Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率~~（已做，见 §13）；~~证明两种各自实现的 payee / facilitator 吃同一份 `PAYMENT-SIGNATURE`~~（已做：2026-09-21 付通 PayAI，见 §13）；剩下：用自建 facilitator（`FACILITATOR_PK` 需 Sepolia ETH）再跑一遍，确认发送锁在真网上也让并发全成。
+2. ~~托管 facilitator 的并发失败：payee 对同一 facilitator 的 `/settle` 排队串行，或对 `invalid_exact_evm_transaction_failed` 且授权仍未上链的情况重试一次~~（两者都已做，见 §7）；剩下：在托管 facilitator 上重跑 5 并发，量化排队后的延迟。
+3. **真 Massive 要上主网**：`agent.massive.com` 只在 Base 主网（`eip155:8453`）卖，需要一份主网部署记录（Circle 主网 USDC `0x8335…2913`、域、托管 facilitator）加付款 EOA 的浮动资金策略（小额、冷钱包补充、`floatWarnAtomic`）；今天 Kairos 买的是 vendor-sim。
+4. 在 Kairos 里：~~工具表接入 face~~（已做，见 §16）；付款 EOA 的浮动资金策略；把 vendor-sim 登记进 CDP 目录让 `discover` 能搜到它需要一个 CDP key（目录只收 `https` 资源，而且登记走 CDP 的写接口），本轮没有。
+5. 钱包：~~预算文件加锁或改为单进程守护~~（已做：`lock: true` + `wallet.lock`，见 §8.10）；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）；`FetchOptions.maxBodyBytes`——让 `--save` / `save_to` 在下载中就按上限截断，而不是整体缓冲后再比 32 MiB（§15）。
+6. facilitator：限流；Base 上卡住交易的替换；指标。
+7. `upto`（付款方签上限、收款方按实际结算，Permit2 + `setSettlementOverrides`）：接法已记在 `docs/upto-design.md`（钱包、payee、facilitator 各要改什么，首个目标与验收条件），**推迟**——x402 生态里每个美股数据卖家（Massive、x402stock、tickersfeed、OttoAI、EDGAR 的 apitoll、x402atlas）都是 Base 主网上固定单价的 `exact`，唯一的 `upto` payee 是个模拟。
+8. **推迟**：批量结算（若单价降到亚分级、频率高到每笔一块等不起：x402 也有 `batch-settlement` scheme 槽位，`aep2-final` 的代码可作为其 network binding 复活）和 Solana（x402 的 `svm` 绑定）——现有卖家都在 Base，先不做。
 
 ## 附录 A：文件索引
 
@@ -328,10 +362,11 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 | `packages/core/src/{types,errors,hints,money,caip,ids,eip3009}.ts` | 底座：类型再导出、错误码与提示、金额、CAIP、EIP-3009 ABI 切片 |
 | `packages/contracts/contracts/MockUSDC.sol`，`src/{deploy,deployments,multicall3,abi}.ts`，`deployments/base-sepolia.json` | 测试 token、本地夹具、部署记录 |
 | `packages/facilitator/src/{facilitator,server,chain,config,index,main}.ts` | facilitator |
-| `packages/payee/src/{paywall,store,types}.ts`，`examples/express.ts` | 收款方 |
-| `packages/wallet/src/{wallet,policy,mandate-store,ledger,durable,hosts}.ts` | 钱包 |
-| `packages/cli/src/{cli,config,amounts,output,context}.ts`，`commands/*`，`SKILL.md` | CLI |
+| `packages/payee/src/{paywall,store,types,settle-lock,chain-reader}.ts`，`examples/{express,env}.ts`，`examples/vendor-sim/{main,app,data}.ts` | 收款方、结算队列与重试、Massive 形状的数据源模拟器 |
+| `packages/wallet/src/{wallet,policy,mandate-store,ledger,durable,hosts,offers}.ts` | 钱包；`offers.ts` 是 `isPayableOffer` |
+| `packages/cli/src/{cli,config,amounts,output,context,tools,bazaar,save}.ts`，`commands/*`，`scripts/testnet-interop.ts`，`SKILL.md` | CLI、工具表、目录客户端、`--save`、互通脚本 |
 | `demo/src/{run-demo,facilitator,payee,chain,accounts,util}.ts` | 端到端演示 |
+| `docs/upto-design.md`，`docs/interop/testnet-interop-2026-09-21.json` | `upto` 设计稿；互通实跑报告 |
 | `README.md`、`.env.example` | 用法与配置 |
 
 ## 附录 B：术语
