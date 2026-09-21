@@ -129,7 +129,13 @@ npm run cli -- address        # send Base Sepolia test USDC here; no ETH needed
 npm run cli -- pay http://127.0.0.1:4021/predict
 ```
 
-To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_PK=… PAYEES=0x… npm run facilitator` (the key needs Base Sepolia ETH). Expect roughly 2–4 s per paid call on Base (one block plus receipt polling), against ~50 ms on an automining hardhat node.
+To run your own facilitator there instead: `DEPLOYMENT=base-sepolia FACILITATOR_PK=… PAYEES=0x… npm run facilitator` (the key needs Base Sepolia ETH).
+
+Measured on 2026-09-19 against the hosted facilitator (settler `0xd407…f1bf`) and the public `sepolia.base.org` RPC, with a fresh payer holding faucet USDC and no ETH:
+
+- **Sequential paid calls settle in about a second**: 10 in a row, all `200` + `settled`, min 675 ms · median 934 ms · avg 1.0 s · max 1.8 s per call (402 → sign → verify → handler → settle → receipt), against ~50 ms on an automining hardhat node. First settlement: [`0xe833…c9d`](https://sepolia.basescan.org/tx/0xe833ba2f4468695dc6f3c50cd4c154e13e5f114164eb3910d517b9adf2b84c9d), a `transferWithAuthorization` sent by the facilitator, `Transfer(payer → payee, 1000)`, 102 828 gas paid by the facilitator.
+- **Parallel calls through the hosted facilitator fail more often than not**: 5 concurrent calls from one payee → 2 settled, 3 answered `402 invalid_exact_evm_transaction_failed` (`replacement transaction underpriced`: the hosted settler reused its own account nonce; once `over rate limit` from the public RPC). Reproduced twice. For those three the handler had already run (settle-after-handler), the payer was not charged, the wallet recorded `rejected`, and `reconcile` released the reservations as `expired-unused` once chain time passed `validBefore`. The self-hosted facilitator serializes its sends (demo scenario 7: 20/20 concurrent), so against the hosted one keep an agent's paid calls sequential, or run your own.
+- `balance`, `reconcile` and `report` agree with the chain to the unit: 16 settlements = $0.025 spent, every settled row confirmed through `authorizationState`, every refused one released.
 
 ## Differences from the x402 reference setup (deliberate)
 

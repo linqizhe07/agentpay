@@ -1,6 +1,6 @@
 # agentpay 技术报告
 
-> 版本：分支 `x402`（2026-09-19），x402 迁移完成后的第一版。适用读者：接入或维护这套支付系统的工程师。AEP2 时代的最后一版代码在 tag `aep2-final`。
+> 版本：`main`（2026-09-19，PR #4 合并后 + Base Sepolia 实跑），x402 迁移完成后的第一版。适用读者：接入或维护这套支付系统的工程师。AEP2 时代的最后一版代码在 tag `aep2-final`。
 
 ## 1. 摘要
 
@@ -12,7 +12,7 @@ agentpay 是一套给 AI agent 用的支付系统：协议是 Coinbase 的 **x40
 |---|---|
 | 代码 | TypeScript ESM monorepo，6 个包 + demo；Solidity 只剩测试用 `MockUSDC.sol` |
 | 协议 | x402 V2 / `exact` / EIP-3009，`@x402/core` `@x402/evm` `@x402/express` `@x402/fetch` ~2.26.0 |
-| 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交，未实跑） |
+| 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交），2026-09-19 已实跑：串行每笔约 1 s，托管 facilitator 下并发会失败（§13） |
 | 测试 | 7 个工作区共 153 个测试，全绿；demo 10 个场景全过 |
 | 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；`face/` 尚未调用 |
 | 不做 | V1、`upto`、Permit2、智能合约钱包签名、批量结算、争议、KYC、前端 |
@@ -139,7 +139,7 @@ from = 付款人；to = payTo；value = amount；validAfter = 0；validBefore = 
 - `packages/contracts/contracts/MockUSDC.sol`：测试用 EIP-3009 token（`transferWithAuthorization` / `receiveWithAuthorization` / `authorizationState`，OpenZeppelin `EIP712`，域 `Mock USD Coin`/`2`，开放 `mint`）。只在本地链用。
 - `deployLocalFixture()`：MockUSDC + 用 `hardhat_setCode` 放到规范地址 `0xcA11…CA11` 的 **Multicall3** 字节码——`@x402/evm` 在模拟失败后靠它诊断精确原因（余额不足、nonce 已用、域不匹配），没有它本地只能得到笼统的 `..._simulation_failed`。
 - 部署记录 `DeploymentRecord { chainId, network, usdc, usdcDomain: { name, version }, facilitatorUrl?, ... }`：`localhost.json` 由 `deploy:local` 生成（gitignored）；`base-sepolia.json` 是提交的静态记录，域已按链上 `DOMAIN_SEPARATOR()` 核对。缺 `usdcDomain` 的旧记录会被 `assertDeploymentRecord` 拒绝。
-- Gas：`transferWithAuthorization` 每笔约 6–8 万 gas，由 facilitator 付；Base 上一次付费调用约 2–4 s（一个块 + 回执轮询），本地 automine 约 50 ms。
+- Gas：`transferWithAuthorization` 每笔约 6–10 万 gas（Base Sepolia 实测 102 828），由 facilitator 付；Base Sepolia 上一次付费调用实测约 1 s（10 笔串行：最小 675 ms、中位 934 ms、最大 1.8 s），本地 automine 约 50 ms。
 
 ## 6. facilitator
 
@@ -263,6 +263,7 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 
 - **本地**：`npx hardhat node` → `npm run deploy:local`（MockUSDC + Multicall3，写 `localhost.json` 含 `usdcDomain`）→ `FACILITATOR_PK=… npm run facilitator` → `npm run payee` → `npm run cli -- …`。
 - **Base Sepolia**：不部署任何东西。payee 指向 `FACILITATOR_URL=https://x402.org/facilitator`（`/supported` 已确认含 `{x402Version:2, scheme:'exact', network:'eip155:84532'}`），付款 EOA 只需测试 USDC；自建 facilitator 需要有 Sepolia ETH 的 `FACILITATOR_PK` 并设置 `PAYEES`。
+- **Base Sepolia 实跑（2026-09-19，托管 facilitator + 公共 `sepolia.base.org`）**：新生成的付款 EOA 只领了水龙头 USDC、没有 ETH。串行 10 笔全部 `200` + `settled`，单笔 675 ms–1.8 s、中位 934 ms；首笔结算 [`0xe833…c9d`](https://sepolia.basescan.org/tx/0xe833ba2f4468695dc6f3c50cd4c154e13e5f114164eb3910d517b9adf2b84c9d) 由托管 facilitator 的签名账户 `0xd407…f1bf` 发出，`Transfer(payer → payee, 1000)`。**并发 5 笔只成 2 笔**：其余 3 笔 `402 invalid_exact_evm_transaction_failed`（托管 facilitator 自己的账户 nonce 撞车 `replacement transaction underpriced`，另有一次公共 RPC `over rate limit`），两轮复现；这 3 笔 handler 已经跑过、付款方未扣款、钱包记 `rejected`，授权按链时间过期后 `reconcile` 释放为 `expired-unused`。自建 facilitator 有发送锁（demo 场景 7 二十并发全成），所以对托管 facilitator 要么让 agent 串行付，要么自建。`balance` / `reconcile` / `report` 与链上分毫不差：16 笔结算 = $0.025。
 - **约束**：facilitator 的 `RECEIPT_TIMEOUT_MS` < payee 的 `facilitator.timeoutMs`；payee 的 `maxTimeoutSeconds` ≤ 付款方钱包的 `maxAuthorizationValiditySeconds`（默认 60 vs 300）；同一 `AGENTPAY_HOME` 只跑一个钱包进程；AEP2 时代的 `ledger.jsonl` / 旧部署记录要归档重来。
 
 ## 14. 与 x402 参考实现的差异（有意为之）
@@ -285,13 +286,14 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 
 ## 16. 与 Kairos 的集成现状
 
-- agentpay 仓库：`https://github.com/linqizhe07/agentpay`（`main` 常绿，改动走 PR）；本次迁移在分支 `x402`，AEP2 最后一版是 tag `aep2-final`。
-- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：子模块 `payment/` 仍钉在 AEP2 版本；合并 `x402` 后需要升级子模块指针，并按 §13 的约束配置（付款 EOA 放 USDC、payee 指向 facilitator）。
+- agentpay 仓库：`https://github.com/linqizhe07/agentpay`（`main` 常绿，改动走 PR）；本次迁移是 PR #4（分支 `x402`，已合并），AEP2 最后一版是 tag `aep2-final`。
+- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：分支 `feat/payment`（PR #1，未合并）已把子模块 `payment/` 钉到 x402 版本；接入时按 §13 的约束配置（付款 EOA 放 USDC、payee 指向 facilitator），`docs/design/kairos-intro.html` 仍画着 AEP2 的钱包界面，要按 x402 重画。
 - Kairos 是付款方。agent 的接入面是 `agentpay` CLI + `SKILL.md`；`face/` 与 `dsh/` 尚未调用它。
 
 ## 17. 建议的后续工作
 
-1. Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率；再用自建 facilitator 跑一遍，证明两种 facilitator 吃同一份 `PAYMENT-SIGNATURE`。
+1. ~~Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率~~（已做，见 §13）；剩下：用自建 facilitator（`FACILITATOR_PK` 需 Sepolia ETH）再跑一遍，证明两种 facilitator 吃同一份 `PAYMENT-SIGNATURE`，并确认发送锁在真网上也让并发全成。
+1. 托管 facilitator 的并发失败是它那边的 nonce 竞争，我们这边可选的缓解：payee 对同一 facilitator 的 `/settle` 排队串行（代价是并发调用退化成串行 ~1 s/笔），或对 `invalid_exact_evm_transaction_failed` 且授权仍未上链的情况重试一次 `/settle`（EIP-3009 nonce 保证幂等）。
 2. 在 Kairos 里真正接入：MCP server 包装 CLI，人批预算的卡片复用现有审批模式；付款 EOA 的浮动资金策略。
 3. 钱包：预算文件加锁或改为单进程守护；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
 4. facilitator：限流；Base 上卡住交易的替换；指标。
