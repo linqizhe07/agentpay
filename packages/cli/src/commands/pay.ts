@@ -1,6 +1,16 @@
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from '@x402/core/http';
-import { LEDGER_STATUS_HEADER, NONCE_HEADER } from '@agentpay/wallet';
-import { PayeeRejected, paymentModelContext, type SettleResponse } from '@agentpay/core';
+import {
+  LEDGER_STATUS_HEADER,
+  NONCE_HEADER,
+  holderSetFor,
+  pickRejection,
+  validatePaymentContext,
+  type Caller,
+  type MandateWallet,
+  type PaymentContext,
+} from '@agentpay/wallet';
+import { PayeeRejected, PolicyViolation, paymentModelContext, type PolicyReason, type SettleResponse } from '@agentpay/core';
+import { callerLabel, contextFromPairs, parseCaller } from '../attribution.js';
 import { ConfigError } from '../config.js';
 import { ok, type CliResult } from '../output.js';
 import type { CommandContext } from '../context.js';
@@ -11,6 +21,10 @@ export interface PayFlags {
   header?: string[];
   mandate?: string;
   prepay?: boolean;
+  /** `--context k=v` values from the command line, or the object a host process already holds. */
+  context?: string[] | PaymentContext;
+  /** `--caller` (see CALLER_GRAMMAR), or the Caller a host process derived itself. */
+  caller?: string | Caller;
 }
 
 function urlArg(positional: string[], what: string): string {
@@ -39,6 +53,13 @@ function initFrom(flags: PayFlags): RequestInit {
   return init;
 }
 
+/** The wallet's FetchOptions from the flags: strings are parsed (usage errors), objects are the wallet's to validate. */
+export function attributionFrom(flags: Pick<PayFlags, 'context' | 'caller'>): { context?: PaymentContext; caller: Caller } {
+  const context = Array.isArray(flags.context) ? contextFromPairs(flags.context) : validatePaymentContext(flags.context);
+  const caller = typeof flags.caller === 'string' || flags.caller === undefined ? parseCaller(flags.caller) : flags.caller;
+  return { ...(context !== undefined ? { context } : {}), caller };
+}
+
 async function bodyOf(res: Response): Promise<unknown> {
   const text = await res.text();
   try {
@@ -48,9 +69,42 @@ async function bodyOf(res: Response): Promise<unknown> {
   }
 }
 
-/** Prints the 402 offer for a URL without paying. */
+/**
+ * requireMandateHost for an offer probe. fetch() refuses before its first
+ * request unless a mandate the caller holds names the host; a probe is the
+ * same HTTP client and leaves under the same rule. Eligibility at amount 0
+ * (the price is not known yet) means signed, enabled, in its window, naming
+ * the host and under its rate; the refusal is the one auto-selection would
+ * surface, so the agent reads the same hints as for `pay`.
+ */
+function preflightOffer(wallet: MandateWallet, url: string, caller: Caller): void {
+  const host = new URL(url).host;
+  const detail = { host, amount: '0' };
+  const deny = (reason: PolicyReason, d: Record<string, unknown>): never => {
+    throw new PolicyViolation(reason, d, paymentModelContext(reason, d));
+  };
+  const set = holderSetFor(caller);
+  const held = wallet.listMandates().filter((m) => set.has(m.holder ?? ''));
+  if (held.length === 0) {
+    if (caller.kind === 'principal' && wallet.listMandates().length === 0) deny('mandate_required', detail);
+    deny('no_held_mandate', { caller: callerLabel(caller), ...detail });
+  }
+  const { eligible, rejected } = wallet.eligibleMandates({ host, amount: 0n, caller });
+  if (eligible.length > 0) return;
+  const r = pickRejection(rejected, held.some((m) => m.status === 'signed'), detail);
+  deny(r.reason, r.detail);
+}
+
+/**
+ * Prints the 402 offer for a URL without paying. Under `requireMandateHost`
+ * (a host process) the probe needs a held mandate naming the host, like
+ * `pay`; the plain CLI probes any URL — a human checking a price needs no
+ * budget yet.
+ */
 export async function offer(ctx: CommandContext, positional: string[], flags: PayFlags): Promise<CliResult> {
   const url = urlArg(positional, 'offer');
+  const { caller } = attributionFrom(flags); // validated even when unused: a bad caller is a usage error here as for `pay`
+  if (ctx.walletOptions.requireMandateHost) preflightOffer(ctx.wallet(), url, caller);
   const res = await ctx.fetch(url, initFrom(flags));
   if (res.status !== 402) {
     return ok({ status: res.status, paid: false, note: 'resource did not ask for payment', body: await bodyOf(res) });
@@ -75,7 +129,7 @@ export async function offer(ctx: CommandContext, positional: string[], flags: Pa
 export async function pay(ctx: CommandContext, positional: string[], flags: PayFlags): Promise<CliResult> {
   const url = urlArg(positional, 'pay');
   const wallet = ctx.wallet();
-  const fetchOpts = { mandateId: flags.mandate, prepay: flags.prepay === true };
+  const fetchOpts = { mandateId: flags.mandate, prepay: flags.prepay === true, ...attributionFrom(flags) };
   const res = await wallet.fetch(url, initFrom(flags), fetchOpts);
   const body = await bodyOf(res);
   const nonce = res.headers.get(NONCE_HEADER);
@@ -108,6 +162,7 @@ export async function pay(ctx: CommandContext, positional: string[], flags: PayF
           intentMandateId: entry.intentMandateId,
           amount: entry.amount,
           ledgerStatus: res.headers.get(LEDGER_STATUS_HEADER) ?? entry.status,
+          ...(entry.context ? { context: entry.context } : {}),
           ...(entry.error ? { error: entry.error } : {}),
           ...(entry.status === 'unknown' ? { payment_model_context: paymentModelContext('unknown') } : {}),
         }

@@ -6,6 +6,9 @@
  *   2 usage / configuration error
  */
 import { parseArgs } from 'node:util';
+import { dirname } from 'node:path';
+import { LOCK_FILE, lockedBy } from '@agentpay/wallet';
+import { CALLER_GRAMMAR, contextPairsFromEnv } from './attribution.js';
 import { resolveConfig, ConfigError, type CliFlags } from './config.js';
 import { CommandContext } from './context.js';
 import { failure, toJson, type CliResult } from './output.js';
@@ -28,19 +31,26 @@ intent mandates (budgets)
                                    (human) create and approve in one step
   mandate-approve <id>             (human) sign a draft
   mandate-enable <id> | mandate-disable <id>
-  mandate-list                     all mandates with remaining budget
+  mandate-delegate --parent <id> --holder <holder> --limit <usd> [--valid-for s --hosts a,b --per-call usd --category c --purpose "…"]
+                                   a signed sub-budget within the parent's terms (limit <= its remaining, validity <= its
+                                   and <= 24h, hosts within its); holder = session:<id> | children:<sessionId> | bot:<id>
+  mandate-list                     all mandates (parentId/holder for delegated ones) with their EFFECTIVE remaining budget
   mandate-status <id>              one mandate + its payments
 
 payments
   offer <url> [--method m --body b --header k=v]   print the 402 offer, pay nothing
   pay <url> [--method m --body b --header k=v --mandate id --prepay]
   ledger [--status s] | reconcile | report
+  offer/pay attribution:  --context k=v (repeatable; keys channel channelName session parentSession origin callId label)
+                          AGENTPAY_CONTEXT=k=v,k=v sets defaults a flag overrides
+                          --caller ${CALLER_GRAMMAR}  (default principal: budgets without a holder)
 
 setup
   init [--from-deployment localhost|base-sepolia|path.json] [--key 0x.. --rpc url --token 0x.. --network eip155:n]
 
 global options: --key --rpc --token --network --home --deployment
-config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > packages/contracts/deployments/<name>.json`;
+config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > packages/contracts/deployments/<name>.json
+a home whose ${LOCK_FILE} names a live process (a running wallet) refuses pay, mandate-* and reconcile; the read-only commands still work`;
 
 const OPTIONS = {
   key: { type: 'string' },
@@ -58,6 +68,10 @@ const OPTIONS = {
   'per-call': { type: 'string' },
   rate: { type: 'string' },
   draft: { type: 'boolean' },
+  parent: { type: 'string' },
+  holder: { type: 'string' },
+  context: { type: 'string', multiple: true },
+  caller: { type: 'string' },
   method: { type: 'string' },
   body: { type: 'string' },
   header: { type: 'string', multiple: true },
@@ -79,6 +93,7 @@ const COMMANDS: Record<string, Handler> = {
   'mandate-approve': mandate.mandateApprove,
   'mandate-enable': mandate.mandateEnable,
   'mandate-disable': mandate.mandateDisable,
+  'mandate-delegate': mandate.mandateDelegate,
   'mandate-list': mandate.mandateList,
   'mandate-status': mandate.mandateStatus,
   offer: payCmd.offer,
@@ -87,6 +102,13 @@ const COMMANDS: Record<string, Handler> = {
   reconcile: ledgerCmd.reconcile,
   report: ledgerCmd.report,
 };
+
+/**
+ * Commands that write mandates.json or the ledger. A long-lived wallet process
+ * (lock: true) loads the store once and rewrites it from memory, so a CLI
+ * write beside it would be silently dropped; these refuse a locked home.
+ */
+const MUTATING = new Set(['pay', 'mandate-request', 'mandate-create', 'mandate-approve', 'mandate-enable', 'mandate-disable', 'mandate-delegate', 'reconcile']);
 
 /** Runs one CLI invocation; never throws, never touches process.exit (tests call this). */
 export async function run(
@@ -110,8 +132,27 @@ export async function run(
     if (command === 'init') return await init(flags as CliFlags & { 'from-deployment'?: string }, env);
     const handler = COMMANDS[command];
     if (!handler) throw new ConfigError(`unknown command: ${command}\n${USAGE}`);
-    const ctx = new CommandContext(resolveConfig(flags as CliFlags, env), fetchImpl);
-    return await handler(ctx, positional, flags);
+    const config = resolveConfig(flags as CliFlags, env);
+    if (MUTATING.has(command)) {
+      const dir = dirname(config.mandatesPath);
+      const pid = lockedBy(dir);
+      if (pid !== undefined) {
+        return {
+          code: 2,
+          output: {
+            ok: false,
+            error: 'locked',
+            pid,
+            home: dir,
+            message: `wallet home ${dir} is locked by pid ${pid} (${LOCK_FILE}): a running wallet process owns it; stop it or use --home elsewhere. mandate-list, mandate-status, report, ledger, address, balance and offer still read it`,
+          },
+        };
+      }
+    }
+    const ctx = new CommandContext(config, fetchImpl);
+    // env first: a --context flag overrides the same key
+    const withEnv = command === 'pay' || command === 'offer' ? { ...flags, context: [...contextPairsFromEnv(env), ...(flags.context ?? [])] } : flags;
+    return await handler(ctx, positional, withEnv);
   } catch (err) {
     return failure(err);
   }

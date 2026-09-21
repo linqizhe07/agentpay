@@ -15,17 +15,28 @@ export interface MandateFlags {
   rate?: string;
 }
 
-function inputFrom(flags: MandateFlags): IntentMandateInput {
-  if (!flags.purpose) throw new ConfigError('--purpose "<what this budget is for>" is required');
+export interface DelegateFlags extends MandateFlags {
+  parent?: string;
+  holder?: string;
+}
+
+/** A root mandate lives a day by default; a delegated one an hour (its parent bounds it at 24 h anyway). */
+export const DEFAULT_VALID_FOR_SECONDS = 86_400;
+export const DEFAULT_DELEGATED_VALID_FOR_SECONDS = 3_600;
+
+function inputFrom(flags: MandateFlags, defaults: { validFor: number; purpose?: string; hosts?: readonly string[] } = { validFor: DEFAULT_VALID_FOR_SECONDS }): IntentMandateInput {
+  const purpose = flags.purpose ?? defaults.purpose;
+  if (!purpose) throw new ConfigError('--purpose "<what this budget is for>" is required');
   if (!flags.limit) throw new ConfigError('--limit <usd> is required');
-  if (!flags.hosts) throw new ConfigError('--hosts <host[,host…]> is required (use "*" only if the user explicitly allows any host)');
-  const validFor = Number(flags['valid-for'] ?? 86_400);
+  const hosts = flags.hosts ? flags.hosts.split(',').map((h) => h.trim()).filter(Boolean) : defaults.hosts;
+  if (!hosts) throw new ConfigError('--hosts <host[,host…]> is required (use "*" only if the user explicitly allows any host)');
+  const validFor = Number(flags['valid-for'] ?? defaults.validFor);
   if (!Number.isInteger(validFor) || validFor <= 0) throw new ConfigError('--valid-for must be a positive number of seconds');
   const input: IntentMandateInput = {
-    naturalLanguage: flags.purpose,
+    naturalLanguage: purpose,
     limitAmount: usdToAtomicString(flags.limit, '--limit'),
     validForSeconds: validFor,
-    hostAllowlist: flags.hosts.split(',').map((h) => h.trim()).filter(Boolean),
+    hostAllowlist: [...hosts],
   };
   if (flags.category) input.category = flags.category;
   if (flags['per-call']) input.perCallMax = usdToAtomicString(flags['per-call'], '--per-call');
@@ -37,6 +48,12 @@ function inputFrom(flags: MandateFlags): IntentMandateInput {
   return input;
 }
 
+/**
+ * A mandate as the CLI prints it: the row (parentId and holder included when
+ * it is a delegated one) plus `remainingAmount`, which is the EFFECTIVE
+ * remaining budget — the tightest on its chain, what it can actually spend —
+ * not `limit - spent - pending` of the row alone.
+ */
 export function view(m: IntentMandate, remaining: bigint) {
   return {
     ...m,
@@ -68,6 +85,29 @@ export async function mandateRequest(ctx: CommandContext, _p: string[], flags: M
 export async function mandateCreate(ctx: CommandContext, _p: string[], flags: MandateFlags & { draft?: boolean }): Promise<CliResult> {
   const wallet = ctx.wallet();
   const m = await wallet.createIntentMandate(inputFrom(flags), { approve: !flags.draft });
+  return ok({ mandate: view(m, wallet.remaining(m.id)) });
+}
+
+/**
+ * A sub-budget under `--parent`, held by `--holder`, signed in one step (the
+ * human approved the parent; the wallet refuses anything outside it). The
+ * purpose defaults to the parent's plus " (delegated)", the hosts to the
+ * parent's, the validity to an hour.
+ */
+export async function mandateDelegate(ctx: CommandContext, _p: string[], flags: DelegateFlags): Promise<CliResult> {
+  if (!flags.parent) throw new ConfigError('--parent <mandateId> is required');
+  if (!flags.holder) throw new ConfigError("--holder <session:<id> | children:<sessionId> | bot:<id>> is required");
+  const wallet = ctx.wallet();
+  const parent = wallet.getMandate(flags.parent);
+  if (!parent) throw new ConfigError(`no intent mandate with id ${flags.parent}`);
+  // The default validity stops with the parent: only an explicit --valid-for past it is a bound violation.
+  const untilParent = parent.validUntil - Math.floor(Date.now() / 1000);
+  const input = inputFrom(flags, {
+    validFor: Math.max(1, Math.min(DEFAULT_DELEGATED_VALID_FOR_SECONDS, untilParent)),
+    purpose: `${parent.naturalLanguage} (delegated)`,
+    hosts: parent.hostAllowlist,
+  });
+  const m = await wallet.delegateIntentMandate(parent.id, input, flags.holder);
   return ok({ mandate: view(m, wallet.remaining(m.id)) });
 }
 

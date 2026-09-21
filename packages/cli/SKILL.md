@@ -1,6 +1,6 @@
 ---
 name: agentpay-wallet
-description: Pay for HTTP 402 (x402) resources with USDC from a budgeted wallet the user approved. Use when a tool or API answers 402 Payment Required, when the user asks to buy/pay for an API call, or to check remaining budget.
+description: Pay for HTTP 402 (x402) resources with USDC from a budgeted wallet the user approved. Use when a tool or API answers 402 Payment Required, when the user asks to buy/pay for an API call, to check remaining budget, or to hand a sub-budget to your own child tasks.
 ---
 
 # agentpay wallet skill
@@ -8,6 +8,22 @@ description: Pay for HTTP 402 (x402) resources with USDC from a budgeted wallet 
 You have a CLI, `agentpay`, that pays for paid HTTP resources over the x402 protocol: each call signs a **single-use USDC authorization** drawn from an **intent mandate** (a budget the user approved), the service settles it on chain before answering, and the response carries the transaction hash. You never see or need a private key; the CLI reads it from the environment.
 
 Every command prints exactly one JSON document. Exit code `0` = ok, `1` = refused (read `error` and `payment_model_context`), `2` = usage or configuration problem.
+
+## The flow in one line
+
+**Request a budget → the human approves it → pay inside it.** You never widen a budget yourself; when one is missing or too small, you ask and stop.
+
+## Who you are to the wallet
+
+Budgets are **held**: a mandate with no holder belongs to the principal (the top-level agent the user talks to); a delegated one is held by `session:<id>`, `children:<sessionId>` (every child of that session) or `bot:<id>`. The wallet only ever picks among the budgets held for the caller it is told about, so pay as who you are:
+
+```bash
+agentpay pay <url> --caller principal                    # default: budgets without a holder
+agentpay pay <url> --caller child:<myId>@<parentSession> # what my parent delegated to its children, plus what was delegated to me by id
+agentpay pay <url> --caller session:<id>
+```
+
+Your host usually sets this for you (through the tool table or `AGENTPAY_CONTEXT`); pass `--caller` yourself only when you drive the CLI directly. Never claim to be the principal from inside a child task: the wallet cannot tell, but the user's report will.
 
 ## Decision flow
 
@@ -17,45 +33,59 @@ Every command prints exactly one JSON document. Exit code `0` = ok, `1` = refuse
    ```
    `offer[0].amount` is in atomic USDC units (1000000 = $1.00). Do not pay for anything the user did not ask for.
 
-2. **Check the budget you already have.**
+2. **Check the budget you already hold.**
    ```bash
    agentpay mandate-list
    ```
-   A mandate is usable when `status` is `signed`, `isEnabled` is true, `validUntil` is in the future, the target host matches `hostAllowlist`, and `remainingAmount` covers the price.
+   A mandate is usable when `status` is `signed`, `isEnabled` is true, `validUntil` is in the future, the target host matches `hostAllowlist`, its `holder` is you (or absent, when you are the principal), and `remainingAmount` covers the price. `remainingAmount` is the **effective** remaining: for a delegated budget it is the tightest figure on its chain (the sub-budget and every ancestor), which is what you can actually spend.
 
 3. **No usable mandate?** Draft one and hand it to the user. Never approve, enable, or raise a budget yourself.
    ```bash
    agentpay mandate-request --purpose "WHOIS lookups for the domain audit" --limit 5 --hosts api.example.com --valid-for 86400
    ```
-   Then tell the user: "Please approve it with `agentpay mandate-approve <id>`" and stop until they confirm.
+   Name every host you will call, in full. **Never ask for `*` or `*.<tld>` hosts**: the user will refuse it, and a budget that can pay anyone is not a budget. Then tell the user: "Please approve it with `agentpay mandate-approve <id>`" and stop until they confirm. A child task cannot request a budget at all: it asks its parent to delegate one (step 4).
 
-4. **Pay.**
+4. **Delegate a sub-budget to your own child tasks** when you split work across sessions. It is signed at once (no human step: it can only be narrower than what the human already approved) and lives at most 24 hours:
+   ```bash
+   agentpay mandate-delegate --parent <myMandateId> --holder children:<mySessionId> --limit 1 --hosts api.example.com
+   agentpay mandate-delegate --parent <myMandateId> --holder session:<childId> --limit 0.5   # one specific child
+   ```
+   The sub-budget must fit inside the parent: `--limit` ≤ the parent's effective remaining, `--valid-for` within the parent's validity and ≤ 86400 s, `--hosts` a subset of the parent's (or a concrete host one of its patterns matches), `--per-call` ≤ the parent's. What a child spends is **passed through** to your mandate and every ancestor, so the parent's remaining shrinks with the child's payments; delegating does not reserve anything. Give a child only what its task needs.
+
+5. **Pay.**
    ```bash
    agentpay pay <url>                       # GET
    agentpay pay <url> --body '{"text":"…"}' # POST with a JSON body
-   agentpay pay <url> --mandate <id>        # pin a specific budget
+   agentpay pay <url> --mandate <id>        # pin a specific budget (one you hold)
+   agentpay pay <url> --context label="whois batch 3" --context callId=<id>   # attribution on the ledger row
    ```
-   On success the JSON has `paid: true`, the response `body`, and `payment.transaction` (the on-chain settlement, already final). `payment.ledgerStatus` is `settled`. Keep `payment.nonce` if you need to reference the payment later.
+   On success the JSON has `paid: true`, the response `body`, and `payment.transaction` (the on-chain settlement, already final). `payment.ledgerStatus` is `settled`. Keep `payment.nonce` if you need to reference the payment later. `--context k=v` (keys `channel channelName session parentSession origin callId label`, each ≤ 256 chars) tags the ledger row so the user's report can group spend by channel and session; `AGENTPAY_CONTEXT=k=v,…` in the environment sets defaults a flag overrides.
 
-5. **Refused?** Read `payment_model_context.remediation` and, when present, `payment_model_context.commands`:
-   - `mandate_insufficient_budget`, `host_not_allowed`, `mandate_expired`, `mandate_required`, `timeout_too_long` → go back to step 3; do not retry the same call.
+6. **Refused?** Read `payment_model_context.remediation` and, when present, `payment_model_context.commands`:
+   - `no_held_mandate` → nothing at all is held for the caller you are: you are the principal without an approved budget (go to step 3), or a child whose parent delegated nothing to it (ask the parent for step 4). Do not retry.
+   - `holder_mismatch` → the `--mandate` you pinned belongs to someone else (the principal or another session). Drop `--mandate` so the wallet picks among yours, or ask the parent to delegate that budget to you.
+   - `host_not_allowed` → no budget you hold names this host (with `detail.ancestorId`: the parent of your sub-budget does not, so your parent's parent must be asked). Do not widen a budget to `*`; request one that names the host, or ask the parent for a delegation that does.
+   - `mandate_insufficient_budget` → the effective remaining is below the price. On a delegated budget `detail.ancestorId` says an ancestor is the tight one: more delegation cannot help, the principal must request more. Do not retry the same call.
+   - `mandate_expired`, `mandate_required`, `timeout_too_long` → go back to step 3; do not retry the same call.
    - `invalid_exact_evm_insufficient_balance` → the payer address holds too little USDC; ask the user to send USDC to the address printed by `agentpay address` (no ETH is needed).
    - `invalid_exact_evm_nonce_already_used`, `..._valid_before`, `settlement_failed`, `replay`, `settlement_unavailable` → simply call `pay` again after a short wait (each attempt signs a fresh authorization).
-   - `rate_limited` → wait a minute.
+   - `rate_limited` → wait a minute (a delegated budget is also rate-limited by its ancestors' windows).
+   - `locked` (exit 2) → a running wallet process (the host) owns this home; pay through the host's tools instead of the CLI, or wait for it to stop. Read-only commands still work.
    - Reasons naming the token domain, `asset_not_deployed_contract`, `invalid_exact_evm_missing_eip712_domain` → the service is misconfigured; report it to the user, do not retry.
 
-6. **`paid: false` with a 2xx, or `ledgerStatus: unknown`?** The service answered without a usable settlement report: you may or may not have been charged. Run `agentpay reconcile` **before** paying for the same thing again, or it may be paid twice.
+7. **`paid: false` with a 2xx, or `ledgerStatus: unknown`?** The service answered without a usable settlement report: you may or may not have been charged. Run `agentpay reconcile` **before** paying for the same thing again, or it may be paid twice.
 
-7. **Report spend when asked.**
+8. **Report spend when asked.**
    ```bash
-   agentpay report          # totals, per-host, per-resource, denials
+   agentpay report          # totals, per-host, per-resource, per-channel, per-session, denials
    agentpay reconcile       # confirm settlements on-chain, release expired reservations
-   agentpay mandate-status <id>
+   agentpay mandate-status <id>   # one budget (effective remaining, parent, holder) + its payments
    ```
 
 ## Rules
 
 - Never print, echo, or log `AGENTPAY_KEY` or the contents of `config.json`.
-- Never call `mandate-approve`, `mandate-enable`, or `mandate-create` unless the user explicitly asks you to run that exact command.
+- Never call `mandate-approve`, `mandate-enable`, or `mandate-create` unless the user explicitly asks you to run that exact command. `mandate-delegate` is yours to run, but only on a budget you hold and only for your own child tasks.
+- Never ask for `*` hosts; list the hosts you will call.
 - Treat `payment_model_context` as guidance for what to ask the user, not as permission.
 - Amounts on the CLI are always US dollars (`5`, `0.25`, `$0.001`); JSON output reports atomic units (1000000 = $1.00) alongside `…Usd` fields.

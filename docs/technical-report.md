@@ -130,7 +130,7 @@ from = 付款人；to = payTo；value = amount；validAfter = 0；validBefore = 
 
 ### 4.5 错误码
 
-以 `@x402/evm` 的实现为准（与规范文档的词汇不同）：`invalid_exact_evm_signature`、`invalid_exact_evm_recipient_mismatch`、`invalid_exact_evm_payload_authorization_valid_before` / `_valid_after` / `_value_mismatch`、`invalid_exact_evm_missing_eip712_domain`、`invalid_exact_evm_network_mismatch`、`invalid_exact_evm_insufficient_balance`、`invalid_exact_evm_nonce_already_used`、`invalid_exact_evm_transaction_simulation_failed`、`invalid_exact_evm_transaction_failed`、`asset_not_deployed_contract`、`settlement_pending`。收款方自己的：`payment_required`（首次 402）、`replay`（在途守卫）、`settlement_unavailable`（facilitator 不可达/超时/5xx）。付款方策略：`mandate_required`、`mandate_not_found`、`no_eligible_mandate`、`mandate_insufficient_budget`、`mandate_expired`、`mandate_disabled`、`host_not_allowed`、`per_call_max`、`rate_limited`、`unsupported_offer`、`timeout_too_long`。每个码都有 `payment_model_context` 提示（`core/src/hints.ts`），测试保证不漏。
+以 `@x402/evm` 的实现为准（与规范文档的词汇不同）：`invalid_exact_evm_signature`、`invalid_exact_evm_recipient_mismatch`、`invalid_exact_evm_payload_authorization_valid_before` / `_valid_after` / `_value_mismatch`、`invalid_exact_evm_missing_eip712_domain`、`invalid_exact_evm_network_mismatch`、`invalid_exact_evm_insufficient_balance`、`invalid_exact_evm_nonce_already_used`、`invalid_exact_evm_transaction_simulation_failed`、`invalid_exact_evm_transaction_failed`、`asset_not_deployed_contract`、`settlement_pending`。收款方自己的：`payment_required`（首次 402）、`replay`（在途守卫）、`settlement_unavailable`（facilitator 不可达/超时/5xx）。付款方策略：`mandate_required`、`mandate_not_found`、`no_eligible_mandate`、`no_held_mandate`、`holder_mismatch`、`mandate_insufficient_budget`、`mandate_expired`、`mandate_disabled`、`host_not_allowed`、`per_call_max`、`rate_limited`、`unsupported_offer`、`timeout_too_long`。每个码都有 `payment_model_context` 提示（`core/src/hints.ts`），测试保证不漏。
 
 ## 5. 链上
 
@@ -169,13 +169,13 @@ agentpay 加的：
 
 `MandateWallet` 是一个 `fetch` 包装器加预算与账本管理；协议动作委托给 `x402Client`（`setSpendControls(false)`——官方默认会拒绝非默认资产并封顶 $1/笔，策略闸就是我们的 spend control）与 `x402HTTPClient`。不用 `wrapFetchWithPayment`：它把我们的 `PolicyViolation` 包成普通 Error。
 
-### 8.1 预算：intent mandate（未变）
+### 8.1 预算：intent mandate
 
-用户批准的额度，链下 EIP-712 凭证（域 `AEP2AgentWallet` v1——名字沿用，改了会让所有已签预算卡失效）：`IntentMandate(id, naturalLanguage, limitAmount, validFrom, validUntil, hostAllowlist, category)`。字段 `limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`、`status: draft | signed`、`isEnabled`。agent 只能 `createIntentMandate` 生成 draft；批准、启用、加额是人的操作。两个计数器是账本的缓存，加载时从账本重算。
+用户批准的额度，链下 EIP-712 凭证。域现在是 **`agentpay` / `2`**（`INTENT_DOMAIN`），签名结构 `IntentMandate(id, naturalLanguage, limitAmount, validFrom, validUntil, hostAllowlist, category, parentId, holder)`——`parentId` 与 `holder` 进了签名结构（缺省为 `''`），因为谁持有、挂在谁之下是预算的一部分，不签进去就能改文件把别人的预算据为己有。`mandates.json` 随之记 `version: 2`；**v1 或无版本号的存储在加载时直接拒绝**（提示归档并新建 `AGENTPAY_HOME`，与账本 v1 的处理一致）：旧卡片是在 `AEP2AgentWallet/1` 下签的，这里没有东西能验它们，而用付款方私钥重签等于凭空制造用户没给过的批准。字段 `limitAmount`、`spentAmount`、`pendingSpentAmount`、`perCallMax?`、`maxCallsPerMinute?`、`hostAllowlist`、`validFrom/validUntil`、`status: draft | signed`、`isEnabled`、`parentId?`、`holder?`。agent 只能 `createIntentMandate` 生成 draft（它拒绝输入里带 `parentId`/`holder`）；批准、启用、加额是人的操作。两个计数器是账本的缓存，加载时从账本重算。
 
-### 8.2 策略闸（未变）
+### 8.2 策略闸
 
-已签名 → 已启用 → 在有效期 → host 在白名单 → 不超单笔上限 → `limit − spent − pending ≥ amount` → 未超每分钟次数。自动选择的拒绝理由优先级 `host_not_allowed > mandate_expired > per_call_max > mandate_insufficient_budget > rate_limited > mandate_disabled`。
+已签名 → 已启用 → 在有效期 → host 在白名单 → 不超单笔上限 → `limit − spent − pending ≥ amount` → 未超每分钟次数。自动选择的拒绝理由优先级 `host_not_allowed > mandate_expired > per_call_max > mandate_insufficient_budget > rate_limited > mandate_disabled`。闸之前先按持有人筛（§8.7），闸本身对链上每个成员都跑一遍（§8.8）。
 
 ### 8.3 选报价
 
@@ -202,6 +202,27 @@ agentpay 加的：
 
 只剩 `balance()`（`balanceOf(owner)`；超过 `caps.floatWarnAtomic` 打日志提醒 EOA 只放小额浮动资金）。`rpcUrl` 可选：`pay` 完全离线签名。
 
+### 8.7 持有人与调用者
+
+没有 `holder` 的预算属于**主体**（principal，用户直接对话的顶层 agent）；委托出去的预算写明持有人：`session:<id>`、`children:<sessionId>`（该会话的所有子任务）或 `bot:<id>`。`fetch()` 的 `caller: { kind: 'principal' | 'child' | 'session' | 'bot', id?, parentSession? }` 决定可见集合（`holderSetFor`）：principal 只见无持有人的；child 见 `children:<parentSession>` 加 `session:<自己 id>`；session 见 `session:<id>`；bot 见 `bot:<id>`。**先筛后闸**：集合为空是新理由 `no_held_mandate`（提示：主体去申请预算，子任务去找父会话委托）；显式 `mandateId` 不在集合内是 `holder_mismatch`；`pickRejection` 只在筛过的集合上跑。目的是子任务不会误花父会话的钱，账本能说清哪个会话花了什么。
+
+`delegateIntentMandate(parentId, input, holder)` 是子预算的唯一构造入口，不需要人再批一次——它只能比人已经批的更窄：父已签、已启用、未过期；`limit ≤ effectiveRemaining(parent)`；`validUntil ≤ min(parent.validUntil, now + 24 h)`（`MAX_DELEGATED_VALIDITY_SECONDS`）；每个 host 模式要么等于父的某个模式，要么是被父模式 `matchHost` 命中的具体主机（带不带端口皆可）；`perCallMax ≤` 父的（父有的话）；category 继承。返回时已是 `signed`。
+
+### 8.8 链式记账
+
+`chainOf(id)` 沿 `parentId` 走到根（带 visited 集合：父缺失或成环就停，只记一次日志）。`adjustBudget` 是唯一一个知道链的变更点：给链上每个成员打补丁、只存一次盘；`rebuildBudgets` 把每条账本行加到它的整条链上。也就是说记账是**透传**的：子预算的一笔付款在父及所有祖先上同时预留、同时入账，委托本身不预留任何东西；`report().totals.spent/pending` 只对根求和，等于账本之和，一条链不会被算两次。一个预算真正能花的是**有效余额** `effectiveRemaining(id) = min(remainingOf(m) for m in chainOf(id))`——`remaining()`、`eligibleMandates()`、`report().mandates[].remainingAmount`、`mandate-list`/`-status` 与工具表返回的都是它，原始计数器留在行上。闸在同一个同步块里对链上**每个**成员跑完整的 `mandateRejection`（host、单笔、余额、频率、启用、有效期），祖先的失败用原有理由码返回并附 `detail.ancestorId`；预留打到每个成员上，尝试记进每个成员的频率窗口。
+
+### 8.9 付款上下文
+
+`FetchOptions.context?: PaymentContext`——只有字符串字段、每个 ≤ 256 字符：`channel`、`channelName`、`session`、`parentSession`、`origin`、`callId`、`label`——原样抄到账本行的 `context` 上（账本仍是 v2：字段可选，`parseEntry` 容忍缺失）。`report()` 新增 `byChannel` 与 `bySession`（只算 settled + unknown 行，缺键的归到 `''`），`byHost`/`byResource` 保留。CLI 用 `--context k=v`（可重复）传，`AGENTPAY_CONTEXT=k=v,…` 提供默认值、标志覆盖同名键；调用者用 `--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>`（默认 principal）。
+
+### 8.10 锁、验签与主机预检
+
+- **锁**：`MandateWallet` 可选 `lock: true`，在 `<home>/wallet.lock` 写自己的 pid（每次存盘刷新），`dispose()` 释放；`lockedBy(home)` 回答是否有活着的 pid 持有它（pid 已死的陈旧锁顺手删掉）。长驻进程把 `mandates.json` 读一次然后从内存回写，旁边的 CLI 写入会被静默覆盖——所以 CLI 的变更命令（`pay`、`mandate-*`、`reconcile`）遇到被锁的 home 直接拒绝（退出码 2，`error: 'locked'`，消息里报 pid），只读命令照常。
+- **验签**：`verifyMandates()`（异步）恢复每个已签预算的签名者，返回恢复不到付款地址的 id；宿主在注册后调用，逐个禁用并告警。
+- **主机预检**：`requireMandateHost: true`（默认 false）时 `fetch()` 在发第一个请求前就以 `host_not_allowed` 拒绝调用者集合里没有任何预算命名的主机——给把钱包嵌进工具表的宿主用，免得 agent 拿看似免费的 402 往返去探测它永远付不了的主机。
+- **对账与在途请求并存**：`reconcile()` 跳过 `error === 'in_flight'` 且链时间未过 `validBefore` 的行（活着的 `fetch()` 拥有它们），入账前按 nonce 重读该行，fetch 已经结清的只补 `verified`/`transaction`，不会记两次。
+
 ## 9. CLI 与 agent 接入
 
 `agentpay <command>`，每条命令恰好输出一份 JSON。退出码：`0` 成功，`1` 业务拒绝（读 `error` 与 `payment_model_context`），`2` 用法或配置错误。金额参数一律是美元。
@@ -209,11 +230,11 @@ agentpay 加的：
 | 组 | 命令 |
 |---|---|
 | 钱包 | `address`（打钱地址，不需要 ETH）`balance` |
-| 预算 | `mandate-request` `mandate-create` `mandate-approve` `mandate-enable` `mandate-disable` `mandate-list` `mandate-status` |
-| 付款 | `offer <url>` `pay <url> [--method --body --header --mandate --prepay]` `ledger` `reconcile` `report` |
+| 预算 | `mandate-request` `mandate-create` `mandate-approve` `mandate-enable` `mandate-disable` `mandate-delegate --parent <id> --holder <session:<id>\|children:<sessionId>\|bot:<id>> --limit <usd> [--valid-for --hosts --per-call --category --purpose]` `mandate-list`（含 parentId/holder 与**有效**余额）`mandate-status` |
+| 付款 | `offer <url>` `pay <url> [--method --body --header --mandate --prepay --context k=v… --caller …]` `ledger` `reconcile` `report`（含 byChannel/bySession） |
 | 设置 | `init [--from-deployment localhost\|base-sepolia\|path.json]` |
 
-`pay` 输出 `payment: { transaction, network, payer, nonce, intentMandateId, amount, ledgerStatus }`（按 `x-agentpay-nonce` 找账本行）；`paid` 只在 `ledgerStatus === 'settled'` 时为 true；`unknown` 时附 `payment_model_context`（先 `reconcile` 再付）。配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > 部署记录；token 的域随 token 走（`AGENTPAY_TOKEN_NAME/VERSION`，或部署记录）。`SKILL.md` 的决策流程：`offer` 看价 → `mandate-list` 找预算 → 没有就 `mandate-request` 起草并停下等人批 → `pay` → 被拒读 `remediation`；结果 `unknown` 时先 `reconcile`。
+`pay` 输出 `payment: { transaction, network, payer, nonce, intentMandateId, amount, ledgerStatus }`（按 `x-agentpay-nonce` 找账本行）；`paid` 只在 `ledgerStatus === 'settled'` 时为 true；`unknown` 时附 `payment_model_context`（先 `reconcile` 再付）。配置优先级：命令行参数 > `AGENTPAY_*` 环境变量 > `$AGENTPAY_HOME/config.json` > 部署记录；token 的域随 token 走（`AGENTPAY_TOKEN_NAME/VERSION`，或部署记录）。归因：`--context k=v` 可重复（键 `channel channelName session parentSession origin callId label`），`AGENTPAY_CONTEXT=k=v,…` 给默认值、标志覆盖；`--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>`（默认 principal）决定可见预算集合（§8.7）。锁：`pay`、`mandate-*`、`reconcile` 遇到 `wallet.lock` 指向活进程的 home 直接退出码 2（`error: 'locked'`，报 pid），只读命令照常（§8.10）。`SKILL.md` 的决策流程：申请预算 → 人批 → 在预算内付；`offer` 看价 → `mandate-list` 找自己持有的预算 → 没有就 `mandate-request` 起草并停下等人批（子任务不能申请，找父会话 `mandate-delegate --holder children:<session>` 委托）→ `pay` → 被拒读 `remediation`（`no_held_mandate`：这个调用者名下没有任何预算；`holder_mismatch`：钉住的预算是别人的；`host_not_allowed` / `mandate_insufficient_budget` 带 `detail.ancestorId` 时是祖先卡住，再委托也没用）；永远不申请 `*` 主机；结果 `unknown` 时先 `reconcile`。
 
 ## 10. 安全模型与信任边界
 
@@ -295,7 +316,7 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 1. ~~Base Sepolia 实跑：payee 对接托管 facilitator，记录真实延迟与失败率~~（已做，见 §13）；剩下：用自建 facilitator（`FACILITATOR_PK` 需 Sepolia ETH）再跑一遍，证明两种 facilitator 吃同一份 `PAYMENT-SIGNATURE`，并确认发送锁在真网上也让并发全成。
 1. 托管 facilitator 的并发失败是它那边的 nonce 竞争，我们这边可选的缓解：payee 对同一 facilitator 的 `/settle` 排队串行（代价是并发调用退化成串行 ~1 s/笔），或对 `invalid_exact_evm_transaction_failed` 且授权仍未上链的情况重试一次 `/settle`（EIP-3009 nonce 保证幂等）。
 2. 在 Kairos 里真正接入：MCP server 包装 CLI，人批预算的卡片复用现有审批模式；付款 EOA 的浮动资金策略。
-3. 钱包：预算文件加锁或改为单进程守护；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
+3. 钱包：~~预算文件加锁或改为单进程守护~~（已做：`lock: true` + `wallet.lock`，见 §8.10）；对账定时执行；密钥走 KMS/宿主签名器（`ClientEvmSigner` 只需要 `signTypedData`，换起来是一处）。
 4. facilitator：限流；Base 上卡住交易的替换；指标。
 5. 若单价降到亚分级、频率高到每笔一块等不起：x402 也有 `batch-settlement` scheme 槽位，`aep2-final` 的代码可作为其 network binding 复活。
 

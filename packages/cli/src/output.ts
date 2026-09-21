@@ -25,10 +25,20 @@ function revertReason(err: unknown): string | undefined {
   return m?.[1];
 }
 
-/** Maps any thrown error to the CLI's JSON error envelope and exit code. */
+/**
+ * Maps any thrown error to the CLI's JSON error envelope and exit code. A
+ * TypeError is what the wallet throws for a malformed argument (a caller, a
+ * context, a holder) before anything is sent, so it is a usage error (2),
+ * not a business one; a RangeError (a delegation outside its parent's
+ * bounds) is a business refusal (1) with its message.
+ */
 export function failure(err: unknown): CliResult {
   if (err instanceof ConfigError) {
     return { code: 2, output: { ok: false, error: 'config', message: err.message } };
+  }
+  if (err instanceof TypeError && !/fetch failed/i.test(err.message)) {
+    // (undici reports an unreachable host as a TypeError too; that one stays a business error below)
+    return { code: 2, output: { ok: false, error: 'usage', message: err.message } };
   }
   if (err instanceof PolicyViolation) {
     return {
