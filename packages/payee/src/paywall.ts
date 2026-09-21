@@ -1,17 +1,32 @@
 import { paymentMiddleware } from '@x402/express';
-import { HTTPFacilitatorClient, x402ResourceServer, type RouteConfig } from '@x402/core/server';
-import { SettleError, VerifyError, type PaymentPayload, type SettleResponse } from '@x402/core/types';
+import { HTTPFacilitatorClient, x402ResourceServer, type FacilitatorConfig, type RouteConfig } from '@x402/core/server';
+import { SettleError, VerifyError, type PaymentPayload, type PaymentRequirements, type SettleResponse } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
-import { X402_SCHEME, parsePrice, paymentModelContext } from '@agentpay/core';
+import { declareDiscoveryExtension, isValidRouteTemplate, type DiscoveryExtension } from '@x402/extensions/bazaar';
+import { X402_SCHEME, parsePrice, paymentModelContext, type Address, type Hex } from '@agentpay/core';
+import { createChainReader } from './chain-reader.js';
+import { settleLockFor, type SendLock } from './settle-lock.js';
 import { InMemoryIdempotencyStore } from './store.js';
-import type { ChargeOptions, Paywall, PaywallOptions } from './types.js';
+import type { ChargeOptions, DiscoveryDeclaration, Paywall, PaywallOptions } from './types.js';
 
 export const DEFAULT_MAX_TIMEOUT_SECONDS = 60;
 export const DEFAULT_FACILITATOR_TIMEOUT_MS = 35_000;
+export const DEFAULT_SETTLE_RETRY_DELAY_MS = 1500;
+/** The facilitator reason that means "the transfer did not go through" and may be worth one retry. */
+const TRANSACTION_FAILED = 'invalid_exact_evm_transaction_failed';
 /** How long a settled authorization stays refused locally after its own validity ends. */
 const RETAIN_GRACE_SECONDS = 60;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+/**
+ * What a catalogue accepts as a route template (the facilitator's own
+ * isValidRouteTemplate character set): a rooted path of safe URL characters
+ * with `:name` parameters, and no '..' or '://' at any percent-decoding depth
+ * (the official check, applied on top). A template is a claim about the
+ * payee's own URL space, so it is checked at charge() time rather than left
+ * for a catalogue to drop silently.
+ */
+export const ROUTE_TEMPLATE_RE = /^\/[a-zA-Z0-9_/:.\-~%]+$/;
 
 /** `${from}:${nonce}` of an exact/EVM payload, or undefined when it is not shaped like one. */
 function inflightKey(payload: { readonly payload?: unknown }): string | undefined {
@@ -22,7 +37,56 @@ function inflightKey(payload: { readonly payload?: unknown }): string | undefine
   return `${from}:${nonce}`.toLowerCase();
 }
 
+/** The authorization fields an exact/EVM payload carries, or undefined when it is not shaped like one. */
+function authorizationOf(payload: { readonly payload?: unknown }): { from: Address; nonce: Hex } | undefined {
+  const a = (payload.payload as { authorization?: { from?: unknown; nonce?: unknown } } | undefined)?.authorization;
+  return ADDRESS_RE.test(String(a?.from)) && /^0x[0-9a-fA-F]{64}$/.test(String(a?.nonce)) ? { from: a!.from as Address, nonce: a!.nonce as Hex } : undefined;
+}
+
 const nowSec = (): number => Math.floor(Date.now() / 1000);
+
+/**
+ * `route.extensions` for a discovery declaration: the official bazaar
+ * builder (info + JSON schema for a query or body route) plus our explicit
+ * routeTemplate. The express adapter's enrichDeclaration adds the method at
+ * request time and leaves the template alone because charge() mounts on '*'.
+ */
+export function discoveryExtensions(discovery: DiscoveryDeclaration): Record<string, DiscoveryExtension> {
+  const { routeTemplate, bodyType, ...rest } = discovery;
+  // The builder only declares `pathParams` in the schema when a pathParamsSchema
+  // is given, while the schema forbids undeclared input fields: an example
+  // without a schema would fail the catalogue's validation. Derive one.
+  if (rest.pathParams && !rest.pathParamsSchema) {
+    rest.pathParamsSchema = { properties: Object.fromEntries(Object.keys(rest.pathParams).map((k) => [k, { type: 'string' }])) };
+  }
+  if (routeTemplate !== undefined && (!ROUTE_TEMPLATE_RE.test(routeTemplate) || !isValidRouteTemplate(routeTemplate))) {
+    throw new Error(`charge: discovery.routeTemplate must be a rooted path of [a-zA-Z0-9_/:.-~%] without '..' or '://': ${routeTemplate}`);
+  }
+  const extensions = bodyType ? declareDiscoveryExtension({ ...rest, bodyType }) : declareDiscoveryExtension(rest);
+  const bazaar = extensions.bazaar!;
+  return { bazaar: routeTemplate ? { ...bazaar, routeTemplate } : bazaar };
+}
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The official HTTP facilitator client with /settle behind a lock. /verify is
+ * a read and stays concurrent; /settle broadcasts from the facilitator's one
+ * account, and a hosted facilitator's nonce manager loses when two of ours
+ * arrive together. `settle` is a plain method on the base class, so overriding
+ * it is enough: core's settleWithPendingRetry and our retry both go through it.
+ */
+export class LockedFacilitatorClient extends HTTPFacilitatorClient {
+  constructor(
+    config: FacilitatorConfig,
+    private readonly lock: SendLock,
+  ) {
+    super(config);
+  }
+
+  override settle(paymentPayload: PaymentPayload, paymentRequirements: PaymentRequirements): Promise<SettleResponse> {
+    return this.lock(() => super.settle(paymentPayload, paymentRequirements));
+  }
+}
 
 /**
  * One x402 resource server (facilitator client, `exact` scheme on one chain,
@@ -44,13 +108,19 @@ export function createPaywall(options: PaywallOptions): Paywall {
   if (!/^https?:\/\//.test(options.facilitator?.url ?? '')) throw new Error('createPaywall: facilitator.url must be an http(s) URL');
   const defaultTimeout = options.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS;
   if (!Number.isInteger(defaultTimeout) || defaultTimeout < 1) throw new Error('createPaywall: maxTimeoutSeconds must be a positive integer');
+  const settleRetryDelayMs = options.settleRetryDelayMs ?? DEFAULT_SETTLE_RETRY_DELAY_MS;
+  if (!Number.isFinite(settleRetryDelayMs) || settleRetryDelayMs < 0) throw new Error('createPaywall: settleRetryDelayMs must be a non-negative number');
+  const chainReader = options.chainReader ?? (options.rpcUrl ? createChainReader(options.rpcUrl) : undefined);
 
   const log = options.log ?? ((line: string) => console.error(line));
   const store = options.idempotencyStore ?? new InMemoryIdempotencyStore();
   const includeHints = options.includeHints ?? true;
   const authToken = options.facilitator.authToken;
-  const facilitator = new HTTPFacilitatorClient({
-    url: options.facilitator.url.replace(/\/+$/, ''),
+  const facilitatorUrl = options.facilitator.url.replace(/\/+$/, '');
+  // serializeSettle: false keeps the official client (concurrent settles);
+  // the default routes every /settle through the process-wide per-URL lock.
+  const facilitatorConfig: FacilitatorConfig = {
+    url: facilitatorUrl,
     timeoutMs: options.facilitator.timeoutMs ?? DEFAULT_FACILITATOR_TIMEOUT_MS,
     ...(authToken
       ? {
@@ -60,7 +130,9 @@ export function createPaywall(options: PaywallOptions): Paywall {
           },
         }
       : {}),
-  });
+  };
+  const facilitator =
+    (options.serializeSettle ?? true) ? new LockedFacilitatorClient(facilitatorConfig, settleLockFor(facilitatorUrl)) : new HTTPFacilitatorClient(facilitatorConfig);
 
   const server = new x402ResourceServer(facilitator);
   // Registered directly rather than via registerExactEvmScheme(): V2 on one
@@ -100,15 +172,59 @@ export function createPaywall(options: PaywallOptions): Paywall {
     const reason = ctx.error instanceof VerifyError ? (ctx.error.invalidReason ?? 'unexpected_verify_error') : 'settlement_unavailable';
     return { recovered: true, result: { isValid: false, invalidReason: reason, invalidMessage: ctx.error.message } };
   });
+  // Keys whose one settle retry has been spent, with the moment the
+  // authorization (plus grace) expires: after that a replay is refused by
+  // validity anyway, so the entry can go. Swept on insert like the store.
+  const retried = new Map<string, number>();
+  const spendRetry = (key: string, expiresAt: number): void => {
+    const now = nowSec();
+    for (const [k, t] of retried) if (t <= now) retried.delete(k);
+    retried.set(key, expiresAt);
+  };
+  const failureOf = (err: Error, network: PaymentRequirements['network']): SettleResponse =>
+    err instanceof SettleError
+      ? { success: false, errorReason: err.errorReason ?? 'unexpected_settle_error', errorMessage: err.message, transaction: err.transaction, network: err.network, payer: err.payer }
+      : { success: false, errorReason: 'settlement_unavailable', errorMessage: err.message, transaction: '', network };
+  // A settle refused as invalid_exact_evm_transaction_failed is ambiguous: the
+  // transfer may have reverted, or the facilitator may have lost the race for
+  // its own account nonce (hosted facilitators do, under concurrency). The
+  // chain settles the ambiguity: an unused nonce means no money moved, so
+  // one more settle cannot double-charge. Everything else — another reason,
+  // no chain reader, a used nonce, a chain we could not read, a key already
+  // retried — refuses as before. The claim is held until the retry has
+  // ended, so a concurrent re-presentation of the same authorization cannot
+  // slip in between. A recovered result skips core's afterSettle hooks, so
+  // the retry path does that hook's work (retain + onSettled) itself.
   server.onSettleFailure(async (ctx) => {
-    const key = release(ctx);
-    log(`payee: facilitator settle failed for ${key ?? '?'}: ${ctx.error.message}`);
-    const err = ctx.error;
-    const result: SettleResponse =
-      err instanceof SettleError
-        ? { success: false, errorReason: err.errorReason ?? 'unexpected_settle_error', errorMessage: err.message, transaction: err.transaction, network: err.network, payer: err.payer }
-        : { success: false, errorReason: 'settlement_unavailable', errorMessage: err.message, transaction: '', network: ctx.requirements.network };
-    return { recovered: true, result };
+    const key = inflightKey(ctx.paymentPayload);
+    let err = ctx.error;
+    const auth = authorizationOf(ctx.paymentPayload);
+    const requirements = ctx.requirements as PaymentRequirements;
+    if (chainReader && key && auth && err instanceof SettleError && err.errorReason === TRANSACTION_FAILED && !retried.has(key)) {
+      spendRetry(key, nowSec() + ttlFor(requirements));
+      const used = await chainReader.authorizationUsed(requirements.asset as Address, auth.from, auth.nonce).catch((e: unknown) => {
+        log(`payee: chain read failed for ${key}, not retrying settle: ${(e as Error).message}`);
+        return undefined;
+      });
+      if (used === false) {
+        log(`payee: settle failed for ${key} with the authorization still unused; retrying once in ${settleRetryDelayMs} ms`);
+        await sleep(settleRetryDelayMs);
+        try {
+          const result = await facilitator.settle(ctx.paymentPayload as PaymentPayload, requirements);
+          if (result.success) {
+            store.retain(key, ttlFor(requirements), nowSec());
+            options.onSettled?.(result, { ...ctx, result });
+            return { recovered: true, result };
+          }
+          err = new SettleError(500, { ...result, errorReason: result.errorReason ?? 'unexpected_settle_error' });
+        } catch (e) {
+          err = e instanceof Error ? e : new Error(String(e));
+        }
+      }
+    }
+    release(ctx);
+    log(`payee: facilitator settle failed for ${key ?? '?'}: ${err.message}`);
+    return { recovered: true, result: failureOf(err, ctx.requirements.network) };
   });
   server.onVerifiedPaymentCanceled(async (ctx) => {
     const key = release(ctx);
@@ -128,6 +244,8 @@ export function createPaywall(options: PaywallOptions): Paywall {
   function charge(price: string, opts: ChargeOptions = {}) {
     const amount = parsePrice(price).toString();
     const maxTimeoutSeconds = opts.maxTimeoutSeconds ?? defaultTimeout;
+    // Built before the route so a bad template fails where the route is written, not on the first request.
+    const extensions = opts.discovery ? discoveryExtensions(opts.discovery) : undefined;
     const route: RouteConfig = {
       accepts: {
         scheme: X402_SCHEME,
@@ -145,6 +263,7 @@ export function createPaywall(options: PaywallOptions): Paywall {
       ...(opts.resource ? { resource: opts.resource } : {}),
       ...(opts.description ? { description: opts.description } : {}),
       ...(opts.mimeType ? { mimeType: opts.mimeType } : {}),
+      ...(extensions ? { extensions } : {}),
       ...(includeHints
         ? {
             unpaidResponseBody: async () => ({

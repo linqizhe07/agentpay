@@ -12,12 +12,14 @@ import {
   INTENT_MANDATE_TYPES,
   IntentMandateStore,
   LEDGER_STATUS_HEADER,
+  DEFAULT_MAX_AUTHORIZATION_VALIDITY,
   Ledger,
   MandateWallet,
   NONCE_HEADER,
   STORE_VERSION,
   hostPatternWithin,
   intentMandateHash,
+  isPayableOffer,
   matchHost,
   recoverIntentMandateSigner,
   type IntentMandateInput,
@@ -456,6 +458,48 @@ describe('intent mandate lifecycle', () => {
 });
 
 // ---------------------------------------------------------------------------
+
+describe('isPayableOffer (the offer predicate the wallet applies, exported for discovery)', () => {
+  const scope = { network: NETWORK, token: TOKEN, assetDomain: { ...MOCK_USDC_DOMAIN } };
+  const good = {
+    scheme: 'exact',
+    network: NETWORK,
+    asset: TOKEN,
+    amount: '1000',
+    payTo: payeeAddress,
+    maxTimeoutSeconds: 60,
+    extra: { name: MOCK_USDC_DOMAIN.name, version: MOCK_USDC_DOMAIN.version },
+  };
+
+  it('accepts an exact/EIP-3009 offer on the wallet network, token and domain', () => {
+    expect(isPayableOffer(good, scope)).toBe(true);
+    expect(isPayableOffer({ ...good, extra: { ...good.extra, assetTransferMethod: 'eip3009' } }, scope)).toBe(true);
+    expect(DEFAULT_MAX_AUTHORIZATION_VALIDITY).toBe(300);
+  });
+
+  it('rejects upto, permit2, another domain, another network, another token and malformed fields', () => {
+    expect(isPayableOffer({ ...good, scheme: 'upto' }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, extra: { ...good.extra, assetTransferMethod: 'permit2' } }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, extra: { name: 'USD Coin', version: '2' } }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, extra: undefined }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, network: 'eip155:8453' }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, asset: payeeAddress }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, amount: '0' }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, amount: '1.5' }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, payTo: 'not-an-address' }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, maxTimeoutSeconds: 0 }, scope)).toBe(false);
+    expect(isPayableOffer({ ...good, maxTimeoutSeconds: '60' }, scope)).toBe(false);
+    expect(isPayableOffer(null, scope)).toBe(false);
+    expect(isPayableOffer('exact', scope)).toBe(false);
+  });
+
+  it('is exactly what the wallet applies: a 402 whose only offer fails it is unsupported_offer', async () => {
+    const s = await serve({ network: 'eip155:8453' });
+    const { wallet } = makeWallet();
+    await approved(wallet);
+    await expectViolation(wallet.fetch(`${s.url}/predict`), 'unsupported_offer');
+  });
+});
 
 describe('policy gate: every PolicyReason fires BEFORE signTypedData', () => {
   it('unsupported_offer (no exact offer for this wallet token)', async () => {

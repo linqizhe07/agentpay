@@ -117,7 +117,11 @@ npm run cli -- pay   http://127.0.0.1:4021/predict     # signs offline; the paye
 npm run cli -- pay   http://127.0.0.1:4021/predict --caller child:task-7@sess-1 --context session=task-7 --context label="backtest"
 npm run cli -- report                      # totals, byHost, byResource, byChannel, bySession, denials
 npm run cli -- reconcile
+npm run cli -- discover "daily OHLCV bars" --max-usd 0.05   # the x402 catalogue (CDP Bazaar), only rows THIS wallet can pay; free
+npm run cli -- pay   http://127.0.0.1:4022/v2/aggs/ticker/AAPL/range/1/day/2016-01-01/2016-12-31 --save massive/AAPL/2016.json
 ```
+
+`discover <query> [--max-usd usd --limit n --bazaar url]` searches the public CDP Bazaar (`--bazaar` / `AGENTPAY_BAZAAR_URL` / config `bazaarUrl` override the catalogue) and lists at most 20 rows this wallet could actually pay (its network and token, `exact`/EIP-3009, authorization ≤ 300 s), ranked by 30-day payers, never a seller's output example, schema or icon; `discover --list [--offset n]` pages the raw catalogue. The catalogue is a lead, not a contract: `offer` the concrete URL before paying. A catalogue outage is `discovery_unavailable` (exit 1), not a wallet error. `pay --save <rel> [--overwrite]` writes a 2xx body under the current directory (relative paths only, no `..`, no symlink escape, atomic write) and prints `saved {path, bytes, sha256, content_type}` with a 1 KB `preview` instead of the body; over 32 MiB the payment stands and `saved.error` is `body_too_large`. A host process gives the same to its model as `wallet_pay.save_to` under a directory it chooses (`ToolCallMeta.saveRoot`); `saved.path` is always the relative path, so a model never learns the host's layout.
 
 `mandate-delegate --parent <id> --holder <session:<id> | children:<sessionId> | bot:<id>> --limit <usd> [--valid-for s --hosts a,b --per-call usd --category c --purpose "…"]` signs the sub-budget in one step (it can only be narrower than the parent; ≤ 24 h). `offer` and `pay` take `--context k=v` (repeatable; keys `channel channelName session parentSession origin callId label`) and `--caller principal | child:<id>@<parentSession> | session:<id> | bot:<id>` (default `principal`: budgets without a holder); `AGENTPAY_CONTEXT=k=v,k=v` supplies context defaults a flag overrides. `pay`, `mandate-*` and `reconcile` refuse a home whose `wallet.lock` names a live process (exit 2, `error: 'locked'`).
 
@@ -130,8 +134,11 @@ Agents use `mandate-request` (creates a draft) and stop until the human runs `ma
 npm run deploy:local                                   # MockUSDC + Multicall3; writes packages/contracts/deployments/localhost.json
 FACILITATOR_PK=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 npm run facilitator  # terminal 2 (hardhat #3)
 npm run payee                                          # terminal 3 (pays to hardhat #2 by default)
+npm run vendor-sim                                     # optional: a Massive/Polygon-shaped data vendor on :4022 (daily bars + news, $0.01 a call)
 curl -i http://127.0.0.1:4021/predict                  # 402 + PAYMENT-REQUIRED
 ```
+
+`vendor-sim` (`packages/payee/examples/vendor-sim`) serves deterministic OHLCV aggregates and news in the real vendor's request and response shape, with a bazaar discovery declaration on each route (`charge(price, { discovery })`), so a buyer written against it only changes the base URL and network for the real thing. The payee itself now serialises `/settle` per facilitator URL (the hosted facilitator's nonce manager loses when two settles race) and, given `rpcUrl`, retries a `invalid_exact_evm_transaction_failed` settle once while the chain shows the authorization unused. `packages/cli/scripts/testnet-interop.ts` (`npm run interop:testnet -w @agentpay/cli`, Base Sepolia home only) pays two stranger payees and writes a report to `docs/interop/`.
 
 Then use the CLI as above with `AGENTPAY_KEY` = hardhat #1 (`0x59c6…690d`). All of these are Hardhat's public dev keys; never use them with real funds. The facilitator refuses to start without ETH, if the token is not EIP-3009, or if the configured domain does not match the token's `eip712Domain()` / `DOMAIN_SEPARATOR()`.
 
@@ -171,3 +178,5 @@ Measured on 2026-09-19 against the hosted facilitator (settler `0xd407…f1bf`) 
 - **Self-hosted facilitator on a real network:** the key needs ETH, and there is no replacement logic for a stuck or underpriced transaction (the nonce manager will queue behind it; restart to resync).
 - **One wallet process per `AGENTPAY_HOME`**: two processes sharing `mandates.json` can overshoot a limit. The lock (`wallet.lock`, above) turns that into a refusal when the long-lived process asks for it; a process that does not take the lock is not protected, and a stale lock from a pid that died is simply ignored.
 - On-chain payments are public; USDC can be frozen by its issuer; MockUSDC has an open mint and exists only for local chains.
+- **`discover` trusts the catalogue's shape, not its claims.** Sellers write their own descriptions, prices go stale, and a listed resource may be dead; the wallet's predicate only guarantees the row is one `pay` would not refuse as `unsupported_offer`. Only `https` resources are listed, so a local vendor-sim is never discoverable this way (use its URL directly).
+- **`--save` bounds the body after download, not during it**: a body over 32 MiB is read into memory, paid for, then dropped (a streaming cap is future work).

@@ -14,7 +14,7 @@ import { wrapFetchWithPayment, decodePaymentResponseHeader } from '@x402/fetch';
 import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
 import { EIP3009_ABI } from '@agentpay/core';
 import { createFacilitator, type FacilitatorHandle } from '@agentpay/facilitator';
-import { createPaywall } from '../src/index.js';
+import { createChainReader, createPaywall } from '../src/index.js';
 import { KEYS, accounts, closeServer, getOffer, listen, pay, paymentFor, readSettlement, refusalReason } from './helpers.js';
 
 const skipReason = inject('skipReason');
@@ -49,6 +49,7 @@ describe.skipIf(skipReason)('paywall + facilitator on hardhat', () => {
       asset: usdc,
       assetDomain: { ...MOCK_USDC_DOMAIN },
       payTo: accounts.payee.address,
+      rpcUrl, // the retry gate reads authorizationState here
       log: () => {},
     });
     const app = express();
@@ -101,6 +102,17 @@ describe.skipIf(skipReason)('paywall + facilitator on hardhat', () => {
     expect(
       await publicClient.readContract({ address: usdc, abi: EIP3009_ABI, functionName: 'authorizationState', args: [a.from, a.nonce] }),
     ).toBe(true);
+  });
+
+  it('createChainReader reads authorizationState on the real chain: used after settlement, unused for a fresh nonce', async () => {
+    const reader = createChainReader(rpcUrl);
+    const { required } = await getOffer(`${base}/predict`);
+    const payload = await paymentFor(required);
+    const a = (payload.payload as { authorization: { from: `0x${string}`; nonce: `0x${string}` } }).authorization;
+    expect(await reader.authorizationUsed(usdc, a.from, a.nonce)).toBe(false);
+    expect((await pay(`${base}/predict`, payload)).status).toBe(200);
+    expect(await reader.authorizationUsed(usdc, a.from, a.nonce)).toBe(true);
+    await expect(createChainReader('http://127.0.0.1:1', { timeoutMs: 500 }).authorizationUsed(usdc, a.from, a.nonce)).rejects.toThrow();
   });
 
   it('is paid by the official @x402/fetch client', async () => {

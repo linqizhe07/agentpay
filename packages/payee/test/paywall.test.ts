@@ -49,6 +49,17 @@ describe('createPaywall (offline, stub facilitator)', () => {
       served++;
       res.json({ echo: req.body });
     });
+    app.get('/quote/:symbol', paywall.charge('$0.01', {
+      description: 'a quote',
+      discovery: {
+        routeTemplate: '/quote/:symbol',
+        pathParams: { symbol: 'ETH' },
+        input: { currency: 'USD' },
+        inputSchema: { properties: { currency: { type: 'string' } } },
+        output: { example: { symbol: 'ETH', price: 3000 } },
+      },
+    }), (req, res) => res.json({ symbol: req.params.symbol }));
+    app.post('/rate', paywall.charge('$0.01', { discovery: { bodyType: 'json', input: { text: 'hello' } } }), (_req, res) => res.json({}));
     app.get('/nohints', createPaywall({
       facilitator: { url: facilitator.url },
       network: NETWORK,
@@ -273,6 +284,47 @@ describe('createPaywall (offline, stub facilitator)', () => {
     expect(() => createPaywall({ ...good, maxTimeoutSeconds: 0 })).toThrow(/maxTimeoutSeconds/);
     expect(() => createPaywall(good).charge('$0')).toThrow();
   });
+
+  // A route with a discovery declaration advertises itself to catalogues
+  // (CDP Bazaar) through the 402's extensions.bazaar; one without stays as
+  // it was, with no extensions at all.
+  it('charge with discovery: the 402 carries extensions.bazaar with the declared routeTemplate and examples', async () => {
+    const { res, required } = await getOffer(`${base}/quote/ETH?currency=USD`);
+    expect(res.status).toBe(402);
+    expect(required.accepts[0]!.amount).toBe('10000');
+    const bazaar = (required as { extensions?: Record<string, any> }).extensions?.bazaar;
+    expect(bazaar).toBeDefined();
+    expect(bazaar.routeTemplate).toBe('/quote/:symbol');
+    // The express adapter fills in the method at request time; our examples pass through untouched.
+    expect(bazaar.info.input).toMatchObject({ type: 'http', method: 'GET', queryParams: { currency: 'USD' }, pathParams: { symbol: 'ETH' } });
+    expect(bazaar.info.output).toEqual({ type: 'json', example: { symbol: 'ETH', price: 3000 } });
+    expect(bazaar.schema.properties.input.properties.queryParams.properties).toEqual({ currency: { type: 'string' } });
+    expect(bazaar.schema.properties.input.required).toContain('method');
+    expect(bazaar.schema.properties.input.properties.pathParams).toEqual({ type: 'object', properties: { symbol: { type: 'string' } } }); // derived: the schema forbids undeclared fields
+    expect(JSON.stringify(bazaar).length).toBeLessThan(4096);
+    expect(served).toBe(0);
+  });
+
+  it('charge with discovery: a body route declares its bodyType and the method', async () => {
+    const { required } = await getOffer(`${base}/rate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    const bazaar = (required as { extensions?: Record<string, any> }).extensions?.bazaar;
+    expect(bazaar.info.input).toMatchObject({ type: 'http', method: 'POST', bodyType: 'json', body: { text: 'hello' } });
+    expect(bazaar.routeTemplate).toBeUndefined();
+  });
+
+  it('charge without discovery: the 402 has no extensions', async () => {
+    const { required } = await getOffer(`${base}/predict`);
+    expect((required as { extensions?: unknown }).extensions).toBeUndefined();
+  });
+
+  it('charge throws at mount time on a routeTemplate a catalogue would refuse', () => {
+    const good = (routeTemplate: string) => paywall.charge('$0.01', { discovery: { routeTemplate } });
+    expect(() => good('/v2/aggs/ticker/:ticker/range/1/day/:from/:to')).not.toThrow();
+    expect(() => good('/a-b_c.d~e%20f')).not.toThrow();
+    for (const bad of ['quote/:symbol', '', '/quote/:symbol?x=1', '/quote/:symbol with space', '/../etc', 'https://x/:a', '/x/%2e%2e/y', '/x://y']) {
+      expect(() => good(bad), bad).toThrow(/routeTemplate/);
+    }
+  });
 });
 
 describe('InMemoryIdempotencyStore', () => {
@@ -287,5 +339,201 @@ describe('InMemoryIdempotencyStore', () => {
     expect(s.claim('A:1', 60, 1011)).toBe(true); // expired retention no longer blocks
     for (let i = 0; i < 300; i++) s.claim(`B:${i}`, 1, 2000 + i); // each entry expires a second after the next claim
     expect(s.size).toBeLessThan(300); // the sweep ran during the flood and dropped the expired ones
+  });
+});
+
+describe('createPaywall: settle serialisation and the one retry (offline, stub facilitator)', () => {
+  let facilitator: StubFacilitator;
+  let server: Server;
+  let base: string;
+  let settledEvents: Array<{ transaction: string; payer?: string }> = [];
+  const chain = { used: false as boolean | undefined, reads: 0 };
+  // A ChainReader double: `used` is what the chain answers, undefined makes the read fail.
+  const chainReader = {
+    authorizationUsed: async () => {
+      chain.reads++;
+      if (chain.used === undefined) throw new Error('rpc down');
+      return chain.used;
+    },
+  };
+  const baseOptions = () => ({
+    facilitator: { url: facilitator.url, timeoutMs: 2000 },
+    network: NETWORK,
+    asset: USDC,
+    assetDomain: { ...MOCK_USDC_DOMAIN },
+    payTo: accounts.payee.address,
+    settleRetryDelayMs: 10,
+    log: () => {},
+  });
+  let retrying: Paywall;
+
+  beforeAll(async () => {
+    facilitator = await startStubFacilitator({ network: NETWORK, address: accounts.facilitator.address });
+    retrying = createPaywall({ ...baseOptions(), chainReader, onSettled: (r) => settledEvents.push({ transaction: r.transaction, payer: r.payer }) });
+    const app = express();
+    // Two paywalls on the same facilitator URL share one settle queue; a third opts out.
+    app.get('/a', createPaywall(baseOptions()).charge('$0.001'), (_req, res) => res.json({ route: 'a' }));
+    app.get('/b', createPaywall(baseOptions()).charge('$0.001'), (_req, res) => res.json({ route: 'b' }));
+    app.get('/parallel', createPaywall({ ...baseOptions(), serializeSettle: false }).charge('$0.001'), (_req, res) => res.json({ route: 'parallel' }));
+    app.get('/retry', retrying.charge('$0.001'), (_req, res) => res.json({ route: 'retry' }));
+    app.get('/noreader', createPaywall(baseOptions()).charge('$0.001'), (_req, res) => res.json({ route: 'noreader' }));
+    ({ server, base } = await listen(app));
+  });
+
+  afterAll(async () => {
+    await closeServer(server);
+    await facilitator.close();
+  });
+
+  afterEach(() => {
+    facilitator.mode = { kind: 'ok' };
+    facilitator.calls.length = 0;
+    facilitator.maxConcurrentSettles = 0;
+    settledEvents = [];
+    chain.used = false;
+    chain.reads = 0;
+  });
+
+  const settleCalls = () => facilitator.calls.filter((c) => c.route === 'settle').length;
+
+  async function payConcurrently(paths: string[]): Promise<Response[]> {
+    const payloads = await Promise.all(paths.map(async (p) => paymentFor((await getOffer(`${base}${p}`)).required)));
+    return Promise.all(paths.map((p, i) => pay(`${base}${p}`, payloads[i]!)));
+  }
+
+  it('settles three concurrent payments one at a time (verify stays concurrent)', async () => {
+    facilitator.mode = { kind: 'slow-settle', ms: 60 };
+    const results = await payConcurrently(['/a', '/a', '/a']);
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(settleCalls()).toBe(3);
+    expect(facilitator.maxConcurrentSettles).toBe(1);
+  });
+
+  it('two paywalls on the same facilitator URL share one settle queue', async () => {
+    facilitator.mode = { kind: 'slow-settle', ms: 60 };
+    const results = await payConcurrently(['/a', '/b', '/a', '/b']);
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200]);
+    expect(facilitator.maxConcurrentSettles).toBe(1);
+  });
+
+  it('serializeSettle: false lets settles overlap', async () => {
+    facilitator.mode = { kind: 'slow-settle', ms: 120 };
+    const results = await payConcurrently(['/parallel', '/parallel', '/parallel']);
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(facilitator.maxConcurrentSettles).toBe(3);
+  });
+
+  it('retries a transaction_failed settle once when the chain says the authorization is unused, then serves', async () => {
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed' };
+    const { required } = await getOffer(`${base}/retry`);
+    const payload = await paymentFor(required);
+    const res = await pay(`${base}/retry`, payload);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ route: 'retry' });
+    const settlement = readSettlement(res);
+    expect(settlement).toMatchObject({ success: true, payer: accounts.payer.address });
+    expect(facilitator.calls.map((c) => c.route)).toEqual(['verify', 'settle', 'settle']);
+    expect(chain.reads).toBe(1);
+    expect(settledEvents).toEqual([{ transaction: settlement!.transaction, payer: accounts.payer.address }]);
+    expect(retrying.store.has(keyOf(payload))).toBe(true); // retained: the replay path is unchanged
+    const again = await pay(`${base}/retry`, payload);
+    expect(again.status).toBe(402);
+    expect(refusalReason(again)).toBe('replay');
+  });
+
+  it('does not retry when the chain says the authorization was used', async () => {
+    chain.used = true;
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed' };
+    const { required } = await getOffer(`${base}/retry`);
+    const payload = await paymentFor(required);
+    const res = await pay(`${base}/retry`, payload);
+    expect(res.status).toBe(402);
+    expect(readSettlement(res)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_transaction_failed' });
+    expect(settleCalls()).toBe(1);
+    expect(chain.reads).toBe(1);
+    expect(settledEvents).toEqual([]);
+    expect(retrying.store.has(keyOf(payload))).toBe(false);
+  });
+
+  it('does not retry when the chain cannot be read', async () => {
+    chain.used = undefined;
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed' };
+    const { required } = await getOffer(`${base}/retry`);
+    const res = await pay(`${base}/retry`, await paymentFor(required));
+    expect(res.status).toBe(402);
+    expect(readSettlement(res)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_transaction_failed' });
+    expect(settleCalls()).toBe(1);
+  });
+
+  it('does not retry another failure reason', async () => {
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_insufficient_balance' };
+    const { required } = await getOffer(`${base}/retry`);
+    const res = await pay(`${base}/retry`, await paymentFor(required));
+    expect(res.status).toBe(402);
+    expect(readSettlement(res)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_insufficient_balance' });
+    expect(settleCalls()).toBe(1);
+    expect(chain.reads).toBe(0);
+  });
+
+  it('does not retry without a chain reader', async () => {
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed' };
+    const { required } = await getOffer(`${base}/noreader`);
+    const res = await pay(`${base}/noreader`, await paymentFor(required));
+    expect(res.status).toBe(402);
+    expect(readSettlement(res)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_transaction_failed' });
+    expect(settleCalls()).toBe(1);
+    expect(chain.reads).toBe(0);
+  });
+
+  it('retries an authorization only once, even when it is presented again', async () => {
+    facilitator.mode = { kind: 'settle-fail', reason: 'invalid_exact_evm_transaction_failed' };
+    const { required } = await getOffer(`${base}/retry`);
+    const payload = await paymentFor(required);
+    const first = await pay(`${base}/retry`, payload);
+    expect(first.status).toBe(402);
+    expect(settleCalls()).toBe(2);
+    const second = await pay(`${base}/retry`, payload); // the claim was released, the retry was spent
+    expect(second.status).toBe(402);
+    expect(readSettlement(second)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_transaction_failed' });
+    expect(settleCalls()).toBe(3);
+    expect(chain.reads).toBe(1);
+  });
+
+  it('a failed retry surfaces the second reason and releases the claim', async () => {
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed', then: 'invalid_exact_evm_nonce_already_used' };
+    const { required } = await getOffer(`${base}/retry`);
+    const payload = await paymentFor(required);
+    const res = await pay(`${base}/retry`, payload);
+    expect(res.status).toBe(402);
+    expect(readSettlement(res)).toMatchObject({ success: false, errorReason: 'invalid_exact_evm_nonce_already_used' });
+    expect(facilitator.calls.map((c) => c.route)).toEqual(['verify', 'settle', 'settle']);
+    expect(settledEvents).toEqual([]);
+    expect(retrying.store.has(keyOf(payload))).toBe(false);
+  });
+
+  it('holds the claim while the retry is in flight', async () => {
+    facilitator.mode = { kind: 'settle-fail-once', reason: 'invalid_exact_evm_transaction_failed' };
+    const slow = createPaywall({ ...baseOptions(), chainReader, settleRetryDelayMs: 150 });
+    const app = express();
+    app.get('/slow', slow.charge('$0.001'), (_req, res) => res.json({}));
+    const { server: s2, base: b2 } = await listen(app);
+    try {
+      const { required } = await getOffer(`${b2}/slow`);
+      const payload = await paymentFor(required);
+      const first = pay(`${b2}/slow`, payload);
+      await new Promise((r) => setTimeout(r, 80)); // inside the retry delay
+      const second = await pay(`${b2}/slow`, payload);
+      expect(second.status).toBe(402);
+      expect(refusalReason(second)).toBe('replay');
+      expect((await first).status).toBe(200);
+      expect(facilitator.calls.map((c) => c.route)).toEqual(['verify', 'settle', 'settle']);
+    } finally {
+      await closeServer(s2);
+    }
+  });
+
+  it('validates rpcUrl and settleRetryDelayMs', () => {
+    expect(() => createPaywall({ ...baseOptions(), settleRetryDelayMs: -1 })).toThrow(/settleRetryDelayMs/);
+    expect(() => createPaywall({ ...baseOptions(), rpcUrl: 'ws://x' })).toThrow(/rpcUrl/);
   });
 });

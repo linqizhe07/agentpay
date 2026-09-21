@@ -16,6 +16,7 @@ import * as chain from './commands/chain.js';
 import * as mandate from './commands/mandate.js';
 import * as payCmd from './commands/pay.js';
 import * as ledgerCmd from './commands/ledger.js';
+import { discover } from './commands/discover.js';
 import { init } from './commands/init.js';
 
 export const USAGE = `usage: agentpay <command> [options]
@@ -39,8 +40,18 @@ intent mandates (budgets)
 
 payments
   offer <url> [--method m --body b --header k=v]   print the 402 offer, pay nothing
-  pay <url> [--method m --body b --header k=v --mandate id --prepay]
+  pay <url> [--method m --body b --header k=v --mandate id --prepay] [--save rel/path [--overwrite]]
+                                   --save writes a 2xx body to that path under the current directory (no absolute paths, no ..,
+                                   existing files kept unless --overwrite) and prints saved {path, bytes, sha256} + a 1 KB preview, not the body
   ledger [--status s] | reconcile | report
+
+discovery (free: nothing is sent to a seller)
+  discover <query> [--max-usd usd --limit n --bazaar url]
+                                   search the x402 catalogue (CDP Bazaar) for resources THIS wallet can pay: exact/EIP-3009 on its
+                                   network and token, authorization <= 300 s; ranked by 30-day payers; at most 20 rows, never a
+                                   seller's output example or schema. Catalogue prices can be stale: offer the URL before you pay
+  discover --list [--offset n --limit n]
+                                   page the raw catalogue instead of searching (same filter); the catalogue is down -> discovery_unavailable
   offer/pay attribution:  --context k=v (repeatable; keys channel channelName session parentSession origin callId label)
                           AGENTPAY_CONTEXT=k=v,k=v sets defaults a flag overrides
                           --caller ${CALLER_GRAMMAR}  (default principal: budgets without a holder)
@@ -48,8 +59,9 @@ payments
 setup
   init [--from-deployment localhost|base-sepolia|path.json] [--key 0x.. --rpc url --token 0x.. --network eip155:n]
 
-global options: --key --rpc --token --network --home --deployment
+global options: --key --rpc --token --network --home --deployment --bazaar
 config precedence: flags > AGENTPAY_* env > $AGENTPAY_HOME/config.json > packages/contracts/deployments/<name>.json
+                   (--bazaar > AGENTPAY_BAZAAR_URL > config.json bazaarUrl > https://api.cdp.coinbase.com/platform/v2/x402)
 a home whose ${LOCK_FILE} names a live process (a running wallet) refuses pay, mandate-* and reconcile; the read-only commands still work`;
 
 const OPTIONS = {
@@ -77,7 +89,13 @@ const OPTIONS = {
   header: { type: 'string', multiple: true },
   mandate: { type: 'string' },
   prepay: { type: 'boolean' },
+  save: { type: 'string' },
+  overwrite: { type: 'boolean' },
   status: { type: 'string' },
+  'max-usd': { type: 'string' },
+  list: { type: 'boolean' },
+  offset: { type: 'string' },
+  bazaar: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -101,6 +119,7 @@ const COMMANDS: Record<string, Handler> = {
   ledger: ledgerCmd.ledger,
   reconcile: ledgerCmd.reconcile,
   report: ledgerCmd.report,
+  discover,
 };
 
 /**
@@ -152,7 +171,9 @@ export async function run(
     const ctx = new CommandContext(config, fetchImpl);
     // env first: a --context flag overrides the same key
     const withEnv = command === 'pay' || command === 'offer' ? { ...flags, context: [...contextPairsFromEnv(env), ...(flags.context ?? [])] } : flags;
-    return await handler(ctx, positional, withEnv);
+    // --save is relative to where the operator ran the command; a host process passes its own root through PayFlags instead.
+    const withRoot = command === 'pay' ? { ...withEnv, saveRoot: process.cwd() } : withEnv;
+    return await handler(ctx, positional, withRoot);
   } catch (err) {
     return failure(err);
   }

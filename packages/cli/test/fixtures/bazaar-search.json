@@ -1,0 +1,525 @@
+{
+  "partialResults": true,
+  "resources": [
+    {
+      "accepts": [
+        {
+          "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "extra": {
+            "name": "USDC",
+            "version": "2"
+          },
+          "network": "eip155:84532",
+          "scheme": "exact",
+          "amount": "5000",
+          "payTo": "0x733f40A4FA0cd13d59aBADE04b9eD2e9acAc6457",
+          "maxTimeoutSeconds": 300
+        },
+        {
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "extra": {
+            "name": "USD Coin",
+            "version": "2"
+          },
+          "network": "eip155:8453",
+          "scheme": "exact",
+          "amount": "5000",
+          "payTo": "0x733f40A4FA0cd13d59aBADE04b9eD2e9acAc6457",
+          "maxTimeoutSeconds": 300
+        }
+      ],
+      "description": "Omni Terminal provides Hyperliquid price structure with bounded OHLCV candles, current funding/carry, and an optional mark-anchored all-level liquidation and margin-stress overlay.",
+      "extensions": {
+        "bazaar": {
+          "info": {
+            "input": {
+              "method": "GET",
+              "pathParams": {
+                "symbol": "BTC"
+              },
+              "queryParams": {
+                "include_liquidations": true,
+                "interval": "1h",
+                "limit": 120,
+                "scope": "aggregate"
+              },
+              "type": "http"
+            },
+            "output": {
+              "example": {
+                "candles": [
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  },
+                  {
+                    "close": 117640,
+                    "close_time": 1784630799999,
+                    "high": 117900,
+                    "low": 116850,
+                    "open": 117200,
+                    "open_time": 1784627200000,
+                    "trades": 4210,
+                    "volume": 1824.5
+                  }
+                ],
+                "funding": {
+                  "canonical_symbol": "hyperliquid:BTC:USDC:perp",
+                  "carry": {
+                    "funding_apr_pct": 10.95,
+                    "funding_direction": "longs_pay_shorts"
+                  },
+                  "prices": {
+                    "mark": 63440.5,
+                    "oracle": 63440.5
+                  }
+                },
+                "note": "THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL THIS_EXAMPLE_MUST_NEVER_REACH_THE_MODEL "
+              },
+              "type": "json"
+            }
+          },
+          "routeTemplate": "/api/x402/v1/market-snapshot/:symbol",
+          "schema": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                }
+              }
+            },
+            "output": {
+              "type": "object",
+              "note": "THIS_SCHEMA_MUST_NEVER_REACH_THE_MODEL"
+            }
+          }
+        }
+      },
+      "iconUrl": "https://res.cloudinary.com/bdb-prod/image/upload/c_fill,ar_1:1,w_256,h_256,f_auto,q_auto/v1786439307/bazaar-icons/74fa8868286482a1.png",
+      "lastUpdated": "2026-09-05T09:40:52.484Z",
+      "quality": {
+        "l30DaysTotalCalls": 15,
+        "l30DaysUniquePayers": 3,
+        "lastCalledAt": "2026-09-05T09:40:52.223Z"
+      },
+      "resource": "https://omniterminal.app/api/x402/v1/market-snapshot/:symbol",
+      "serviceName": "Omni Terminal",
+      "tags": [
+        "crypto",
+        "hyperliquid",
+        "market-data",
+        "ohlcv"
+      ],
+      "type": "http",
+      "x402Version": 2
+    },
+    {
+      "accepts": [
+        {
+          "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "extra": {
+            "name": "USDC",
+            "version": "2"
+          },
+          "network": "eip155:84532",
+          "scheme": "exact",
+          "amount": "10000",
+          "payTo": "0x8Ba1f109551bD432803012645Ac136ddd64DBA72",
+          "maxTimeoutSeconds": 300
+        }
+      ],
+      "description": "RallyLive streams live crypto rally detection for agents: momentum bursts, volume anomalies and breakout confirmations across the top 200 pairs, with an explainable score per signal, historical hit rate, and a machine-readable rationale you can cite in a research note. RallyLive streams live crypto rally detection for agents: momentum bursts, volume anomalies and breakout confirmations across the top 200 pairs, with an explainable score per signal, historical hit rate, and a machine-readable rationale you can cite in a research note. ",
+      "extensions": {
+        "bazaar": {
+          "info": {
+            "input": {
+              "method": "POST",
+              "bodyFields": {
+                "pairs": [
+                  "BTC-USD",
+                  "ETH-USD"
+                ],
+                "window_minutes": 15
+              },
+              "type": "http"
+            },
+            "output": {
+              "example": {
+                "signals": [
+                  {
+                    "pair": "BTC-USD",
+                    "score": 0.82
+                  }
+                ]
+              },
+              "type": "json"
+            }
+          },
+          "schema": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                }
+              }
+            },
+            "output": {
+              "type": "object",
+              "note": "THIS_SCHEMA_MUST_NEVER_REACH_THE_MODEL"
+            }
+          }
+        }
+      },
+      "iconUrl": "https://res.cloudinary.com/bdb-prod/image/upload/c_fill,ar_1:1,w_256,h_256,f_auto,q_auto/v1786439307/bazaar-icons/74fa8868286482a1.png",
+      "lastUpdated": "2026-09-20T18:02:11.000Z",
+      "quality": {
+        "l30DaysTotalCalls": 40,
+        "l30DaysUniquePayers": 5,
+        "lastCalledAt": "2026-09-20T18:02:10.500Z"
+      },
+      "resource": "https://api.rallylive.xyz/x402/signals",
+      "serviceName": "RallyLive",
+      "tags": [
+        "crypto",
+        "signals",
+        "momentum",
+        "breakout",
+        "volume",
+        "this-tag-is-far-too-long-to-show-in-full-to-a-model",
+        "extra-seventh-tag"
+      ],
+      "type": "http",
+      "x402Version": 2
+    },
+    {
+      "accepts": [
+        {
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "extra": {
+            "name": "USD Coin",
+            "version": "2"
+          },
+          "network": "eip155:8453",
+          "scheme": "exact",
+          "amount": "10000",
+          "payTo": "0x2c9E5a33Ad6A9E0b3BfCf4B1a8f0E7c0d9E1F234",
+          "maxTimeoutSeconds": 300
+        }
+      ],
+      "description": "Massive: daily OHLCV aggregates for US equities (Polygon.io lineage), adjusted or raw, any date range since 2003.",
+      "extensions": {
+        "bazaar": {
+          "info": {
+            "input": {
+              "method": "GET",
+              "pathParams": {
+                "ticker": "AAPL",
+                "from": "2016-01-01",
+                "to": "2016-12-31"
+              },
+              "queryParams": {
+                "adjusted": false,
+                "sort": "asc",
+                "limit": 50000
+              },
+              "type": "http"
+            },
+            "output": {
+              "example": {
+                "results": [
+                  {
+                    "t": 1451970000000,
+                    "o": 1,
+                    "h": 1,
+                    "l": 1,
+                    "c": 1,
+                    "v": 1
+                  }
+                ]
+              },
+              "type": "json"
+            }
+          },
+          "routeTemplate": "/v2/aggs/ticker/:ticker/range/1/day/:from/:to",
+          "schema": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                }
+              }
+            },
+            "output": {
+              "type": "object",
+              "note": "THIS_SCHEMA_MUST_NEVER_REACH_THE_MODEL"
+            }
+          }
+        }
+      },
+      "iconUrl": "https://res.cloudinary.com/bdb-prod/image/upload/c_fill,ar_1:1,w_256,h_256,f_auto,q_auto/v1786439307/bazaar-icons/74fa8868286482a1.png",
+      "lastUpdated": "2026-09-21T02:00:00.000Z",
+      "quality": {
+        "l30DaysTotalCalls": 9000,
+        "l30DaysUniquePayers": 50,
+        "lastCalledAt": "2026-09-21T02:00:00.000Z"
+      },
+      "resource": "https://agent.massive.com/v2/aggs/ticker/:ticker/range/1/day/:from/:to",
+      "serviceName": "Massive",
+      "tags": [
+        "stocks",
+        "ohlcv",
+        "us-equities"
+      ],
+      "type": "http",
+      "x402Version": 2
+    },
+    {
+      "accepts": [
+        {
+          "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "extra": {
+            "name": "USDC",
+            "version": "2",
+            "assetTransferMethod": "permit2"
+          },
+          "network": "eip155:84532",
+          "scheme": "upto",
+          "amount": "20000",
+          "payTo": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+          "maxTimeoutSeconds": 300
+        }
+      ],
+      "description": "Mechamanda upto simulation: metered compute, you are charged for what you use up to the cap.",
+      "extensions": {
+        "bazaar": {
+          "info": {
+            "input": {
+              "method": "POST",
+              "bodyFields": {
+                "prompt": "hello"
+              },
+              "type": "http"
+            },
+            "output": {
+              "example": {
+                "tokens": 12
+              },
+              "type": "json"
+            }
+          },
+          "schema": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                }
+              }
+            },
+            "output": {
+              "type": "object",
+              "note": "THIS_SCHEMA_MUST_NEVER_REACH_THE_MODEL"
+            }
+          }
+        }
+      },
+      "iconUrl": "https://res.cloudinary.com/bdb-prod/image/upload/c_fill,ar_1:1,w_256,h_256,f_auto,q_auto/v1786439307/bazaar-icons/74fa8868286482a1.png",
+      "lastUpdated": "2026-09-19T10:00:00.000Z",
+      "quality": {
+        "l30DaysTotalCalls": 7,
+        "l30DaysUniquePayers": 2,
+        "lastCalledAt": "2026-09-19T10:00:00.000Z"
+      },
+      "resource": "https://upto.mechamanda.dev/api/metered",
+      "serviceName": "Mechamanda",
+      "tags": [
+        "upto",
+        "compute"
+      ],
+      "type": "http",
+      "x402Version": 2
+    },
+    {
+      "accepts": [
+        {
+          "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "extra": {
+            "name": "USDC",
+            "version": "2"
+          },
+          "network": "eip155:84532",
+          "scheme": "exact",
+          "amount": "1000",
+          "payTo": "0x1Fd5B2A3c4D5E6F708192A3B4C5D6E7F80912345",
+          "maxTimeoutSeconds": 900
+        }
+      ],
+      "description": "QuickNode Base Sepolia JSON-RPC over x402: one call per payment, batch allowed.",
+      "extensions": {
+        "bazaar": {
+          "info": {
+            "input": {
+              "method": "POST",
+              "bodyFields": {
+                "jsonrpc": "2.0",
+                "method": "eth_blockNumber",
+                "params": [],
+                "id": 1
+              },
+              "type": "http"
+            },
+            "output": {
+              "example": {
+                "result": "0x1"
+              },
+              "type": "json"
+            }
+          },
+          "schema": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                }
+              }
+            },
+            "output": {
+              "type": "object",
+              "note": "THIS_SCHEMA_MUST_NEVER_REACH_THE_MODEL"
+            }
+          }
+        }
+      },
+      "iconUrl": "https://res.cloudinary.com/bdb-prod/image/upload/c_fill,ar_1:1,w_256,h_256,f_auto,q_auto/v1786439307/bazaar-icons/74fa8868286482a1.png",
+      "lastUpdated": "2026-09-18T00:00:00.000Z",
+      "quality": {
+        "l30DaysTotalCalls": 120,
+        "l30DaysUniquePayers": 8,
+        "lastCalledAt": "2026-09-18T00:00:00.000Z"
+      },
+      "resource": "https://x402.quicknode.com/base-sepolia/rpc",
+      "serviceName": "QuickNode",
+      "tags": [
+        "rpc",
+        "base-sepolia"
+      ],
+      "type": "http",
+      "x402Version": 2
+    }
+  ],
+  "searchMethod": "hybrid",
+  "x402Version": 2,
+  "meta": {
+    "searchToken": "xlfzybvci7utqaa"
+  }
+}

@@ -7,7 +7,6 @@ import {
   createPublicClient,
   defineChain,
   http,
-  isAddress,
   type Chain,
   type PublicClient,
   type Transport,
@@ -20,7 +19,6 @@ import {
   EIP3009_ABI,
   PolicyViolation,
   WireError,
-  X402_SCHEME,
   chainIdFromNetwork,
   parseAmount,
   paymentModelContext,
@@ -35,6 +33,7 @@ import {
   type SettleResponse,
 } from '@agentpay/core';
 import { hostAllowed, hostCandidates, hostPatternWithin, urlHostCandidates } from './hosts.js';
+import { DEFAULT_MAX_AUTHORIZATION_VALIDITY, isPayableOffer } from './offers.js';
 import { LEDGER_VERSION, Ledger, validatePaymentContext, type LedgerEntry, type PaymentContext } from './ledger.js';
 import {
   IntentMandateStore,
@@ -230,7 +229,6 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-const DEFAULT_MAX_AUTHORIZATION_VALIDITY = 300;
 const DEFAULT_TRANSPORT_RETRIES = { attempts: 2, delayMs: 1000 };
 /** Seconds before validBefore at which re-presenting a signed header is pointless. */
 const REPRESENT_MARGIN_SECONDS = 10;
@@ -1080,28 +1078,7 @@ export class MandateWallet {
   }
 
   private isSupportedOffer(o: unknown): o is PaymentRequirements {
-    if (typeof o !== 'object' || o === null) return false;
-    const x = o as Partial<PaymentRequirements>;
-    const extra = (x.extra ?? undefined) as Record<string, unknown> | undefined;
-    return (
-      x.scheme === X402_SCHEME &&
-      x.network === this.network &&
-      typeof x.asset === 'string' &&
-      eqAddr(x.asset, this.token) &&
-      typeof x.amount === 'string' &&
-      /^\d+$/.test(x.amount) &&
-      BigInt(x.amount) > 0n &&
-      typeof x.payTo === 'string' &&
-      isAddress(x.payTo, { strict: false }) &&
-      typeof x.maxTimeoutSeconds === 'number' &&
-      Number.isInteger(x.maxTimeoutSeconds) &&
-      x.maxTimeoutSeconds > 0 &&
-      typeof extra === 'object' &&
-      extra !== null &&
-      extra.name === this.assetDomain.name &&
-      extra.version === this.assetDomain.version &&
-      (extra.assetTransferMethod === undefined || extra.assetTransferMethod === 'eip3009')
-    );
+    return isPayableOffer(o, { network: this.network, token: this.token, assetDomain: this.assetDomain });
   }
 
   /**

@@ -29,6 +29,8 @@ export interface StubPayeeOptions {
   rawMode?: RawMode;
   /** Handler status for /predict (>= 400 cancels the settlement). */
   handlerStatus?: number;
+  /** Size of the JSON body GET /big answers with (default 100 000 bytes): what `--save` is for. */
+  bigBytes?: number;
 }
 
 export interface StubPayee {
@@ -73,6 +75,14 @@ export async function startStubPayee(opts: StubPayeeOptions): Promise<StubPayee>
   app.get('/predict', paywall.charge(opts.price, { description: 'a prediction' }), (_req, res) => {
     state.served++;
     res.status(opts.handlerStatus ?? 200).json({ ok: true, resource: 'GET /predict', served: state.served });
+  });
+  // A paid body far past the 8 KB a tool result carries: `{"rows":[...],"pad":"xxxx…"}` padded to exactly bigBytes.
+  app.get('/big', paywall.charge(opts.price, { description: 'a big download' }), (_req, res) => {
+    state.served++;
+    const size = opts.bigBytes ?? 100_000;
+    const head = JSON.stringify({ rows: [{ t: 1, o: 1, h: 2, l: 0.5, c: 1.5, v: 100 }], served: state.served, pad: '' });
+    const body = head.slice(0, -2) + 'x'.repeat(Math.max(0, size - head.length)) + '"}';
+    res.status(opts.handlerStatus ?? 200).type('application/json').send(body);
   });
   app.post('/analyze', paywall.charge(opts.price), (req, res) => {
     state.served++;
