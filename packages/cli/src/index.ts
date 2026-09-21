@@ -8,12 +8,27 @@ export { CALLER_GRAMMAR, callerLabel, contextFromPairs, contextPairsFromEnv, par
 export { WALLET_TOOLS, MAX_BODY_BYTES, budgetView, createWalletToolHandlers } from './tools.js';
 export { MAX_SAVE_BYTES, PREVIEW_BYTES, resolveSavePath, writeSaved } from './save.js';
 export type { ResolvedSavePath, SavedFile } from './save.js';
+export {
+  DEFAULT_BAZAAR_URL,
+  DEFAULT_BAZAAR_TIMEOUT_MS,
+  DISCOVERY_NOTE,
+  DiscoveryUnavailable,
+  MAX_BAZAAR_RESPONSE_BYTES,
+  MAX_DISCOVER_ROWS,
+  compactRow,
+  compactRows,
+  listBazaar,
+  rankRows,
+  searchBazaar,
+} from './bazaar.js';
+export type { BazaarRow, CompactScope, DiscoveredResource } from './bazaar.js';
 export type { JsonSchema, ToolCallMeta, WalletTool, WalletToolHandler, WalletToolOptions } from './tools.js';
 // The handler modules, for a host that wants a command without the tool table around it.
 export * as mandateCommands from './commands/mandate.js';
 export * as payCommands from './commands/pay.js';
 export * as ledgerCommands from './commands/ledger.js';
 export * as chainCommands from './commands/chain.js';
+export * as discoverCommands from './commands/discover.js';
 // The wallet types a host meets in `meta` and in the envelopes.
 export type { Caller, Holder, IntentMandate, IntentMandateInput, LedgerEntry, PaymentContext, SpendReport } from '@agentpay/wallet';
 export { PRINCIPAL, holderSetFor } from '@agentpay/wallet';

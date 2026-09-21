@@ -11,6 +11,7 @@ import { MOCK_USDC_DOMAIN } from '@agentpay/contracts';
 import { LOCK_FILE } from '@agentpay/wallet';
 import { KEYS, startStubPayee, type StubPayee, type StubPayeeOptions } from '../../wallet/test/stub-payee.js';
 import { run } from '../src/cli.js';
+import { startStubBazaar } from './stub-bazaar.js';
 import { MAX_SAVE_BYTES, PREVIEW_BYTES } from '../src/save.js';
 
 const execFileAsync = promisify(execFile);
@@ -153,6 +154,30 @@ describe('agentpay CLI', () => {
     expect(out.resource.url).toBe(`${payee.url}/predict`);
     expect(out.payment_model_context.reason).toBe('payment_required');
     expect(payee.served).toBe(0);
+  });
+
+  it('discover queries the catalogue for this wallet network and works on a locked home (it is read-only)', async () => {
+    // A localhost wallet (eip155:31337, the mock USDC) can pay none of the fixture rows: matched, but nothing payable.
+    const bazaar = await startStubBazaar();
+    const requests = payee.requests;
+    try {
+      const r = await run(['discover', 'market snapshot', '--bazaar', bazaar.url], env);
+      expect(r.code).toBe(0);
+      expect(r.output).toMatchObject({ ok: true, query: 'market snapshot', network: 'eip155:31337', bazaar: bazaar.url, matched: 5, payable: 0, resources: [] });
+      expect(bazaar.calls[0].params).toMatchObject({ query: 'market snapshot', network: 'eip155:31337', type: 'http' });
+      expect((r.output as Out).usage).toBeUndefined();
+      expect(payee.requests).toBe(requests);
+      // discover is not MUTATING: a running wallet's lock does not refuse it
+      writeFileSync(join(home, LOCK_FILE), String(process.pid));
+      try {
+        expect((await run(['discover', 'x', '--bazaar', bazaar.url], env)).code).toBe(0);
+        expect((await run(['pay', `${payee.url}/predict`], env)).output).toMatchObject({ error: 'locked' });
+      } finally {
+        rmSync(join(home, LOCK_FILE), { force: true });
+      }
+    } finally {
+      await bazaar.close();
+    }
   });
 
   it('pay pays through the wallet and reports the settlement; ledger and report reflect it', async () => {
@@ -453,10 +478,11 @@ describe('agentpay CLI: delegation, attribution, callers, lock', () => {
       expect(out.paid).toBe(true);
       expect(out.body).toBeUndefined();
       const path = join(saveDir, 'massive', 'AAPL', '2016.json');
-      expect(out.saved.path).toBe(path);
+      // saved.path is the relative path as given (normalised), not the resolved absolute one.
+      expect(out.saved.path).toBe('massive/AAPL/2016.json');
       const file = readFileSync(path);
       expect(file.byteLength).toBe(100_000);
-      expect(out.saved).toEqual({ path, bytes: 100_000, sha256: createHash('sha256').update(file).digest('hex'), content_type: 'application/json; charset=utf-8' });
+      expect(out.saved).toEqual({ path: 'massive/AAPL/2016.json', bytes: 100_000, sha256: createHash('sha256').update(file).digest('hex'), content_type: 'application/json; charset=utf-8' });
       expect(out.preview_truncated).toBe(true);
       expect(Buffer.byteLength(out.preview, 'utf8')).toBeLessThanOrEqual(PREVIEW_BYTES);
       expect(readdirSync(join(saveDir, 'massive', 'AAPL'))).toEqual(['2016.json']);
@@ -510,6 +536,7 @@ describe('agentpay CLI: delegation, attribution, callers, lock', () => {
       const out = r.output as Out;
       expect(out.paid).toBe(true);
       expect(out.saved.error).toBe('body_too_large');
+      expect(out.saved.path).toBe('huge.json');
       expect(out.saved.bytes).toBe(MAX_SAVE_BYTES + 1);
       expect(out.saved.limit).toBe(MAX_SAVE_BYTES);
       expect(out.saved.sha256).toBeUndefined();
@@ -533,7 +560,8 @@ describe('agentpay CLI: delegation, attribution, callers, lock', () => {
       const { stdout } = await execFileAsync('npx', ['tsx', cliPath, 'pay', `${big.url}/big`, '--mandate', id, '--save', 'out/bars.json'], { cwd: saveDir, env });
       const parsed = JSON.parse(stdout) as Out;
       expect(parsed.ok).toBe(true);
-      expect(parsed.saved.path).toBe(join(saveDir, 'out', 'bars.json'));
+      expect(parsed.saved.path).toBe('out/bars.json');
+      expect(stdout).not.toContain(saveDir);
       expect(parsed.saved.bytes).toBe(20_000);
       expect(parsed.body).toBeUndefined();
       const file = readFileSync(join(saveDir, 'out', 'bars.json'));

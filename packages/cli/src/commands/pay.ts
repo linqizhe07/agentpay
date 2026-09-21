@@ -135,15 +135,18 @@ export async function offer(ctx: CommandContext, positional: string[], flags: Pa
 /**
  * The `saved` / `preview` fields of a `--save` result. Over MAX_SAVE_BYTES
  * nothing is written and `saved.error` says so: the payment has already
- * happened, so this is a reported outcome, not a thrown one.
+ * happened, so this is a reported outcome, not a thrown one. `saved.path`
+ * is the normalised RELATIVE path (what was asked for, under the root):
+ * the model and the host's wallet page never see the host's directory
+ * layout, and the ledger label carries the same string.
  */
 function saveResult(target: ResolvedSavePath, bytes: Uint8Array, contentType: string | null): Record<string, unknown> {
   const preview = previewOf(bytes);
   if (bytes.byteLength > MAX_SAVE_BYTES) {
-    return { saved: { error: 'body_too_large', path: target.path, bytes: bytes.byteLength, limit: MAX_SAVE_BYTES, content_type: contentType }, ...preview };
+    return { saved: { error: 'body_too_large', path: target.rel, bytes: bytes.byteLength, limit: MAX_SAVE_BYTES, content_type: contentType }, ...preview };
   }
   const written = writeSaved(target.path, bytes);
-  return { saved: { path: target.path, bytes: written.bytes, sha256: written.sha256, content_type: contentType }, ...preview };
+  return { saved: { path: target.rel, bytes: written.bytes, sha256: written.sha256, content_type: contentType }, ...preview };
 }
 
 /**

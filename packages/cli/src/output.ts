@@ -1,4 +1,5 @@
 import { PayeeRejected, PolicyViolation, WireError, paymentModelContext } from '@agentpay/core';
+import { DiscoveryUnavailable } from './bazaar.js';
 import { ConfigError } from './config.js';
 
 export type ExitCode = 0 | 1 | 2;
@@ -65,6 +66,10 @@ export function failure(err: unknown): CliResult {
   }
   if (err instanceof WireError) {
     return { code: 1, output: { ok: false, error: 'wire', message: err.message } };
+  }
+  if (err instanceof DiscoveryUnavailable) {
+    // The catalogue, not the wallet, failed: a business error (1) the model can retry later or route around with a known URL.
+    return { code: 1, output: { ok: false, error: 'discovery_unavailable', ...(err.status !== undefined ? { status: err.status } : {}), bazaar: err.bazaar, message: err.message } };
   }
   const reason = revertReason(err);
   if (reason) {

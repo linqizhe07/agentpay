@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { isAddress } from 'viem';
 import { readDeployment, type DeploymentRecord } from '@agentpay/contracts';
 import type { Address, AssetDomain, Hex } from '@agentpay/core';
+import { DEFAULT_BAZAAR_URL } from './bazaar.js';
 
 /** Thrown for usage / configuration problems (exit code 2). */
 export class ConfigError extends Error {
@@ -21,6 +22,8 @@ export interface CliFlags {
   network?: string;
   home?: string;
   deployment?: string;
+  /** `--bazaar <url>`: the x402 discovery catalogue `discover` queries. */
+  bazaar?: string;
 }
 
 /** Contents of $AGENTPAY_HOME/config.json (written by `agentpay init`). */
@@ -33,6 +36,8 @@ export interface StoredConfig {
   network?: string;
   /** Deployment record name/path used to fill the blanks above. */
   deployment?: string;
+  /** Base URL of the x402 discovery catalogue (default: the CDP Bazaar). */
+  bazaarUrl?: string;
 }
 
 export interface CliConfig {
@@ -42,6 +47,10 @@ export interface CliConfig {
   token: Address;
   tokenDomain: AssetDomain;
   network: string;
+  /** The discovery catalogue `discover` / `wallet_discover` query; always set (the default is the CDP Bazaar). */
+  bazaarUrl: string;
+  /** Catalogue timeout override (AGENTPAY_BAZAAR_TIMEOUT_MS), for tests; unset means the client's default. */
+  bazaarTimeoutMs?: number;
   home: string;
   configPath: string;
   mandatesPath: string;
@@ -93,6 +102,26 @@ function domainFromEnv(env: NodeJS.ProcessEnv): AssetDomain | undefined {
     : undefined;
 }
 
+/** The catalogue is fetched, so only http(s) will do; a bare host or a file: URL is a configuration slip, not a catalogue. */
+function requireHttpUrl(name: string, value: string): string {
+  let u: URL;
+  try {
+    u = new URL(value);
+  } catch {
+    throw new ConfigError(`${name} is not a URL: ${value}`);
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new ConfigError(`${name} must be an http(s) URL: ${value}`);
+  return value;
+}
+
+function bazaarTimeoutFromEnv(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.AGENTPAY_BAZAAR_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return undefined;
+  const ms = Number(raw);
+  if (!Number.isInteger(ms) || ms <= 0) throw new ConfigError(`AGENTPAY_BAZAAR_TIMEOUT_MS must be a positive integer, got ${JSON.stringify(raw)}`);
+  return ms;
+}
+
 function requireAddress(name: string, value: string | undefined): Address | undefined {
   if (value === undefined) return undefined;
   if (!isAddress(value, { strict: false })) throw new ConfigError(`${name} is not an address: ${value}`);
@@ -100,7 +129,8 @@ function requireAddress(name: string, value: string | undefined): Address | unde
 }
 
 /**
- * Precedence per field: flag > env (AGENTPAY_*) > config.json > deployment record.
+ * Precedence per field: flag > env (AGENTPAY_*) > config.json > deployment record
+ * (the catalogue URL has no deployment record: flag > env > config.json > the CDP Bazaar).
  * The deployment record is looked up by flag --deployment, env DEPLOYMENT,
  * config.deployment, then 'localhost' as a last resort.
  */
@@ -120,6 +150,8 @@ export function resolveConfig(flags: CliFlags, env: NodeJS.ProcessEnv): CliConfi
   const network = flags.network ?? env.AGENTPAY_NETWORK ?? stored.network ?? deployment?.network;
   const rpcUrl = flags.rpc ?? env.AGENTPAY_RPC ?? stored.rpcUrl ?? (network ? DEFAULT_RPC[network] : undefined);
   const key = (flags.key ?? env.AGENTPAY_KEY ?? stored.key) as Hex | undefined;
+  const bazaarUrl = requireHttpUrl('bazaar (--bazaar / AGENTPAY_BAZAAR_URL)', flags.bazaar ?? env.AGENTPAY_BAZAAR_URL ?? stored.bazaarUrl ?? DEFAULT_BAZAAR_URL);
+  const bazaarTimeoutMs = bazaarTimeoutFromEnv(env);
 
   const missing = [
     !token && 'token (--token / AGENTPAY_TOKEN)',
@@ -140,6 +172,8 @@ export function resolveConfig(flags: CliFlags, env: NodeJS.ProcessEnv): CliConfi
     token: token!,
     tokenDomain: tokenDomain!,
     network: network!,
+    bazaarUrl,
+    ...(bazaarTimeoutMs !== undefined ? { bazaarTimeoutMs } : {}),
     home,
     configPath: configPathIn(home),
     mandatesPath: join(home, 'mandates.json'),

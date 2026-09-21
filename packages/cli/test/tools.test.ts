@@ -55,9 +55,9 @@ describe('wallet tool table', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it('describes eight tools with closed JSON schemas and USD-string amounts', () => {
+  it('describes nine tools with closed JSON schemas and USD-string amounts', () => {
     expect(WALLET_TOOLS.map((t) => t.name)).toEqual([
-      'wallet_offer', 'wallet_pay', 'wallet_budget_request', 'wallet_budget_delegate',
+      'wallet_offer', 'wallet_pay', 'wallet_discover', 'wallet_budget_request', 'wallet_budget_delegate',
       'wallet_budget_disable', 'wallet_budgets', 'wallet_report', 'wallet_reconcile',
     ]);
     for (const t of WALLET_TOOLS) {
@@ -73,7 +73,9 @@ describe('wallet tool table', () => {
     expect(props('wallet_pay').save_to.description).toMatch(/sha256/);
     expect(props('wallet_pay').overwrite.type).toBe('boolean');
     expect(props('wallet_budget_delegate').per_call_usd.type).toBe('string');
+    expect(props('wallet_discover').max_usd.type).toBe('string');
     expect(WALLET_TOOLS.find((t) => t.name === 'wallet_budget_request')!.principalOnly).toBe(true);
+    expect(WALLET_TOOLS.find((t) => t.name === 'wallet_discover')).toMatchObject({ kind: 'read', principalOnly: false });
   });
 
   it('refuses a probe or a payment with no held budget, and bad arguments with code 2', async () => {
@@ -355,7 +357,9 @@ describe('wallet_pay save_to', () => {
     expect(out.body).toBeUndefined();
     expect(out.body_truncated).toBeUndefined();
     const path = join(saveRoot, 'massive', 'AAPL', '2016.json');
-    expect(out.saved.path).toBe(path);
+    // Plan B: the relative path, never the host's directory layout (saveRoot stays the host's secret).
+    expect(out.saved.path).toBe('massive/AAPL/2016.json');
+    expect(JSON.stringify(out)).not.toContain(saveRoot);
     const file = readFileSync(path);
     expect(file.byteLength).toBe(100_000);
     expect(out.saved.bytes).toBe(100_000);
@@ -373,6 +377,12 @@ describe('wallet_pay save_to', () => {
     // A label the host set wins over the file name.
     const labelled = await call('wallet_pay', { url: `${payee.url}/big`, save_to: 'massive/AAPL/2017.json' }, { ...meta(), context: { session: 'buyer-1', label: 'mine' } });
     expect((labelled.output as Out).context.label).toBe('mine');
+    // The label and saved.path are the same normalised string, whatever the model's spelling.
+    const spelt = await call('wallet_pay', { url: `${payee.url}/predict`, save_to: './massive/./AAPL/2018.json' }, meta());
+    expect(spelt.code).toBe(0);
+    expect((spelt.output as Out).saved.path).toBe('massive/AAPL/2018.json');
+    expect((spelt.output as Out).context.label).toBe('massive/AAPL/2018.json');
+    expect(existsSync(join(saveRoot, 'massive', 'AAPL', '2018.json'))).toBe(true);
     // A small body is saved too, previewed whole.
     const small = await call('wallet_pay', { url: `${payee.url}/predict`, save_to: 'small.json' }, meta());
     expect(small.code).toBe(0);

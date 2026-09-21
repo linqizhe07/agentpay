@@ -54,3 +54,4 @@ export {
   type ReconcileResult,
   type SpendReport,
 } from './wallet.js';
+export { DEFAULT_MAX_AUTHORIZATION_VALIDITY, isPayableOffer, type PayableScope } from './offers.js';

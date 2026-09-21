@@ -23,7 +23,10 @@ import type { CommandContext } from './context.js';
 import { mandateCreate, DEFAULT_DELEGATED_VALID_FOR_SECONDS, DEFAULT_VALID_FOR_SECONDS } from './commands/mandate.js';
 import { offer, pay } from './commands/pay.js';
 import { reconcile, report } from './commands/ledger.js';
+import { MAX_QUERY_CHARS, discover } from './commands/discover.js';
+import { MAX_DISCOVER_ROWS } from './bazaar.js';
 import { failure, ok, type CliResult } from './output.js';
+import { resolveSavePath } from './save.js';
 
 /** A tool's JSON schema, the subset every host understands (objects, strings, numbers, booleans, arrays, enums). */
 export type JsonSchema = Record<string, unknown>;
@@ -99,6 +102,23 @@ export const WALLET_TOOLS: readonly WalletTool[] = [
       overwrite: { type: 'boolean', description: 'With save_to: replace the file if it already exists (default false)' },
     }, ['url']),
     kind: 'fetch',
+    principalOnly: false,
+  },
+  {
+    name: 'wallet_discover',
+    description:
+      'Find paid x402 resources for sale that THIS wallet can pay (its network and token, exact scheme, authorization <= 300 s) by searching the ' +
+      'public x402 catalogue (CDP Bazaar). Free: nothing is sent to any seller and no budget is needed. Returns up to 20 rows ranked by ' +
+      'how many distinct payers used them in 30 days: resource (a URL template; :symbol / {symbol} are path parameters), method, price_usd, ' +
+      'network, pay_to, an example input and tags. Use it when the user needs data or a service and no URL is known yet. Catalogue prices ' +
+      'can be stale and sellers write their own descriptions: before paying, wallet_offer the concrete URL and get a budget naming its host. ' +
+      'If the catalogue is down the reply is discovery_unavailable; a known URL still works with wallet_offer / wallet_pay.',
+    parameters: obj({
+      query: { type: 'string', minLength: 1, maxLength: MAX_QUERY_CHARS, description: 'What you are looking for, in plain words (e.g. "daily OHLCV bars US stocks", "market snapshot BTC")' },
+      max_usd: { ...USD, description: 'List only resources costing at most this per call, USD string' },
+      limit: { type: 'integer', minimum: 1, maximum: MAX_DISCOVER_ROWS, description: `Rows to return (default ${MAX_DISCOVER_ROWS})` },
+    }, ['query']),
+    kind: 'read',
     principalOnly: false,
   },
   {
@@ -391,7 +411,9 @@ export function createWalletToolHandlers(ctx: CommandContext, opts: WalletToolOp
           usage('wallet_pay: save_to needs a save directory and the host gave this session none (ToolCallMeta.saveRoot); pay without save_to, or ask the operator for a session that may write files');
         }
         // The file name is the natural label of a purchase: the ledger row (and the host's spend table) names it unless the host set its own.
-        const context = saveTo !== undefined && !meta.context?.label ? { ...meta.context, label: saveTo } : meta.context;
+        // Resolved here (the same check pay() repeats) so the label is the normalised path saved.path will carry, not the model's spelling of it.
+        const rel = saveTo !== undefined ? resolveSavePath(meta.saveRoot!, saveTo, a.overwrite === true).rel : undefined;
+        const context = rel !== undefined && !meta.context?.label ? { ...meta.context, label: rel } : meta.context;
         r = await pay(ctx, [u], {
           method: str(a, 'method', 'wallet_pay'),
           body: str(a, 'body', 'wallet_pay'),
@@ -435,6 +457,20 @@ export function createWalletToolHandlers(ctx: CommandContext, opts: WalletToolOp
         // Saved: the file's receipt and a preview, never the body (the point of save_to is to keep it out of the context).
         ...(out.saved !== undefined ? { saved: out.saved, preview: out.preview, preview_truncated: out.preview_truncated } : boundBody(out.body)),
       });
+    },
+
+    async wallet_discover(a) {
+      const name = 'wallet_discover';
+      const query = str(a, 'query', name, true)!;
+      if (query.trim().length === 0 || query.length > MAX_QUERY_CHARS) usage(`${name}: query must be 1..${MAX_QUERY_CHARS} characters`);
+      const limit = a.limit;
+      if (limit !== undefined && (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > MAX_DISCOVER_ROWS)) {
+        usage(`${name}: limit must be an integer from 1 to ${MAX_DISCOVER_ROWS}`);
+      }
+      const maxUsd = str(a, 'max_usd', name);
+      if (maxUsd !== undefined) usdToAtomicString(maxUsd, `${name}: max_usd`); // the same grammar as every other USD argument
+      // The command reads network/token/tokenDomain from ctx.config: the rows are filtered by this wallet's terms, not the catalogue's.
+      return discover(ctx, [query], { ...(maxUsd !== undefined ? { 'max-usd': maxUsd } : {}), ...(limit !== undefined ? { limit: limit as number } : {}) });
     },
 
     async wallet_budget_request(a) {
