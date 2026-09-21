@@ -14,7 +14,7 @@ agentpay 是一套给 AI agent 用的支付系统：协议是 Coinbase 的 **x40
 | 协议 | x402 V2 / `exact` / EIP-3009，`@x402/core` `@x402/evm` `@x402/express` `@x402/fetch` ~2.26.0 |
 | 链 | 本地 Hardhat 全流程；Base Sepolia 无需部署（Circle USDC + 托管 facilitator 的静态记录已提交），2026-09-19 已实跑：串行每笔约 1 s，托管 facilitator 下并发会失败（§13） |
 | 测试 | 7 个工作区共 153 个测试，全绿；demo 10 个场景全过 |
-| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；`face/` 尚未调用 |
+| 集成 | 作为 git 子模块 `payment/` 挂在 Kairos 仓库；Kairos 的 face 在进程内把 `packages/cli/src/tools.ts` 的八个工具注册给 agent（2026-09-21，分支 `feat/agent-wallet`） |
 | 不做 | V1、`upto`、Permit2、智能合约钱包签名、批量结算、争议、KYC、前端 |
 
 ## 2. 目标与范围
@@ -308,8 +308,8 @@ demo 的 10 个场景：同一调用内链上余额变动；V2 报价 + 提示�
 ## 16. 与 Kairos 的集成现状
 
 - agentpay 仓库：`https://github.com/linqizhe07/agentpay`（`main` 常绿，改动走 PR）；本次迁移是 PR #4（分支 `x402`，已合并），AEP2 最后一版是 tag `aep2-final`。
-- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：分支 `feat/payment`（PR #1，未合并）已把子模块 `payment/` 钉到 x402 版本；接入时按 §13 的约束配置（付款 EOA 放 USDC、payee 指向 facilitator），`docs/design/kairos-intro.html` 仍画着 AEP2 的钱包界面，要按 x402 重画。
-- Kairos 是付款方。agent 的接入面是 `agentpay` CLI + `SKILL.md`；`face/` 与 `dsh/` 尚未调用它。
+- Kairos 仓库 `KairosPan/Evolving-Alpha-US`：分支 `feat/payment`（PR #1，未合并）把子模块钉到 x402 版本；其上的分支 `feat/agent-wallet`（2026-09-21）钉到本仓库 `agent-surface`，face 按相对路径 `../../payment/packages/{cli,wallet}/src/index.ts` 引入（子模块 `npm ci` 后才能通过它的 tsc），`docs/design/kairos-intro.html` 已按 x402 重画。
+- Kairos 是付款方。face 在进程内注册 `tools.ts` 的八个 `wallet_*` 工具，从会话头读出 channel / session / 子任务作为付款 context；`wallet_budget_request` 过 face 的第三道门（审批卡），子预算只给 Kairos 自己的子任务（holder `children:<session>`），bot 没有钱包工具；钱包主目录 `$DSH_HOME/face/agentpay`，face 运行时持 `wallet.lock`，CLI 的写命令会拒绝。设计与评审记录见 Kairos 仓库 `docs/superpowers/specs/2026-09-20-agent-wallet-design.md`。
 
 ## 17. 建议的后续工作
 
