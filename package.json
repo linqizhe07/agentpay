@@ -20,6 +20,7 @@
     "demo": "npm run gen-abi && npm run demo --workspace @agentpay/demo",
     "facilitator": "npm run start --workspace @agentpay/facilitator",
     "payee": "npm run start --workspace @agentpay/payee",
+    "vendor-sim": "npm run vendor-sim --workspace @agentpay/payee",
     "cli": "tsx packages/cli/src/cli.ts",
     "deploy:local": "npm run deploy:local --workspace @agentpay/contracts"
   },

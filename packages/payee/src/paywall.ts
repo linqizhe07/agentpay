@@ -2,11 +2,12 @@ import { paymentMiddleware } from '@x402/express';
 import { HTTPFacilitatorClient, x402ResourceServer, type FacilitatorConfig, type RouteConfig } from '@x402/core/server';
 import { SettleError, VerifyError, type PaymentPayload, type PaymentRequirements, type SettleResponse } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
+import { declareDiscoveryExtension, isValidRouteTemplate, type DiscoveryExtension } from '@x402/extensions/bazaar';
 import { X402_SCHEME, parsePrice, paymentModelContext, type Address, type Hex } from '@agentpay/core';
 import { createChainReader } from './chain-reader.js';
 import { settleLockFor, type SendLock } from './settle-lock.js';
 import { InMemoryIdempotencyStore } from './store.js';
-import type { ChargeOptions, Paywall, PaywallOptions } from './types.js';
+import type { ChargeOptions, DiscoveryDeclaration, Paywall, PaywallOptions } from './types.js';
 
 export const DEFAULT_MAX_TIMEOUT_SECONDS = 60;
 export const DEFAULT_FACILITATOR_TIMEOUT_MS = 35_000;
@@ -17,6 +18,15 @@ const TRANSACTION_FAILED = 'invalid_exact_evm_transaction_failed';
 const RETAIN_GRACE_SECONDS = 60;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+/**
+ * What a catalogue accepts as a route template (the facilitator's own
+ * isValidRouteTemplate character set): a rooted path of safe URL characters
+ * with `:name` parameters, and no '..' or '://' at any percent-decoding depth
+ * (the official check, applied on top). A template is a claim about the
+ * payee's own URL space, so it is checked at charge() time rather than left
+ * for a catalogue to drop silently.
+ */
+export const ROUTE_TEMPLATE_RE = /^\/[a-zA-Z0-9_/:.\-~%]+$/;
 
 /** `${from}:${nonce}` of an exact/EVM payload, or undefined when it is not shaped like one. */
 function inflightKey(payload: { readonly payload?: unknown }): string | undefined {
@@ -34,6 +44,28 @@ function authorizationOf(payload: { readonly payload?: unknown }): { from: Addre
 }
 
 const nowSec = (): number => Math.floor(Date.now() / 1000);
+
+/**
+ * `route.extensions` for a discovery declaration: the official bazaar
+ * builder (info + JSON schema for a query or body route) plus our explicit
+ * routeTemplate. The express adapter's enrichDeclaration adds the method at
+ * request time and leaves the template alone because charge() mounts on '*'.
+ */
+export function discoveryExtensions(discovery: DiscoveryDeclaration): Record<string, DiscoveryExtension> {
+  const { routeTemplate, bodyType, ...rest } = discovery;
+  // The builder only declares `pathParams` in the schema when a pathParamsSchema
+  // is given, while the schema forbids undeclared input fields: an example
+  // without a schema would fail the catalogue's validation. Derive one.
+  if (rest.pathParams && !rest.pathParamsSchema) {
+    rest.pathParamsSchema = { properties: Object.fromEntries(Object.keys(rest.pathParams).map((k) => [k, { type: 'string' }])) };
+  }
+  if (routeTemplate !== undefined && (!ROUTE_TEMPLATE_RE.test(routeTemplate) || !isValidRouteTemplate(routeTemplate))) {
+    throw new Error(`charge: discovery.routeTemplate must be a rooted path of [a-zA-Z0-9_/:.-~%] without '..' or '://': ${routeTemplate}`);
+  }
+  const extensions = bodyType ? declareDiscoveryExtension({ ...rest, bodyType }) : declareDiscoveryExtension(rest);
+  const bazaar = extensions.bazaar!;
+  return { bazaar: routeTemplate ? { ...bazaar, routeTemplate } : bazaar };
+}
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -212,6 +244,8 @@ export function createPaywall(options: PaywallOptions): Paywall {
   function charge(price: string, opts: ChargeOptions = {}) {
     const amount = parsePrice(price).toString();
     const maxTimeoutSeconds = opts.maxTimeoutSeconds ?? defaultTimeout;
+    // Built before the route so a bad template fails where the route is written, not on the first request.
+    const extensions = opts.discovery ? discoveryExtensions(opts.discovery) : undefined;
     const route: RouteConfig = {
       accepts: {
         scheme: X402_SCHEME,
@@ -229,6 +263,7 @@ export function createPaywall(options: PaywallOptions): Paywall {
       ...(opts.resource ? { resource: opts.resource } : {}),
       ...(opts.description ? { description: opts.description } : {}),
       ...(opts.mimeType ? { mimeType: opts.mimeType } : {}),
+      ...(extensions ? { extensions } : {}),
       ...(includeHints
         ? {
             unpaidResponseBody: async () => ({

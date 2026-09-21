@@ -49,6 +49,17 @@ describe('createPaywall (offline, stub facilitator)', () => {
       served++;
       res.json({ echo: req.body });
     });
+    app.get('/quote/:symbol', paywall.charge('$0.01', {
+      description: 'a quote',
+      discovery: {
+        routeTemplate: '/quote/:symbol',
+        pathParams: { symbol: 'ETH' },
+        input: { currency: 'USD' },
+        inputSchema: { properties: { currency: { type: 'string' } } },
+        output: { example: { symbol: 'ETH', price: 3000 } },
+      },
+    }), (req, res) => res.json({ symbol: req.params.symbol }));
+    app.post('/rate', paywall.charge('$0.01', { discovery: { bodyType: 'json', input: { text: 'hello' } } }), (_req, res) => res.json({}));
     app.get('/nohints', createPaywall({
       facilitator: { url: facilitator.url },
       network: NETWORK,
@@ -272,6 +283,47 @@ describe('createPaywall (offline, stub facilitator)', () => {
     expect(() => createPaywall({ ...good, facilitator: { url: 'ftp://x' } })).toThrow(/facilitator.url/);
     expect(() => createPaywall({ ...good, maxTimeoutSeconds: 0 })).toThrow(/maxTimeoutSeconds/);
     expect(() => createPaywall(good).charge('$0')).toThrow();
+  });
+
+  // A route with a discovery declaration advertises itself to catalogues
+  // (CDP Bazaar) through the 402's extensions.bazaar; one without stays as
+  // it was, with no extensions at all.
+  it('charge with discovery: the 402 carries extensions.bazaar with the declared routeTemplate and examples', async () => {
+    const { res, required } = await getOffer(`${base}/quote/ETH?currency=USD`);
+    expect(res.status).toBe(402);
+    expect(required.accepts[0]!.amount).toBe('10000');
+    const bazaar = (required as { extensions?: Record<string, any> }).extensions?.bazaar;
+    expect(bazaar).toBeDefined();
+    expect(bazaar.routeTemplate).toBe('/quote/:symbol');
+    // The express adapter fills in the method at request time; our examples pass through untouched.
+    expect(bazaar.info.input).toMatchObject({ type: 'http', method: 'GET', queryParams: { currency: 'USD' }, pathParams: { symbol: 'ETH' } });
+    expect(bazaar.info.output).toEqual({ type: 'json', example: { symbol: 'ETH', price: 3000 } });
+    expect(bazaar.schema.properties.input.properties.queryParams.properties).toEqual({ currency: { type: 'string' } });
+    expect(bazaar.schema.properties.input.required).toContain('method');
+    expect(bazaar.schema.properties.input.properties.pathParams).toEqual({ type: 'object', properties: { symbol: { type: 'string' } } }); // derived: the schema forbids undeclared fields
+    expect(JSON.stringify(bazaar).length).toBeLessThan(4096);
+    expect(served).toBe(0);
+  });
+
+  it('charge with discovery: a body route declares its bodyType and the method', async () => {
+    const { required } = await getOffer(`${base}/rate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    const bazaar = (required as { extensions?: Record<string, any> }).extensions?.bazaar;
+    expect(bazaar.info.input).toMatchObject({ type: 'http', method: 'POST', bodyType: 'json', body: { text: 'hello' } });
+    expect(bazaar.routeTemplate).toBeUndefined();
+  });
+
+  it('charge without discovery: the 402 has no extensions', async () => {
+    const { required } = await getOffer(`${base}/predict`);
+    expect((required as { extensions?: unknown }).extensions).toBeUndefined();
+  });
+
+  it('charge throws at mount time on a routeTemplate a catalogue would refuse', () => {
+    const good = (routeTemplate: string) => paywall.charge('$0.01', { discovery: { routeTemplate } });
+    expect(() => good('/v2/aggs/ticker/:ticker/range/1/day/:from/:to')).not.toThrow();
+    expect(() => good('/a-b_c.d~e%20f')).not.toThrow();
+    for (const bad of ['quote/:symbol', '', '/quote/:symbol?x=1', '/quote/:symbol with space', '/../etc', 'https://x/:a', '/x/%2e%2e/y', '/x://y']) {
+      expect(() => good(bad), bad).toThrow(/routeTemplate/);
+    }
   });
 });
 

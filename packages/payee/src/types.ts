@@ -76,6 +76,33 @@ export interface PaywallOptions {
   settleRetryDelayMs?: number;
 }
 
+/**
+ * What a route tells a catalogue (CDP Bazaar) about itself, carried in the
+ * 402's `extensions.bazaar`. Examples are what a buyer's agent reads to form a
+ * request, so keep them small: a catalogue row echoes them to every searcher.
+ */
+export interface DiscoveryDeclaration {
+  /** Example query parameters (GET) or body (POST etc.). */
+  input?: Record<string, unknown>;
+  /** JSON-schema fragment (`properties`, `required`) for `input`. */
+  inputSchema?: Record<string, unknown>;
+  /** Example path parameters, keyed as in `routeTemplate` (`:ticker` -> `ticker`). */
+  pathParams?: Record<string, unknown>;
+  pathParamsSchema?: Record<string, unknown>;
+  /** Marks a body route (POST, PUT, PATCH); absent = query route (GET, HEAD, DELETE). */
+  bodyType?: 'json' | 'form-data' | 'text';
+  /** A small example response (well under 4 KB) and optionally its schema. */
+  output?: { example?: unknown; schema?: Record<string, unknown> };
+  /**
+   * The route with its parameters as `:name` segments, e.g.
+   * '/v2/aggs/ticker/:ticker/range/1/day/:from/:to'. `charge()` is mounted
+   * per route and sees only the wildcard pattern '*', so the bazaar extension
+   * cannot infer it; without one the catalogue lists the resource under the
+   * concrete URL that happened to be called first.
+   */
+  routeTemplate?: string;
+}
+
 export interface ChargeOptions {
   description?: string;
   mimeType?: string;
@@ -83,6 +110,8 @@ export interface ChargeOptions {
   resource?: string;
   /** Per-route override of PaywallOptions.maxTimeoutSeconds. */
   maxTimeoutSeconds?: number;
+  /** Declares the route to catalogues; without it the 402 carries no extensions. */
+  discovery?: DiscoveryDeclaration;
 }
 
 export interface Paywall {
